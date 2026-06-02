@@ -1,0 +1,25 @@
+[package]
+name = "oxisql-parse"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "SQL parsing utilities for OxiSQL — thin sqlparser facade"
+readme = "README.md"
+categories = ["database", "parsing"]
+keywords = ["sql", "parser", "pure-rust", "cooljapan", "oxisql"]
+
+[dependencies]
+oxisql-core.workspace = true
+sqlparser.workspace = true
+lru.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "parse_benchmarks"
+harness = false

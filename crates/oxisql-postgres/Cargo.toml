@@ -1,0 +1,45 @@
+[package]
+name = "oxisql-postgres"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pure-Rust PostgreSQL backend for OxiSQL via tokio-postgres + OxiTLS (no libpq, no OpenSSL)"
+readme = "README.md"
+categories = ["database", "asynchronous"]
+keywords = ["database", "postgresql", "pure-rust", "cooljapan", "oxisql"]
+
+[features]
+default = []
+# Gate the integration tests (require a live Postgres instance).
+integration-postgres = []
+
+[dependencies]
+oxisql-core.workspace = true
+oxisql-parse.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+tokio-postgres-rustls.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rustls-pemfile.workspace = true
+tokio-rustls.workspace = true
+rustls-rustcrypto.workspace = true
+oxitls.workspace = true
+bytes.workspace = true
+time.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+oxisql-pool = { workspace = true, features = ["postgres"] }
+deadpool-postgres.workspace = true
+criterion = { workspace = true }
+
+[[bench]]
+name = "postgres_benchmarks"
+harness = false

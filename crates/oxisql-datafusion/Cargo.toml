@@ -1,0 +1,46 @@
+[package]
+name = "oxisql-datafusion"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Apache DataFusion TableProvider over oxisql Connection — enables OLAP SQL queries against oxisql-backed tables"
+readme = "README.md"
+categories = ["database", "asynchronous"]
+keywords = ["database", "sql", "datafusion", "cooljapan", "oxisql"]
+
+[features]
+default = []
+parse    = ["dep:oxisql-parse"]
+mysql    = ["dep:oxisql-mysql"]
+postgres = ["dep:oxisql-postgres"]
+sqlite   = ["dep:oxisql-sqlite-compat"]
+columnar = ["dep:oxistore-columnar"]
+
+[dependencies]
+oxisql-core           = { workspace = true }
+oxisql-parse          = { workspace = true, optional = true }
+oxisql-mysql          = { workspace = true, optional = true }
+oxisql-postgres       = { workspace = true, optional = true }
+oxisql-sqlite-compat  = { workspace = true, optional = true }
+oxistore-columnar     = { workspace = true, optional = true }
+datafusion  = { workspace = true }
+arrow       = { workspace = true }
+tokio       = { workspace = true }
+async-trait = { workspace = true }
+thiserror   = { workspace = true }
+futures     = { workspace = true }
+
+[dev-dependencies]
+oxisql-embedded       = { workspace = true }
+oxisql-postgres       = { workspace = true }
+oxisql-mysql          = { workspace = true }
+oxisql-sqlite-compat  = { workspace = true }
+tokio                 = { workspace = true }
+criterion             = { workspace = true }
+
+[[bench]]
+name = "datafusion_benchmarks"
+harness = false

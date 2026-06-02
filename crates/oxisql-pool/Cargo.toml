@@ -1,0 +1,56 @@
+[package]
+name = "oxisql-pool"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Async connection pooling for OxiSQL — deadpool-postgres, custom MySQL manager, embedded no-op (Pure Rust)"
+readme = "README.md"
+categories = ["database", "asynchronous"]
+keywords = ["database", "pool", "deadpool", "pure-rust", "oxisql"]
+
+[features]
+default = []
+# Enable Postgres pool via deadpool-postgres
+postgres = ["dep:deadpool", "dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio", "dep:oxisql-postgres"]
+# Enable MySQL pool via custom deadpool Manager over mysql_async
+mysql = ["dep:deadpool", "dep:mysql_async", "dep:tokio", "dep:oxisql-mysql"]
+# Enable embedded no-op pool via Arc<Mutex<Glue<MemoryStorage>>>
+embedded = ["dep:gluesql", "dep:tokio", "dep:oxisql-embedded"]
+# Enable Pure-Rust SQLite pool via Limbo (no C deps) — this is the canonical sqlite feature
+sqlite = ["dep:deadpool", "dep:oxisql-sqlite-compat", "dep:tokio"]
+# Transitional alias: sqlite-compat is a synonym for sqlite (both use the Limbo engine)
+sqlite-compat = ["sqlite"]
+# Legacy C-backed SQLite via rusqlite (C-FFI) — use only if you explicitly need the C backend
+sqlite-rusqlite = ["dep:deadpool", "dep:rusqlite", "dep:tokio"]
+# Enable QueryBuilder::execute_pooled integration (requires embedded)
+query-builder = ["embedded", "dep:oxisql-parse"]
+
+[dependencies]
+oxisql-core = { workspace = true }
+oxisql-embedded = { workspace = true, optional = true }
+oxisql-parse = { workspace = true, optional = true }
+oxisql-postgres = { workspace = true, optional = true }
+oxisql-mysql = { workspace = true, optional = true }
+oxisql-sqlite-compat = { workspace = true, optional = true }
+async-trait.workspace = true
+deadpool = { workspace = true, optional = true }
+deadpool-postgres = { workspace = true, optional = true }
+tokio-postgres = { workspace = true, optional = true }
+mysql_async = { workspace = true, optional = true }
+gluesql = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+oxisql-migrate = { workspace = true, features = ["migrate"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "pool_benchmarks"
+harness = false
+required-features = ["embedded"]

@@ -1,0 +1,107 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oxisql-core",
+    "crates/oxisql-parse",
+    "crates/oxisql-embedded",
+    "crates/oxisql-postgres",
+    "crates/oxisql-mysql",
+    "crates/oxisql-datafusion",
+    "crates/oxisql-pool",
+    "crates/oxisql-migrate",
+    "crates/oxisql-sqlite-compat",
+    "crates/oxisql",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+authors = ["COOLJAPAN OU (Team Kitasan)"]
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/oxisql"
+description = "OxiSQL is the COOLJAPAN-blessed Pure-Rust database layer: a unified SQL surface that spans embedded engines, OLTP wire-protocol clients (Postgres, MySQL), and a SQLite-compatible embedded path — without `libpq`, `mysqlclient`, `libsqlite3`, or any C/C++ DB driver."
+
+[workspace.dependencies]
+oxisql-core           = { path = "crates/oxisql-core",           version = "0.1.0" }
+oxisql-parse          = { path = "crates/oxisql-parse",          version = "0.1.0" }
+oxisql-embedded       = { path = "crates/oxisql-embedded",       version = "0.1.0" }
+oxisql-postgres       = { path = "crates/oxisql-postgres",       version = "0.1.0" }
+oxisql-mysql          = { path = "crates/oxisql-mysql",          version = "0.1.0" }
+oxisql-datafusion     = { path = "crates/oxisql-datafusion",     version = "0.1.0" }
+oxisql-pool           = { path = "crates/oxisql-pool",           version = "0.1.0" }
+oxisql-migrate        = { path = "crates/oxisql-migrate",        version = "0.1.0" }
+oxisql-sqlite-compat  = { path = "crates/oxisql-sqlite-compat",  version = "0.1.0" }
+
+# DataFusion backend — default-features=false avoids parquet/compression *-sys crates
+datafusion = { version = "53.1.0", default-features = false, features = ["sql"] }
+arrow      = { version = "58.3.0" }
+thiserror  = { version = "2.0.18" }
+
+async-trait = { version = "0.1.89" }
+tokio       = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time"] }
+sqlparser   = { version = "0.62.0", default-features = false }
+gluesql     = { version = "0.19.0", default-features = false, features = ["gluesql_memory_storage"] }
+
+# Postgres backend (Pure Rust, no libpq/openssl-sys/native-tls)
+tokio-postgres          = { version = "0.7.17", default-features = false, features = ["runtime", "with-time-0_3", "with-uuid-1"] }
+tokio-postgres-rustls   = { version = "0.14.0", default-features = false }
+rustls                  = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-pki-types        = { version = "1" }
+rustls-pemfile          = { version = "2" }
+tokio-rustls            = { version = "0.26", default-features = false, features = ["tls12"] }
+rustls-rustcrypto       = { version = "0.0.2-alpha" }
+oxitls                  = { version = "0.1.0", default-features = false, features = ["pure", "webpki-roots"] }
+bytes                   = { version = "1" }
+time                    = { version = "0.3.47", features = ["formatting", "macros"] }
+uuid                    = { version = "1.23.2" }
+
+# MySQL backend (Pure Rust, no libmysqlclient/mysqlclient-sys/openssl-sys)
+# default-features=false avoids libz-sys; minimal-rust + rustls-tls gives a
+# fully pure Rust build with rustls-based TLS.
+mysql_async = { version = "0.37.0", default-features = false, features = ["minimal-rust", "rustls-tls"] }
+chrono      = { version = "0.4", default-features = false, features = ["std"] }
+
+# Connection pooling — Pure Rust, deadpool for generic pool + deadpool-postgres wrapper
+deadpool          = { version = "0.13.0" }
+deadpool-postgres  = { version = "0.14.1" }
+
+futures = { version = "0.3" }
+
+# LRU cache
+lru = { version = "0.18.0" }
+
+# Logging
+log = { version = "0.4" }
+
+# CLI support
+clap   = { version = "4", features = ["derive"] }
+anyhow = { version = "1" }
+
+# SQLite (C-FFI, feature-gated; bundled compiles SQLite from vendored C source)
+rusqlite = { version = "0.40.0", features = ["bundled"] }
+
+# Pure-Rust SQLite-compatible engine (Limbo, no C dependency)
+# index_experimental enables CREATE INDEX support in limbo 0.0.22
+limbo = { version = "0.0.22", features = ["index_experimental"] }
+
+# Persistent embedded storage — fjall LSM-tree (Pure Rust, optional)
+fjall = { version = "3.1.4" }
+
+# Persistent embedded storage — redb B-tree engine (Pure Rust, optional)
+redb          = { version = "4.1.0" }
+ordered-float = { version = "5", features = ["serde"] }
+rust_decimal  = { version = "1", features = ["serde"] }
+
+# Persistent embedded storage — sled key-value engine (Pure Rust, optional)
+sled = { version = "0.34.7" }
+
+# Benchmarking
+criterion = { version = "0.8.2", features = ["html_reports", "async_tokio"] }
+
+# Test utilities
+proptest  = { version = "1.11.0", default-features = false, features = ["std"] }
+serde_json = { version = "1" }
+
+# OxiStore columnar Parquet backend (Pure Rust, optional)
+oxistore-columnar = { version = "0.1.0" }

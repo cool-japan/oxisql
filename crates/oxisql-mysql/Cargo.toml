@@ -1,0 +1,36 @@
+[package]
+name = "oxisql-mysql"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pure-Rust MySQL backend for OxiSQL via mysql_async + OxiTLS (no libmysqlclient, no OpenSSL)"
+readme = "README.md"
+categories = ["database", "asynchronous"]
+keywords = ["database", "mysql", "pure-rust", "cooljapan", "oxisql"]
+
+[features]
+default = []
+# Gate the integration tests (require a live MySQL instance).
+integration-mysql = []
+
+[dependencies]
+oxisql-core.workspace = true
+oxisql-parse.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio.workspace = true
+mysql_async.workspace = true
+rustls.workspace = true
+rustls-rustcrypto.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+criterion = { workspace = true }
+
+[[bench]]
+name = "mysql_benchmarks"
+harness = false

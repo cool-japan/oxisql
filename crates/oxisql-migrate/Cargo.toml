@@ -1,0 +1,56 @@
+[package]
+name = "oxisql-migrate"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Directory-based SQL migration runner for OxiSQL — sqlparser filename convention, gluesql embedded tracker"
+readme = "README.md"
+categories = ["database"]
+keywords = ["database", "migration", "sql", "pure-rust", "oxisql"]
+
+[features]
+default = []
+# Enable the full migration runner (sqlparser + gluesql embedded tracker)
+migrate = ["dep:sqlparser", "dep:gluesql", "dep:tokio", "dep:async-trait"]
+# Enable run_pooled using the embedded pool (pulls in oxisql-pool/embedded)
+pool = ["migrate", "dep:oxisql-pool", "oxisql-pool/embedded"]
+# Enable the oxisql-migrate CLI binary
+cli = ["pool", "dep:clap", "dep:anyhow", "dep:oxisql-embedded"]
+
+[dependencies]
+oxisql-core.workspace = true
+thiserror.workspace = true
+
+sqlparser       = { workspace = true, optional = true }
+gluesql         = { workspace = true, optional = true }
+tokio           = { workspace = true, optional = true }
+async-trait     = { workspace = true, optional = true }
+oxisql-pool     = { workspace = true, optional = true }
+clap            = { workspace = true, optional = true }
+anyhow          = { workspace = true, optional = true }
+oxisql-embedded = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true
+gluesql.workspace = true
+sqlparser.workspace = true
+oxisql-embedded.workspace = true
+oxisql-pool = { workspace = true, features = ["embedded"] }
+criterion = { workspace = true }
+
+[[bin]]
+name = "oxisql-migrate"
+path = "src/bin/migrate.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "migrate"
+required-features = ["migrate"]
+
+[[bench]]
+name = "migrate_benchmarks"
+harness = false
+required-features = ["migrate", "pool"]

@@ -1,0 +1,84 @@
+[package]
+name = "oxisql"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OxiSQL — Pure-Rust SQL facade: connect to in-memory, embedded, or wire-protocol databases with a single API"
+readme = "README.md"
+categories = ["database", "asynchronous"]
+keywords = ["database", "sql", "pure-rust", "cooljapan", "oxisql"]
+
+[features]
+default = []
+embedded = ["dep:oxisql-embedded"]
+postgres = ["dep:oxisql-postgres"]
+mysql = ["dep:oxisql-mysql"]
+datafusion = ["dep:oxisql-datafusion", "dep:arrow"]
+# Persistent embedded backends — each also enables the base `embedded` feature
+redb = ["embedded", "oxisql-embedded/redb-storage"]
+fjall = ["embedded", "oxisql-embedded/fjall-storage"]
+sled = ["embedded", "oxisql-embedded/sled-storage"]
+# Pure-Rust SQLite-compat backend via Limbo (no C/C++ dependencies)
+sqlite = ["dep:oxisql-sqlite-compat"]
+# Connection pooling: pools for postgres, mysql, embedded backends
+pool-postgres = ["dep:oxisql-pool", "oxisql-pool/postgres"]
+pool-mysql = ["dep:oxisql-pool", "oxisql-pool/mysql"]
+pool-embedded = ["dep:oxisql-pool", "oxisql-pool/embedded"]
+# Pure-Rust SQLite-compat pool (Limbo)
+pool-sqlite-compat = ["dep:oxisql-pool", "oxisql-pool/sqlite-compat", "dep:oxisql-sqlite-compat"]
+# Migration runner
+migrate = ["dep:oxisql-migrate", "oxisql-migrate/migrate"]
+
+[dependencies]
+oxisql-core.workspace = true
+async-trait.workspace = true
+rustls.workspace = true
+futures.workspace = true
+log.workspace = true
+
+[dependencies.oxisql-embedded]
+workspace = true
+optional = true
+
+[dependencies.oxisql-postgres]
+workspace = true
+optional = true
+
+[dependencies.oxisql-mysql]
+workspace = true
+optional = true
+
+[dependencies.oxisql-datafusion]
+workspace = true
+optional = true
+
+[dependencies.arrow]
+workspace = true
+optional = true
+
+[dependencies.oxisql-pool]
+workspace = true
+optional = true
+
+[dependencies.oxisql-migrate]
+workspace = true
+optional = true
+
+[dependencies.oxisql-sqlite-compat]
+workspace = true
+optional = true
+
+[dev-dependencies]
+tokio.workspace = true
+arrow.workspace = true
+oxisql-embedded = { workspace = true }
+oxisql-pool = { workspace = true, features = ["embedded"] }
+oxisql-core.workspace = true
+criterion = { workspace = true }
+
+[[bench]]
+name = "facade_benchmarks"
+harness = false

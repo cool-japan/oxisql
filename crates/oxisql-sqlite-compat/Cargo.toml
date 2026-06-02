@@ -1,0 +1,24 @@
+[package]
+name = "oxisql-sqlite-compat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pure-Rust SQLite-compatible backend for OxiSQL via the Limbo engine"
+readme = "README.md"
+keywords = ["sqlite", "sql", "database", "limbo", "pure-rust"]
+categories = ["database"]
+
+[dependencies]
+oxisql-core = { workspace = true }
+limbo       = { workspace = true }
+async-trait = { workspace = true }
+thiserror   = { workspace = true }
+tokio       = { workspace = true }
+log         = { workspace = true }
+lru         = { workspace = true }
+
+[dev-dependencies]
+tokio.workspace = true

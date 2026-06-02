@@ -1,0 +1,26 @@
+[package]
+name = "oxisql-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Core traits and types for OxiSQL — the COOLJAPAN Pure-Rust SQL facade"
+readme = "README.md"
+categories = ["database", "asynchronous"]
+keywords = ["database", "sql", "pure-rust", "cooljapan", "oxisql"]
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+log.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "value_benchmarks"
+harness = false
