@@ -106,6 +106,9 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 mod params;
 pub use params::{bind_params, bind_params_string, escape_sql_value};
 
+pub mod csv;
+pub use csv::{build_csv_output, parse_csv, value_to_csv_field};
+
 #[cfg(feature = "fjall-storage")]
 mod fjall_storage;
 #[cfg(feature = "fjall-storage")]
@@ -1127,6 +1130,116 @@ impl EmbeddedConnection {
     pub async fn import_from_sql(&self, sql: &str) -> Result<(), OxiSqlError> {
         self.execute_batch(sql).await?;
         Ok(())
+    }
+
+    // ── CSV import / export ───────────────────────────────────────────────────
+
+    /// Import CSV data into a new table.
+    ///
+    /// The first row of the CSV is treated as the header — it provides the
+    /// column names for the newly created table.  All columns are declared
+    /// `TEXT`; explicit `CAST` in subsequent queries can convert to other types.
+    ///
+    /// # Behaviour
+    ///
+    /// - A new table named `table_name` is created (will error if it already
+    ///   exists — drop it first if you want to re-import).
+    /// - Each subsequent CSV row becomes one `INSERT` statement.
+    /// - Empty fields are imported as `NULL`.
+    /// - Column names are sanitised: spaces/hyphens become underscores, leading
+    ///   digits get a `col_` prefix, non-ASCII characters are stripped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OxiSqlError::Other`] if the CSV cannot be parsed, if any
+    /// column name cannot be sanitised, or if no header row is present.
+    /// Returns [`OxiSqlError::Execution`] if any DDL/DML statement fails.
+    pub async fn import_csv(&self, table_name: &str, csv_data: &str) -> Result<usize, OxiSqlError> {
+        let rows = csv::parse_csv(csv_data)?;
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        // First row is the header
+        let headers = &rows[0];
+        if headers.is_empty() {
+            return Err(OxiSqlError::Other("CSV import: header row is empty".into()));
+        }
+
+        // Sanitise all column names
+        let columns: Vec<String> = headers
+            .iter()
+            .map(|h| csv::sanitise_column_name(h))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // CREATE TABLE
+        let ddl = csv::build_create_table_sql(table_name, &columns);
+        self.execute(&ddl, &[]).await?;
+
+        // INSERT each data row
+        let data_rows = &rows[1..];
+        let mut inserted = 0usize;
+        for row in data_rows {
+            if row.is_empty() || row.iter().all(|f| f.is_empty()) {
+                continue; // skip blank rows
+            }
+            // Pad or truncate to match column count
+            let values: Vec<String> = (0..columns.len())
+                .map(|i| row.get(i).cloned().unwrap_or_default())
+                .collect();
+            let dml = csv::build_insert_sql(table_name, &columns, &values);
+            self.execute(&dml, &[]).await?;
+            inserted += 1;
+        }
+
+        Ok(inserted)
+    }
+
+    /// Export a table to RFC 4180-compliant CSV.
+    ///
+    /// Queries `SELECT * FROM {table_name}` and writes all rows as CSV with
+    /// a header row containing the column names from the first result row.
+    ///
+    /// # Returns
+    ///
+    /// A `String` containing the CSV data (CRLF line endings per RFC 4180).
+    /// Returns an empty string (header-only CSV) if the table has no rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OxiSqlError::Execution`] if the SELECT fails (e.g. table
+    /// does not exist).
+    pub async fn export_table_to_csv(&self, table_name: &str) -> Result<String, OxiSqlError> {
+        let sql = format!("SELECT * FROM {table_name}");
+        let rows = self.query(&sql, &[]).await?;
+
+        // Derive column headers: prefer row metadata when rows exist,
+        // fall back to schema introspection for empty tables.
+        let headers: Vec<String> = if rows.is_empty() {
+            // Use schema introspection to get column names for empty tables.
+            let col_infos = self.columns(table_name).await.unwrap_or_default();
+            if col_infos.is_empty() {
+                // No column info available — return empty string
+                return Ok(String::new());
+            }
+            col_infos.into_iter().map(|c| c.name).collect()
+        } else {
+            rows[0].columns().to_vec()
+        };
+
+        // Convert rows to Vec<Vec<Value>>
+        let value_rows: Vec<Vec<Value>> = rows
+            .into_iter()
+            .map(|row| {
+                let col_count = row.column_count();
+                (0..col_count)
+                    .map(|i| row.get_by_index(i).cloned().unwrap_or(Value::Null))
+                    .collect()
+            })
+            .collect();
+
+        Ok(csv::build_csv_output(&headers, &value_rows))
     }
 
     // ── oxisql-parse integration ──────────────────────────────────────────────

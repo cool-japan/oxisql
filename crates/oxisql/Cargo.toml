@@ -31,6 +31,8 @@ pool-embedded = ["dep:oxisql-pool", "oxisql-pool/embedded"]
 pool-sqlite-compat = ["dep:oxisql-pool", "oxisql-pool/sqlite-compat", "dep:oxisql-sqlite-compat"]
 # Migration runner
 migrate = ["dep:oxisql-migrate", "oxisql-migrate/migrate"]
+# Interactive REPL binary (requires embedded backend)
+repl = ["embedded", "dep:tokio", "dep:anyhow"]
 
 [dependencies]
 oxisql-core.workspace = true
@@ -38,6 +40,9 @@ async-trait.workspace = true
 rustls.workspace = true
 futures.workspace = true
 log.workspace = true
+# Needed for the REPL binary (feature-gated in the binary itself)
+tokio = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
 
 [dependencies.oxisql-embedded]
 workspace = true
@@ -74,11 +79,16 @@ optional = true
 [dev-dependencies]
 tokio.workspace = true
 arrow.workspace = true
-oxisql-embedded = { workspace = true }
-oxisql-pool = { workspace = true, features = ["embedded"] }
+oxisql-embedded = { path = "../oxisql-embedded" }
+oxisql-pool = { path = "../oxisql-pool", features = ["embedded"] }
 oxisql-core.workspace = true
 criterion = { workspace = true }
 
 [[bench]]
 name = "facade_benchmarks"
 harness = false
+
+[[bin]]
+name = "oxisql-repl"
+path = "src/bin/repl.rs"
+required-features = ["repl"]

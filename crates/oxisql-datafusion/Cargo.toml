@@ -34,10 +34,10 @@ thiserror   = { workspace = true }
 futures     = { workspace = true }
 
 [dev-dependencies]
-oxisql-embedded       = { workspace = true }
-oxisql-postgres       = { workspace = true }
-oxisql-mysql          = { workspace = true }
-oxisql-sqlite-compat  = { workspace = true }
+oxisql-embedded       = { path = "../oxisql-embedded" }
+oxisql-postgres       = { path = "../oxisql-postgres" }
+oxisql-mysql          = { path = "../oxisql-mysql" }
+oxisql-sqlite-compat  = { path = "../oxisql-sqlite-compat" }
 tokio                 = { workspace = true }
 criterion             = { workspace = true }
 

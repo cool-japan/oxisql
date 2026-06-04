@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-06-04
+
+### Added
+
+#### CSV Import / Export (`oxisql-embedded`)
+- `EmbeddedConnection::import_csv(table_name, csv_data)` — import RFC 4180 CSV directly into a new table; first row is treated as the header, column names are sanitised (spaces/hyphens → underscores, leading digits get `col_` prefix), empty fields become `NULL`, all values stored as `TEXT`
+- `EmbeddedConnection::export_table_to_csv(table_name)` — export any table to RFC 4180-compliant CSV (CRLF line endings); values containing commas, double-quotes, or newlines are properly quoted; `NULL` exports as an empty field
+- `oxisql_embedded::csv` module (public) — standalone CSV utilities: `parse_csv`, `build_csv_output`, `value_to_csv_field`, `sanitise_column_name`, `build_create_table_sql`, `build_insert_sql`, `quote_csv_field`; zero external `csv`-crate dependency, hand-rolled state-machine parser handles quoted fields, `""` escapes, bare LF, CRLF, and embedded newlines
+
+#### Interactive SQL REPL (`oxisql` facade — `repl` feature)
+- `oxisql-repl` binary — interactive Read-Eval-Print Loop over any OxiSQL backend; supports `memory://`, `postgres://`, `mysql://`, and `sqlite://` URIs; multi-line statement accumulation (flush on `;` or blank line); tabular result rendering with auto-sized columns and truncation
+- Dot commands: `.help`, `.tables`, `.schema <table>`, `.quit` / `.exit` / `.q`
+- New `repl` feature flag in `oxisql/Cargo.toml` (activates `embedded` + `tokio` + `anyhow`); binary is conditionally compiled (`required-features = ["repl"]`)
+
+### Fixed
+- `unique_test_dir` helper in `oxisql-embedded/tests/memory_persistent.rs` is now guarded with `#[cfg(any(feature = "fjall-storage", feature = "redb-storage"))]`, eliminating the `dead_code` warning when building with default features
+
 ## [0.1.0] - 2026-06-01
 
 ### Added
@@ -98,5 +115,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Statement cache infrastructure: 128-slot LRU cache keyed by rewritten SQL text is in
   place; activates once limbo fixes the `Statement::reset()` / `Program::n_change` bug.
 
-[Unreleased]: https://github.com/cool-japan/oxisql/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/cool-japan/oxisql/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/cool-japan/oxisql/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/cool-japan/oxisql/releases/tag/v0.1.0

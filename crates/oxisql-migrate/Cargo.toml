@@ -37,8 +37,8 @@ oxisql-embedded = { workspace = true, optional = true }
 tokio.workspace = true
 gluesql.workspace = true
 sqlparser.workspace = true
-oxisql-embedded.workspace = true
-oxisql-pool = { workspace = true, features = ["embedded"] }
+oxisql-embedded = { path = "../oxisql-embedded" }
+oxisql-pool = { path = "../oxisql-pool", features = ["embedded"] }
 criterion = { workspace = true }
 
 [[bin]]

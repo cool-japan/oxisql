@@ -9,7 +9,7 @@
 
 ```toml
 [dependencies]
-oxisql-sqlite-compat = "0.1.0"
+oxisql-sqlite-compat = "0.1.1"
 ```
 
 ## Quick Start

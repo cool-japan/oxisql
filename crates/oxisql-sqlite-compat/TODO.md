@@ -42,6 +42,7 @@
   params to positional `?` before forwarding to limbo.  The limbo-level named
   param binding path (`todo!()`) is bypassed entirely.
 - [ ] Add savepoint support once limbo implements it
+  - **BLOCKED: upstream Limbo 0.0.22 has no savepoint API**
 - [x] DataFusion registration for SQLite tables
 - [x] `execute_batch` via token-aware state-machine split (handles `;` in literals, identifiers, comments)
 

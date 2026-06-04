@@ -10,10 +10,10 @@
 ```toml
 [dependencies]
 # Choose the backends you need:
-oxisql-pool = { version = "0.1.0", features = ["embedded"] }
-oxisql-pool = { version = "0.1.0", features = ["postgres"] }
-oxisql-pool = { version = "0.1.0", features = ["mysql"] }
-oxisql-pool = { version = "0.1.0", features = ["sqlite"] }  # Pure-Rust Limbo
+oxisql-pool = { version = "0.1.1", features = ["embedded"] }
+oxisql-pool = { version = "0.1.1", features = ["postgres"] }
+oxisql-pool = { version = "0.1.1", features = ["mysql"] }
+oxisql-pool = { version = "0.1.1", features = ["sqlite"] }  # Pure-Rust Limbo
 ```
 
 ## Quick Start

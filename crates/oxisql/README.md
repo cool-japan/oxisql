@@ -10,16 +10,16 @@
 ```toml
 [dependencies]
 # In-memory only
-oxisql = { version = "0.1.0", features = ["embedded"] }
+oxisql = { version = "0.1.1", features = ["embedded"] }
 
 # PostgreSQL
-oxisql = { version = "0.1.0", features = ["postgres"] }
+oxisql = { version = "0.1.1", features = ["postgres"] }
 
 # MySQL
-oxisql = { version = "0.1.0", features = ["mysql"] }
+oxisql = { version = "0.1.1", features = ["mysql"] }
 
 # All backends + pooling
-oxisql = { version = "0.1.0", features = ["embedded", "postgres", "mysql", "pool-embedded", "pool-postgres", "pool-mysql"] }
+oxisql = { version = "0.1.1", features = ["embedded", "postgres", "mysql", "pool-embedded", "pool-postgres", "pool-mysql"] }
 ```
 
 ## Quick Start

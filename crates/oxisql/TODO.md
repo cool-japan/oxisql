@@ -28,6 +28,7 @@ Facade crate providing `connect(uri)` entry-point dispatching to embedded, Postg
 - [x] Add `connect_or_create(uri)` — like `connect` but creates the database if it does not exist; embedded always works; PG/MySQL auto-create planned (~30 SLOC)
 - [x] Add feature flag combinations documentation — which features enable which backends (~10 SLOC docs) — Feature Flags table in lib.rs lines 21-36 lists each feature, URI scheme, and backend
 - [x] Add `version()` function returning crate version string (~3 SLOC)
+- [x] Add interactive SQL REPL binary — `oxisql-repl` behind `repl` feature; connects to any URI (default `memory://`); dot commands: `.help`, `.tables`, `.schema <table>`, `.quit`; multi-line SQL accumulation until `;` or blank line; `SELECT`/`WITH`/`EXPLAIN` → display_rows (tabular); other SQL → execute with row count; terminal-detection for prompt suppression in pipe mode; `src/bin/repl.rs` (~270 SLOC)
 
 ## Testing
 - [x] Test `connect("memory://")` end-to-end — CREATE TABLE, INSERT, SELECT, UPDATE, DELETE (~25 SLOC)

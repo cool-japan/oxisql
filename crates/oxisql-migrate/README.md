@@ -9,7 +9,7 @@
 
 ```toml
 [dependencies]
-oxisql-migrate = { version = "0.1.0", features = ["migrate"] }
+oxisql-migrate = { version = "0.1.1", features = ["migrate"] }
 ```
 
 The `migrate` feature enables the runner, tracker, and pool integration. Without it, only `MigrationError`, `MigrateOptions`, and the `scanner` module are compiled.

@@ -16,8 +16,8 @@ collapses these into one facade, defaults to Pure Rust drivers (`tokio-postgres`
 rustcrypto provider (no `ring`, no `openssl-sys`), and keeps `libpq` available
 only behind an opt-in `system` feature for legacy parity.
 
-**Version 0.1.0 — released 2026-06-01.**
-10 crates, 890 tests passing (64 skipped), zero clippy warnings, zero production stubs.
+**Version 0.1.1 — released 2026-06-04.**
+10 crates, 924 tests passing (64 skipped), zero clippy warnings, zero production stubs.
 ~33,902 lines of Rust across 145 source files.
 
 ---
@@ -46,14 +46,14 @@ Add to your workspace's root `Cargo.toml`:
 ```toml
 # Workspace root Cargo.toml
 [workspace.dependencies]
-oxisql = { version = "0.1.0", features = ["embedded"] }
+oxisql = { version = "0.1.1", features = ["embedded"] }
 ```
 
 Or add to a single crate:
 
 ```toml
 [dependencies]
-oxisql = { version = "0.1.0", features = ["embedded", "postgres", "pool-embedded", "migrate"] }
+oxisql = { version = "0.1.1", features = ["embedded", "postgres", "pool-embedded", "migrate"] }
 ```
 
 ---
@@ -254,23 +254,23 @@ cross-backend OLAP queries.
 
 ```toml
 # In-memory only
-oxisql = { version = "0.1.0", features = ["embedded"] }
+oxisql = { version = "0.1.1", features = ["embedded"] }
 
 # PostgreSQL + pooling
-oxisql = { version = "0.1.0", features = ["postgres", "pool-postgres"] }
+oxisql = { version = "0.1.1", features = ["postgres", "pool-postgres"] }
 
 # MySQL + migrations
-oxisql = { version = "0.1.0", features = ["mysql", "pool-mysql", "migrate"] }
+oxisql = { version = "0.1.1", features = ["mysql", "pool-mysql", "migrate"] }
 
 # All OLTP backends + pooling + migrations
-oxisql = { version = "0.1.0", features = [
+oxisql = { version = "0.1.1", features = [
     "embedded", "postgres", "mysql",
     "pool-embedded", "pool-postgres", "pool-mysql",
     "migrate",
 ] }
 
 # Full stack including DataFusion OLAP
-oxisql = { version = "0.1.0", features = [
+oxisql = { version = "0.1.1", features = [
     "embedded", "postgres", "mysql", "datafusion",
     "pool-embedded", "pool-postgres", "pool-mysql",
     "migrate",

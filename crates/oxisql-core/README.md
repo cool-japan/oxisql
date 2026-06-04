@@ -9,7 +9,7 @@
 
 ```toml
 [dependencies]
-oxisql-core = "0.1.0"
+oxisql-core = "0.1.1"
 ```
 
 ## Quick Start

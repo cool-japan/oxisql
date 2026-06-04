@@ -32,6 +32,7 @@ In-memory SQL engine backed by GlueSQL `MemoryStorage`. `EmbeddedConnection` imp
 - [x] Add `EmbeddedConnection::export_as_sql()` — returns `UnsupportedUri` (GlueSQL MemoryStorage has no stable INFORMATION_SCHEMA) (~10 SLOC)
 - [x] Implement export_as_sql() via GlueSQL Store::fetch_all_schemas() + Schema::to_ddl() (Wave 39+)
 - [x] Add `EmbeddedConnection::import_from_sql(sql)` — delegates to `execute_batch` to load SQL dump strings (~5 SLOC)
+- [x] Add CSV import/export — `import_csv(table, csv_data)` creates a new table from RFC 4180 CSV (first row = header, all columns TEXT, empty fields → NULL); `export_table_to_csv(table)` queries all rows and writes RFC 4180 CSV with CRLF line endings; pure-Rust state-machine CSV parser handles quoted commas, `""` escapes, bare LF and CRLF; `src/csv.rs` (~350 SLOC, 24 unit tests); integration tests in `tests/csv_import_export.rs` (~200 SLOC, 14 tests)
 
 ## Testing
 - [x] Test all GlueSQL value-to-OxiSQL value conversions — verify each of the 20+ `glue_value_to_oxisql` branches (~40 SLOC)

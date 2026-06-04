@@ -9,12 +9,12 @@
 
 ```toml
 [dependencies]
-oxisql-embedded = "0.1.0"
+oxisql-embedded = "0.1.1"
 
 # Optional persistent backends:
-# oxisql-embedded = { version = "0.1.0", features = ["fjall-storage"] }
-# oxisql-embedded = { version = "0.1.0", features = ["redb-storage"] }
-# oxisql-embedded = { version = "0.1.0", features = ["sled-storage"] }
+# oxisql-embedded = { version = "0.1.1", features = ["fjall-storage"] }
+# oxisql-embedded = { version = "0.1.1", features = ["redb-storage"] }
+# oxisql-embedded = { version = "0.1.1", features = ["sled-storage"] }
 ```
 
 ## Status

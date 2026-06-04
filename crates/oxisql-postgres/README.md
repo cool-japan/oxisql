@@ -9,7 +9,7 @@
 
 ```toml
 [dependencies]
-oxisql-postgres = "0.1.0"
+oxisql-postgres = "0.1.1"
 ```
 
 ## Quick Start

@@ -47,7 +47,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
-oxisql-migrate = { workspace = true, features = ["migrate"] }
+oxisql-migrate = { path = "../oxisql-migrate", features = ["migrate"] }
 criterion = { workspace = true }
 
 [[bench]]

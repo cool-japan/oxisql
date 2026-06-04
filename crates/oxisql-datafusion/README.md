@@ -9,11 +9,11 @@
 
 ```toml
 [dependencies]
-oxisql-datafusion = "0.1.0"
+oxisql-datafusion = "0.1.1"
 
 # Optional features:
-# oxisql-datafusion = { version = "0.1.0", features = ["columnar"] }  # Parquet support
-# oxisql-datafusion = { version = "0.1.0", features = ["parse"] }     # Plan bridge
+# oxisql-datafusion = { version = "0.1.1", features = ["columnar"] }  # Parquet support
+# oxisql-datafusion = { version = "0.1.1", features = ["parse"] }     # Plan bridge
 ```
 
 ## Quick Start

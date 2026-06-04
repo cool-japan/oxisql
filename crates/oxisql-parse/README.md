@@ -9,7 +9,7 @@
 
 ```toml
 [dependencies]
-oxisql-parse = "0.1.0"
+oxisql-parse = "0.1.1"
 ```
 
 ## Quick Start

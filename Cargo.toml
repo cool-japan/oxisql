@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.89"
 authors = ["COOLJAPAN OU (Team Kitasan)"]
@@ -23,15 +23,15 @@ repository = "https://github.com/cool-japan/oxisql"
 description = "OxiSQL is the COOLJAPAN-blessed Pure-Rust database layer: a unified SQL surface that spans embedded engines, OLTP wire-protocol clients (Postgres, MySQL), and a SQLite-compatible embedded path — without `libpq`, `mysqlclient`, `libsqlite3`, or any C/C++ DB driver."
 
 [workspace.dependencies]
-oxisql-core           = { path = "crates/oxisql-core",           version = "0.1.0" }
-oxisql-parse          = { path = "crates/oxisql-parse",          version = "0.1.0" }
-oxisql-embedded       = { path = "crates/oxisql-embedded",       version = "0.1.0" }
-oxisql-postgres       = { path = "crates/oxisql-postgres",       version = "0.1.0" }
-oxisql-mysql          = { path = "crates/oxisql-mysql",          version = "0.1.0" }
-oxisql-datafusion     = { path = "crates/oxisql-datafusion",     version = "0.1.0" }
-oxisql-pool           = { path = "crates/oxisql-pool",           version = "0.1.0" }
-oxisql-migrate        = { path = "crates/oxisql-migrate",        version = "0.1.0" }
-oxisql-sqlite-compat  = { path = "crates/oxisql-sqlite-compat",  version = "0.1.0" }
+oxisql-core           = { path = "crates/oxisql-core",           version = "0.1.1" }
+oxisql-parse          = { path = "crates/oxisql-parse",          version = "0.1.1" }
+oxisql-embedded       = { path = "crates/oxisql-embedded",       version = "0.1.1" }
+oxisql-postgres       = { path = "crates/oxisql-postgres",       version = "0.1.1" }
+oxisql-mysql          = { path = "crates/oxisql-mysql",          version = "0.1.1" }
+oxisql-datafusion     = { path = "crates/oxisql-datafusion",     version = "0.1.1" }
+oxisql-pool           = { path = "crates/oxisql-pool",           version = "0.1.1" }
+oxisql-migrate        = { path = "crates/oxisql-migrate",        version = "0.1.1" }
+oxisql-sqlite-compat  = { path = "crates/oxisql-sqlite-compat",  version = "0.1.1" }
 
 # DataFusion backend — default-features=false avoids parquet/compression *-sys crates
 datafusion = { version = "53.1.0", default-features = false, features = ["sql"] }
@@ -51,7 +51,7 @@ rustls-pki-types        = { version = "1" }
 rustls-pemfile          = { version = "2" }
 tokio-rustls            = { version = "0.26", default-features = false, features = ["tls12"] }
 rustls-rustcrypto       = { version = "0.0.2-alpha" }
-oxitls                  = { version = "0.1.0", default-features = false, features = ["pure", "webpki-roots"] }
+oxitls                  = { version = "0.1.1", default-features = false, features = ["pure", "webpki-roots"] }
 bytes                   = { version = "1" }
 time                    = { version = "0.3.47", features = ["formatting", "macros"] }
 uuid                    = { version = "1.23.2" }
@@ -104,4 +104,4 @@ proptest  = { version = "1.11.0", default-features = false, features = ["std"] }
 serde_json = { version = "1" }
 
 # OxiStore columnar Parquet backend (Pure Rust, optional)
-oxistore-columnar = { version = "0.1.0" }
+oxistore-columnar = { version = "0.1.1" }

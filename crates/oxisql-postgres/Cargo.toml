@@ -36,7 +36,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
-oxisql-pool = { workspace = true, features = ["postgres"] }
+oxisql-pool = { path = "../oxisql-pool", features = ["postgres"] }
 deadpool-postgres.workspace = true
 criterion = { workspace = true }
 

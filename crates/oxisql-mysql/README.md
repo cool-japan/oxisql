@@ -9,7 +9,7 @@
 
 ```toml
 [dependencies]
-oxisql-mysql = "0.1.0"
+oxisql-mysql = "0.1.1"
 ```
 
 ## Quick Start

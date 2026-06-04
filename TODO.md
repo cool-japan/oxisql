@@ -1,10 +1,10 @@
-# OxiSQL TODO — v0.1.0
+# OxiSQL TODO — v0.1.1
 
-Last updated: 2026-06-01
+Last updated: 2026-06-04
 
-## Released: 0.1.0 (2026-06-01)
+## Released: 0.1.1 (2026-06-04)
 
-10 crates fully implemented. 890 tests pass (64 skipped). Zero clippy warnings. Zero production stubs.
+10 crates fully implemented. 924 tests pass (64 skipped). Zero clippy warnings. Zero production stubs.
 ~33,902 lines of Rust across 145 source files, 202+ public API items.
 Pure Rust: zero C/FFI in default build — all `*-sys` crates are feature-gated.
 
@@ -13,6 +13,13 @@ backends via `oxisql-core` default trait methods; `EmbeddedConnection` schema in
 (tables/columns/indexes/foreign_keys) via GlueSQL catalog; honest ROLLBACK error in
 `oxisql-sqlite-compat`; `OxiSqlError::Params` variant; 128-slot LRU statement cache
 infrastructure in `oxisql-sqlite-compat`. 37 additional tests (852 → 889).
+
+Third ultra pass (2026-06-03): CSV import/export for embedded connections
+(`import_csv`/`export_table_to_csv` on `EmbeddedConnection`, pure-Rust RFC 4180 CSV
+state-machine parser in `oxisql-embedded/src/csv.rs`); interactive SQL REPL binary
+(`oxisql-repl` behind `repl` feature in `oxisql` crate, `.help`/`.tables`/`.schema`
+commands, multi-line SQL accumulation, terminal-detection for pipe mode); workspace
+dependency version fix (`oxistore-columnar` 0.1.1 → 0.1.0 to match crates.io).
 
 Milestones derived from `../phase3/oxisql_blueprint.md` section Phased milestones.
 
@@ -151,6 +158,7 @@ These items cannot be resolved without upstream changes in Limbo:
 - [ ] **oxisql-sqlite-compat: PRAGMA foreign_key_list** — FK metadata currently
   retrieved via DDL parsing of `sqlite_master` because PRAGMA is not yet
   supported by Limbo 0.0.22.
+  - **BLOCKED: Limbo 0.0.22 does not implement PRAGMA commands; unblocks when Limbo 0.1+ is released**
 
 ## Open Questions
 

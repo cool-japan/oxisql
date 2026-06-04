@@ -2,6 +2,13 @@
 
 /// Generate a unique temp directory path for a test, using process ID and
 /// sub-second nanosecond timestamp to avoid clashes between concurrent test runs.
+///
+/// Only the persistent-storage test modules below (`fjall_storage_tests` and
+/// `redb_storage_tests`) consume this helper, and both are feature-gated. The
+/// same `cfg` guard is mirrored here so the helper is not compiled — and thus
+/// does not trip `dead_code` — when neither backend feature is enabled (e.g. a
+/// default-feature `cargo nextest` build).
+#[cfg(any(feature = "fjall-storage", feature = "redb-storage"))]
 fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "{}_{}_{}",
