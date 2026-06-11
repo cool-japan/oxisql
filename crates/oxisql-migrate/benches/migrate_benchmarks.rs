@@ -54,7 +54,7 @@ fn bench_apply_migrations(c: &mut Criterion) {
             }
 
             let pool = EmbeddedPool::new();
-            let runner = MigrationRunner::new(dir.to_str().unwrap());
+            let mut runner = MigrationRunner::new(dir.to_str().unwrap());
             let n = runner.run_pooled(&pool).await.unwrap();
             std::hint::black_box(n);
 

@@ -10,17 +10,23 @@
 //! 4. [`LimitPushThrough`]   — push `LIMIT N` into single-table scans
 //! 5. [`JoinAlgorithmPass`]  — annotate `Join` nodes with an algorithm hint
 
+pub mod cse;
+pub mod expr_util;
 mod folding;
 pub mod join_algo;
+pub mod join_reorder;
 mod limit;
 mod pruning;
 mod pushdown;
+pub mod simplify;
 
+pub use cse::CommonSubexprElimination;
 pub use folding::ConstantFolding;
 pub use join_algo::{JoinAlgoHint, JoinAlgorithmPass};
 pub use limit::LimitPushThrough;
 pub use pruning::ProjectionPruning;
 pub use pushdown::PredicatePushdown;
+pub use simplify::PredicateSimplification;
 
 use crate::LogicalPlan;
 
@@ -54,6 +60,8 @@ impl Optimizer {
     pub fn new() -> Self {
         let passes: Vec<Box<dyn OptPass>> = vec![
             Box::new(PredicatePushdown),
+            Box::new(PredicateSimplification),
+            Box::new(CommonSubexprElimination),
             Box::new(ProjectionPruning { required: vec![] }),
             Box::new(ConstantFolding),
             Box::new(LimitPushThrough),
@@ -76,6 +84,25 @@ impl Optimizer {
 impl Default for Optimizer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Optimizer {
+    /// Create an [`Optimizer`] with the standard pipeline plus cost-aware passes.
+    ///
+    /// Cost-aware passes (such as `JoinReorder`) own an `Arc<CostModel>` and
+    /// require this constructor to be registered.  Currently this returns the
+    /// same five-pass pipeline as [`Optimizer::new`]; cost-aware passes will
+    /// attach themselves here as they are added in subsequent phases.
+    pub fn with_cost_model(model: crate::cost::CostModel) -> Self {
+        use std::sync::Arc;
+        let model = Arc::new(model);
+        let mut opt = Self::new();
+        opt.passes
+            .push(Box::new(crate::optimizer::join_reorder::JoinReorder::new(
+                model,
+            )));
+        opt
     }
 }
 

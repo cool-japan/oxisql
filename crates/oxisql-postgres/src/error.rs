@@ -25,6 +25,8 @@ pub enum PgError {
     Copy(String),
     /// A LISTEN/NOTIFY error (invalid channel name or unsupported connection type).
     Notify(String),
+    /// A connection-level error (e.g. cancel request failed).
+    Connection(String),
 }
 
 impl std::fmt::Display for PgError {
@@ -40,6 +42,7 @@ impl std::fmt::Display for PgError {
             PgError::PoolExhausted(msg) => write!(f, "postgres pool exhausted: {msg}"),
             PgError::Copy(msg) => write!(f, "postgres COPY error: {msg}"),
             PgError::Notify(msg) => write!(f, "postgres NOTIFY error: {msg}"),
+            PgError::Connection(msg) => write!(f, "postgres connection error: {msg}"),
         }
     }
 }
@@ -54,7 +57,8 @@ impl std::error::Error for PgError {
             | PgError::Timeout(_)
             | PgError::PoolExhausted(_)
             | PgError::Copy(_)
-            | PgError::Notify(_) => None,
+            | PgError::Notify(_)
+            | PgError::Connection(_) => None,
         }
     }
 }
@@ -99,6 +103,9 @@ impl From<PgError> for oxisql_core::OxiSqlError {
             PgError::Tls(msg) => oxisql_core::OxiSqlError::Other(msg),
             PgError::Copy(msg) => oxisql_core::OxiSqlError::Other(format!("COPY error: {msg}")),
             PgError::Notify(msg) => oxisql_core::OxiSqlError::Other(format!("NOTIFY error: {msg}")),
+            PgError::Connection(msg) => {
+                oxisql_core::OxiSqlError::Other(format!("connection error: {msg}"))
+            }
         }
     }
 }

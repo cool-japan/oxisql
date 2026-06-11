@@ -19,7 +19,8 @@
 //! use oxisql_pool::sqlite_compat::new_sqlite_compat_pool;
 //!
 //! // File-backed pool
-//! let pool = new_sqlite_compat_pool("/tmp/mydb.sqlite3", 4).await?;
+//! # let path = std::env::temp_dir().join("mydb.sqlite3");
+//! let pool = new_sqlite_compat_pool(path.to_str().unwrap(), 4).await?;
 //! let conn = pool.get().await?;
 //! // use conn as a &SqliteConnection (via Deref)
 //! # Ok(())
@@ -193,3 +194,61 @@ pub async fn new_sqlite_pool(
 /// without changes after the `sqlite` feature was migrated to the Pure-Rust
 /// Limbo backend.
 pub type SqlitePool = SqliteCompatPool;
+
+/// Create a new [`SqliteCompatPool`] using the provided [`crate::PoolConfig`].
+///
+/// The pool is built with `config.max_size` slots.  If `config.min_idle` is
+/// set and positive, that many connections are eagerly pre-warmed during
+/// construction: they are checked out simultaneously (forcing deadpool to
+/// create distinct connection objects), then immediately released back to the
+/// idle pool.  This avoids cold-start latency on the first `min_idle`
+/// checkouts.  The warm count is capped at `config.max_size`.
+///
+/// # Parameters
+///
+/// - `path` — File path for the SQLite database, or `":memory:"` for in-memory.
+/// - `config` — Pool configuration.  `config.max_size` sets the connection
+///   limit; `config.min_idle` controls the number of eagerly-opened
+///   connections (capped at `max_size`).
+///
+/// # Errors
+///
+/// Returns [`crate::PoolError::Build`] if pool construction fails (e.g. when
+/// `max_size` is 0, or the path contains non-UTF-8 characters) or
+/// [`crate::PoolError::Sqlite`] if a pre-warm connection attempt fails.
+pub async fn new_sqlite_compat_pool_with_config(
+    path: impl AsRef<std::path::Path>,
+    config: crate::PoolConfig,
+) -> Result<SqliteCompatPool, crate::PoolError> {
+    let path_str = path
+        .as_ref()
+        .to_str()
+        .ok_or_else(|| crate::PoolError::Build("path contains invalid UTF-8".into()))?
+        .to_owned();
+
+    let manager = SqliteCompatManager::new(path_str);
+    let pool = deadpool::managed::Pool::builder(manager)
+        .max_size(config.max_size)
+        .build()
+        .map(SqliteCompatPool)
+        .map_err(|e| crate::PoolError::Build(e.to_string()))?;
+
+    // Pre-warm the pool by holding min_idle connections simultaneously so
+    // that deadpool creates distinct connection objects, then releasing them
+    // all back to the idle pool.  Holding concurrently (not sequentially) is
+    // required: a sequential get-drop cycle would always reuse the same slot.
+    if let Some(min_idle) = config.min_idle {
+        let warm_count = min_idle.min(config.max_size);
+        if warm_count > 0 {
+            let mut connections = Vec::with_capacity(warm_count);
+            for _ in 0..warm_count {
+                let conn = pool.get().await.map_err(crate::PoolError::Sqlite)?;
+                connections.push(conn);
+            }
+            // Releasing all handles returns them to the idle pool.
+            drop(connections);
+        }
+    }
+
+    Ok(pool)
+}

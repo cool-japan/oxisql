@@ -18,7 +18,9 @@ lru.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-criterion = { workspace = true }
+criterion   = { workspace = true }
+proptest    = { workspace = true }
+serde_json  = { workspace = true }
 
 [[bench]]
 name = "parse_benchmarks"

@@ -97,7 +97,8 @@ impl SchemaValidator {
             | LogicalPlan::Sort { input, .. }
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::Aggregate { input, .. }
-            | LogicalPlan::Window { input, .. } => {
+            | LogicalPlan::Window { input, .. }
+            | LogicalPlan::Compute { input, .. } => {
                 self.validate_scans(input)?;
             }
             LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
@@ -130,7 +131,8 @@ impl SchemaValidator {
             | LogicalPlan::Sort { input, .. }
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::Aggregate { input, .. }
-            | LogicalPlan::Window { input, .. } => {
+            | LogicalPlan::Window { input, .. }
+            | LogicalPlan::Compute { input, .. } => {
                 self.collect_scan_tables(input, out);
             }
             LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
@@ -226,7 +228,8 @@ impl SchemaValidator {
             | LogicalPlan::Sort { input, .. }
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::Aggregate { input, .. }
-            | LogicalPlan::Window { input, .. } => {
+            | LogicalPlan::Window { input, .. }
+            | LogicalPlan::Compute { input, .. } => {
                 self.validate_projections(input, accessible_tables)
             }
             LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {

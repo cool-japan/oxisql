@@ -67,7 +67,7 @@ pub struct IndexInfo {
 }
 
 /// A foreign key constraint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ForeignKeyInfo {
     /// The constraint name.
     pub constraint_name: String,
@@ -77,4 +77,12 @@ pub struct ForeignKeyInfo {
     pub foreign_table: String,
     /// The referenced column in the parent table.
     pub foreign_column: String,
+    /// Referential action on `UPDATE` of parent row (`CASCADE`, `SET NULL`, etc.).
+    ///
+    /// `None` when the backend does not surface this information.
+    pub on_update: Option<String>,
+    /// Referential action on `DELETE` of parent row.
+    ///
+    /// `None` when the backend does not surface this information.
+    pub on_delete: Option<String>,
 }

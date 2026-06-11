@@ -11,12 +11,12 @@
 //! let stmt = parse_one("SELECT id FROM users WHERE active = true").unwrap();
 //! let plan = plan_statement(&stmt).unwrap();
 //! let model = CostModel::new()
-//!     .with_table_stats("users", TableStats { row_count: 50_000, avg_row_size_bytes: 80, index_on: vec![] });
+//!     .with_table_stats("users", TableStats { row_count: 50_000, avg_row_size_bytes: 80, index_on: vec![], ..Default::default() });
 //! let est = model.estimate(&plan);
 //! assert!(est.rows < 50_000.0);
 //! ```
 
-use crate::LogicalPlan;
+use crate::{JoinType, LogicalPlan};
 use std::collections::HashMap;
 
 // ── CostEstimate ─────────────────────────────────────────────────────────────
@@ -69,6 +69,8 @@ pub struct TableStats {
     pub avg_row_size_bytes: u64,
     /// Column names that have an index.
     pub index_on: Vec<String>,
+    /// Per-column statistics keyed by column name (lower-cased).
+    pub column_stats: HashMap<String, ColumnStats>,
 }
 
 impl Default for TableStats {
@@ -77,8 +79,34 @@ impl Default for TableStats {
             row_count: 10_000,
             avg_row_size_bytes: 100,
             index_on: vec![],
+            column_stats: HashMap::new(),
         }
     }
+}
+
+impl TableStats {
+    /// Attach per-column statistics to this table description.
+    ///
+    /// Returns `self` so that builder calls can be chained.
+    pub fn with_column(mut self, name: impl Into<String>, stats: ColumnStats) -> Self {
+        self.column_stats.insert(name.into(), stats);
+        self
+    }
+}
+
+// ── ColumnStats ───────────────────────────────────────────────────────────────
+
+/// Per-column statistics for selectivity estimation.
+#[derive(Debug, Clone, Default)]
+pub struct ColumnStats {
+    /// Number of distinct values in the column.
+    pub ndv: u64,
+    /// Fraction of rows containing NULL in `[0, 1]`.
+    pub null_fraction: f64,
+    /// Minimum observed value (numeric approximation).
+    pub min: Option<f64>,
+    /// Maximum observed value (numeric approximation).
+    pub max: Option<f64>,
 }
 
 // ── CostModel ────────────────────────────────────────────────────────────────
@@ -144,22 +172,51 @@ impl CostModel {
         io_cost + self.cpu_weight * cpu_cost
     }
 
+    /// Estimate the cost of a full table scan on `table`.
+    ///
+    /// This is a pure function of the registered [`TableStats`] for the table;
+    /// it is extracted so that the join-reorder pass can call it directly
+    /// without constructing a synthetic `LogicalPlan::Scan` node.
+    pub(crate) fn estimate_scan(&self, table: &str) -> CostEstimate {
+        let s = self.table_stats(table);
+        let rows = s.row_count as f64;
+        let io_cost = rows * s.avg_row_size_bytes as f64 / 8192.0;
+        let cpu_cost = rows * self.cpu_weight;
+        CostEstimate {
+            rows,
+            cpu_cost,
+            io_cost,
+            total_cost: self.total(cpu_cost, io_cost),
+        }
+    }
+
+    /// Estimate the cost of joining two already-estimated sub-plans.
+    ///
+    /// `selectivity` controls the output row fraction: `l.rows * r.rows * selectivity`.
+    /// Pass `self.filter_selectivity` for the default behaviour.  The join-reorder
+    /// pass can supply per-predicate selectivities from column statistics.
+    pub(crate) fn estimate_join_from(
+        &self,
+        l: &CostEstimate,
+        r: &CostEstimate,
+        selectivity: f64,
+    ) -> CostEstimate {
+        let rows = l.rows * r.rows * selectivity;
+        let cpu_cost = l.cpu_cost + r.cpu_cost + l.rows + r.rows + rows;
+        let io_cost = l.io_cost + r.io_cost;
+        CostEstimate {
+            rows,
+            cpu_cost,
+            io_cost,
+            total_cost: self.total(cpu_cost, io_cost),
+        }
+    }
+
     /// Estimate the cost of executing `plan`.
     pub fn estimate(&self, plan: &LogicalPlan) -> CostEstimate {
         match plan {
             // ── Scan ──────────────────────────────────────────────────────
-            LogicalPlan::Scan { table, .. } => {
-                let s = self.table_stats(table);
-                let rows = s.row_count as f64;
-                let io_cost = rows * s.avg_row_size_bytes as f64 / 8192.0;
-                let cpu_cost = rows * self.cpu_weight;
-                CostEstimate {
-                    rows,
-                    cpu_cost,
-                    io_cost,
-                    total_cost: self.total(cpu_cost, io_cost),
-                }
-            }
+            LogicalPlan::Scan { table, .. } => self.estimate_scan(table),
 
             // ── Filter ────────────────────────────────────────────────────
             LogicalPlan::Filter { input, .. } => {
@@ -190,17 +247,40 @@ impl CostModel {
             }
 
             // ── Join ──────────────────────────────────────────────────────
-            LogicalPlan::Join { left, right, .. } => {
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                ..
+            } => {
                 let l = self.estimate(left);
                 let r = self.estimate(right);
-                let rows = l.rows * r.rows * 0.1;
-                let cpu_cost = l.cpu_cost + r.cpu_cost + l.rows + r.rows + rows;
-                let io_cost = l.io_cost + r.io_cost;
-                CostEstimate {
-                    rows,
-                    cpu_cost,
-                    io_cost,
-                    total_cost: self.total(cpu_cost, io_cost),
+                match join_type {
+                    JoinType::LeftSemi => {
+                        // Semi-join: at most one output row per left row.
+                        let rows = l.rows.min(l.rows * self.filter_selectivity);
+                        let cpu_cost = l.cpu_cost + r.cpu_cost + l.rows + r.rows + rows;
+                        let io_cost = l.io_cost + r.io_cost;
+                        CostEstimate {
+                            rows,
+                            cpu_cost,
+                            io_cost,
+                            total_cost: self.total(cpu_cost, io_cost),
+                        }
+                    }
+                    JoinType::LeftAnti => {
+                        // Anti-join: rows from the left that have no match.
+                        let rows = (l.rows * (1.0 - self.filter_selectivity)).min(l.rows);
+                        let cpu_cost = l.cpu_cost + r.cpu_cost + l.rows + r.rows + rows;
+                        let io_cost = l.io_cost + r.io_cost;
+                        CostEstimate {
+                            rows,
+                            cpu_cost,
+                            io_cost,
+                            total_cost: self.total(cpu_cost, io_cost),
+                        }
+                    }
+                    _ => self.estimate_join_from(&l, &r, self.filter_selectivity),
                 }
             }
 
@@ -344,6 +424,122 @@ impl CostModel {
                     total_cost: self.total(cpu_cost, io_cost),
                 }
             }
+
+            // ── Compute ───────────────────────────────────────────────────
+            // A Compute node is a pure naming layer that introduces no
+            // additional compute overhead.  Pass through the input's cost
+            // unchanged.
+            LogicalPlan::Compute { input, .. } => self.estimate(input),
+        }
+    }
+}
+
+// ── NodeCost ──────────────────────────────────────────────────────────────────
+
+/// An annotated plan cost tree mirroring the [`LogicalPlan`] structure.
+///
+/// Each node stores the operator name, its estimated cost, and the cost trees
+/// for its children.  Built by [`CostModel::explain_costs`] and consumed by
+/// the verbose / JSON explain formatters.
+#[derive(Debug, Clone)]
+pub struct NodeCost {
+    /// Short operator name (e.g. `"Scan"`, `"Join"`, `"Filter"`).
+    pub op: &'static str,
+    /// The cost estimate for this node.
+    pub estimate: CostEstimate,
+    /// Cost trees for child nodes, in the same order as the plan children.
+    pub children: Vec<NodeCost>,
+}
+
+impl CostModel {
+    /// Build a [`NodeCost`] tree for `plan` by recursively estimating each node.
+    pub fn explain_costs(&self, plan: &LogicalPlan) -> NodeCost {
+        match plan {
+            LogicalPlan::Scan { .. } => NodeCost {
+                op: "Scan",
+                estimate: self.estimate(plan),
+                children: vec![],
+            },
+            LogicalPlan::Filter { input, .. } => NodeCost {
+                op: "Filter",
+                estimate: self.estimate(plan),
+                children: vec![self.explain_costs(input)],
+            },
+            LogicalPlan::Project { input, .. } => NodeCost {
+                op: "Project",
+                estimate: self.estimate(plan),
+                children: vec![self.explain_costs(input)],
+            },
+            LogicalPlan::Join { left, right, .. } => NodeCost {
+                op: "Join",
+                estimate: self.estimate(plan),
+                children: vec![self.explain_costs(left), self.explain_costs(right)],
+            },
+            LogicalPlan::Aggregate { input, .. } => NodeCost {
+                op: "Aggregate",
+                estimate: self.estimate(plan),
+                children: vec![self.explain_costs(input)],
+            },
+            LogicalPlan::Sort { input, .. } => NodeCost {
+                op: "Sort",
+                estimate: self.estimate(plan),
+                children: vec![self.explain_costs(input)],
+            },
+            LogicalPlan::Limit { input, .. } => NodeCost {
+                op: "Limit",
+                estimate: self.estimate(plan),
+                children: vec![self.explain_costs(input)],
+            },
+            LogicalPlan::Values { .. } => NodeCost {
+                op: "Values",
+                estimate: CostEstimate::zero(),
+                children: vec![],
+            },
+            LogicalPlan::Empty => NodeCost {
+                op: "Empty",
+                estimate: CostEstimate::zero(),
+                children: vec![],
+            },
+            LogicalPlan::SetOp { left, right, .. } => NodeCost {
+                op: "SetOp",
+                estimate: self.estimate(plan),
+                children: vec![self.explain_costs(left), self.explain_costs(right)],
+            },
+            LogicalPlan::Cte { query, .. } => NodeCost {
+                op: "Cte",
+                estimate: self.estimate(plan),
+                children: vec![self.explain_costs(query)],
+            },
+            LogicalPlan::CteRef { .. } => NodeCost {
+                op: "CteRef",
+                estimate: self.estimate(plan),
+                children: vec![],
+            },
+            LogicalPlan::Window { input, .. } => NodeCost {
+                op: "Window",
+                estimate: self.estimate(plan),
+                children: vec![self.explain_costs(input)],
+            },
+            LogicalPlan::Subquery { query, .. } => NodeCost {
+                op: "Subquery",
+                estimate: self.estimate(plan),
+                children: vec![self.explain_costs(query)],
+            },
+            LogicalPlan::Exists { subquery, .. } => NodeCost {
+                op: "Exists",
+                estimate: self.estimate(plan),
+                children: vec![self.explain_costs(subquery)],
+            },
+            LogicalPlan::InSubquery { subquery, .. } => NodeCost {
+                op: "InSubquery",
+                estimate: self.estimate(plan),
+                children: vec![self.explain_costs(subquery)],
+            },
+            LogicalPlan::Compute { input, .. } => NodeCost {
+                op: "Compute",
+                estimate: self.estimate(plan),
+                children: vec![self.explain_costs(input)],
+            },
         }
     }
 }
@@ -381,6 +577,7 @@ mod tests {
                 row_count: 50_000,
                 avg_row_size_bytes: 128,
                 index_on: vec![],
+                ..Default::default()
             },
         );
         let est = model.estimate(&plan);

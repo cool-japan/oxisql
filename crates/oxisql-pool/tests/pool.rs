@@ -413,6 +413,50 @@ mod embedded_tests {
         }
     }
 
+    /// Verify that `acquired_total` is incremented on every `pool.get()` call
+    /// and that `timeout_count` is always `0` for the embedded pool.
+    ///
+    /// Uses the raw [`EmbeddedPool::get`] path (returns a `MutexGuard`).  Each
+    /// successful call increments the atomic `acquired` counter, while
+    /// `timeout_count` is always `0` because the embedded pool never times out
+    /// (it blocks on a `tokio::sync::Mutex` indefinitely).
+    #[tokio::test]
+    async fn embedded_pool_metrics_acquired_and_timeout() {
+        let pool = EmbeddedPool::new();
+
+        for _ in 0..3u64 {
+            let _guard = pool.get().await.expect("get connection");
+            // MutexGuard is dropped here, releasing the lock.
+        }
+
+        let m = pool.metrics();
+        assert!(
+            m.acquired_total >= 3,
+            "expected acquired_total >= 3 after 3 checkouts, got {}",
+            m.acquired_total
+        );
+        assert_eq!(
+            m.timeout_count, 0,
+            "embedded pool never times out; expected timeout_count == 0"
+        );
+    }
+
+    /// Verify that `EmbeddedPool::with_config` accepts a `PoolConfig` without
+    /// error and that the pool remains functional afterward.
+    ///
+    /// Pre-warming is a no-op for the embedded pool (single shared `Glue`
+    /// instance), so this test confirms the call succeeds and the pool can
+    /// still serve checkouts.
+    #[tokio::test]
+    async fn embedded_pool_with_config_no_op() {
+        let config = PoolConfigBuilder::new().min_idle(2).max_size(4).build();
+        let pool = EmbeddedPool::new().with_config(config);
+
+        // Pool should still be usable after with_config.
+        let _guard = pool.get().await.expect("checkout after with_config");
+        assert_eq!(pool.backend_name(), "embedded");
+    }
+
     #[tokio::test]
     async fn embedded_pool_migration_integration() {
         use oxisql_core::ConnectionPool;
@@ -437,7 +481,7 @@ mod embedded_tests {
         let pool = EmbeddedPool::new();
         let conn = <EmbeddedPool as ConnectionPool>::get(&pool).await.unwrap();
 
-        let runner = MigrationRunner::new(&dir);
+        let mut runner = MigrationRunner::new(&dir);
         let applied = runner.run_with_conn(conn.as_ref()).await.unwrap();
         assert_eq!(applied, 1);
 
@@ -532,6 +576,44 @@ mod sqlite_tests {
         let oxi = oxisql_pool::OxidbPool::Sqlite(pool);
         let m = oxi.metrics();
         assert_eq!(m.max_size, 2);
+    }
+
+    /// Verify `new_sqlite_compat_pool_with_config` with `min_idle = 2`:
+    /// - Pool max_size matches the config value.
+    /// - At least 2 simultaneous handles can be obtained (pre-warmed slots).
+    #[tokio::test]
+    async fn test_sqlite_pool_with_config_min_idle() {
+        use oxisql_pool::sqlite_compat::new_sqlite_compat_pool_with_config;
+        use oxisql_pool::PoolConfigBuilder;
+
+        let config = PoolConfigBuilder::new().max_size(4).min_idle(2).build();
+        let pool = new_sqlite_compat_pool_with_config(":memory:", config)
+            .await
+            .expect("pool with config should be created successfully");
+
+        assert_eq!(pool.max_size(), 4, "max_size should match config");
+
+        // Verify 2 simultaneous connections can be obtained from the pool.
+        let conn1 = pool.get().await.expect("first simultaneous connection");
+        let conn2 = pool.get().await.expect("second simultaneous connection");
+        drop(conn1);
+        drop(conn2);
+    }
+
+    /// Verify that `new_sqlite_compat_pool_with_config` with `min_idle = 0`
+    /// (no pre-warming) still constructs a valid pool.
+    #[tokio::test]
+    async fn test_sqlite_pool_with_config_no_min_idle() {
+        use oxisql_pool::sqlite_compat::new_sqlite_compat_pool_with_config;
+        use oxisql_pool::PoolConfigBuilder;
+
+        let config = PoolConfigBuilder::new().max_size(2).build();
+        let pool = new_sqlite_compat_pool_with_config(":memory:", config)
+            .await
+            .expect("pool without min_idle should succeed");
+
+        let _conn = pool.get().await.expect("checkout should succeed");
+        assert_eq!(pool.max_size(), 2);
     }
 }
 

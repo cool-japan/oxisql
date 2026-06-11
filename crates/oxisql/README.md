@@ -1,232 +1,216 @@
 # oxisql — The COOLJAPAN Pure-Rust SQL facade
 
 [![Crates.io](https://img.shields.io/crates/v/oxisql.svg)](https://crates.io/crates/oxisql)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 
-`oxisql` is the top-level façade crate. A single URI string selects the backend; the caller receives a `Box<dyn Connection>` regardless of which database is running. All backends are Pure Rust — no C/C++ libraries required.
+> Unified Pure-Rust SQL facade dispatching to embedded, Postgres, MySQL, SQLite-compat, and DataFusion via a single URI-based API.
+
+## What it is
+
+`oxisql` is the top-level façade crate of the OxiSQL workspace. A single URI
+string selects the backend; the caller receives a `Box<dyn Connection>`
+regardless of which database is running. Every backend is genuinely Pure Rust —
+no `libpq`, no `libmysqlclient`, no `libsqlite3`, no C/C++/Fortran. The
+SQLite path now runs on **oxisqlite** (a C-free fork of limbo 0.0.22), so even
+the SQLite-compatible option is C-free.
+
+The facade re-exports the core traits and types from `oxisql-core` and adds
+URI-based dispatch, connection pooling, TLS, options, introspection, a
+`MultiConnection` fan-out helper, and an optional interactive REPL.
 
 ## Installation
 
 ```toml
 [dependencies]
 # In-memory only
-oxisql = { version = "0.1.1", features = ["embedded"] }
+oxisql = { version = "0.1.2", features = ["embedded"] }
 
 # PostgreSQL
-oxisql = { version = "0.1.1", features = ["postgres"] }
+oxisql = { version = "0.1.2", features = ["postgres"] }
 
 # MySQL
-oxisql = { version = "0.1.1", features = ["mysql"] }
+oxisql = { version = "0.1.2", features = ["mysql"] }
 
-# All backends + pooling
-oxisql = { version = "0.1.1", features = ["embedded", "postgres", "mysql", "pool-embedded", "pool-postgres", "pool-mysql"] }
+# Pure-Rust SQLite-compat (oxisqlite, C-free fork of limbo)
+oxisql = { version = "0.1.2", features = ["sqlite"] }
+
+# Everything + pooling + migrations
+oxisql = { version = "0.1.2", features = [
+    "embedded", "postgres", "mysql", "sqlite", "datafusion",
+    "pool-embedded", "pool-postgres", "pool-mysql",
+    "migrate",
+] }
 ```
 
-## Quick Start
+MSRV 1.89 · edition 2021 · Apache-2.0.
 
-```rust
-use oxisql::Connection;
+## Quick start
+
+```rust,no_run
+use oxisql::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), oxisql::OxiSqlError> {
-    // Connect — URI dispatches to the right backend automatically
+    // The URI selects the backend automatically.
     let conn = oxisql::connect("memory://").await?;
 
-    conn.execute("CREATE TABLE t (id INTEGER, name TEXT)", &[]).await?;
-    conn.execute("INSERT INTO t VALUES ($1, $2)", &[&1i64, &"Alice"]).await?;
+    conn.execute("CREATE TABLE users (id INTEGER, name TEXT)", &[]).await?;
+    conn.execute("INSERT INTO users VALUES ($1, $2)", &[&1i64, &"Alice"]).await?;
 
-    let rows = conn.query("SELECT id, name FROM t", &[]).await?;
+    // Named parameters work on every backend (:name, $name, or @name).
+    let rows = conn.query_named(
+        "SELECT id, name FROM users WHERE id = :id",
+        &[("id", &1i64 as &dyn ToSqlValue)],
+    ).await?;
+
     let name: String = rows[0].try_get("name")?;
-    println!("name={name}");
+    println!("name = {name}");
     Ok(())
 }
 ```
 
-## URI Scheme Reference
+## Key API
+
+| Item | Signature / shape | Purpose |
+|------|-------------------|---------|
+| `connect(uri)` | `-> Box<dyn Connection>` | Open a connection; URI picks the backend |
+| `connect_or_create(uri)` | `-> Box<dyn Connection>` | Like `connect`, creating the DB if absent (embedded always works) |
+| `connect_pooled(uri, max)` | `-> Box<dyn ConnectionPool>` | Type-erased pool with `max` connections |
+| `connect_pool(uri, max)` | `-> OxidbPool` | Typed pool enum for backend-specific access |
+| `connect_with_options(uri, ConnectOptions)` | `-> Box<dyn Connection>` | Connect with timeout / pool size / TLS options |
+| `connect_with_tls(uri, tls_cfg)` | `-> Box<dyn Connection>` | Connect with an explicit `rustls::ClientConfig` |
+| `connect_datafusion(uri)` | `-> OxiSqlContext` | OLAP context (DataFusion is not a single-connection backend) |
+| `ping(conn)` / `close(conn)` | `-> ()` | Backend-agnostic liveness check / teardown |
+| `introspect(conn)` | `-> Vec<TableInfo>` | Schema snapshot from any backend |
+| `version()` | `-> &'static str` | Crate version string |
+| `backend_info_for_uri(uri)` | `-> Option<BackendInfo>` | Which backend handles a URI, without connecting |
+| `BackendInfo` | `{ name, version, features }` | Backend identity / capability report |
+| `ConnectOptions` | builder | `new().timeout_ms(_).pool_size(_).require_tls(_)` |
+| `MultiConnection` | struct | Fan a query out to several connections in parallel |
+| `prelude` | module | `use oxisql::prelude::*` brings in traits, `Value`, `Row`, errors |
+
+### URI scheme reference
 
 | URI prefix | Feature flag | Backend | Notes |
-|------------|-------------|---------|-------|
-| `memory://` | `embedded` | GlueSQL MemoryStorage | Fresh in-memory DB each time |
-| `postgres://` or `postgresql://` | `postgres` | tokio-postgres | Pure Rust, no libpq |
+|------------|--------------|---------|-------|
+| `memory://` | `embedded` | GlueSQL in-memory | Fresh DB each time |
+| `redb://path` | `redb` | redb B-tree | Pure Rust, file-backed |
+| `fjall://path` | `fjall` | fjall LSM-tree | Pure Rust, file-backed |
+| `sled://path` | `sled` | sled key-value | Pure Rust, file-backed |
+| `postgres://` / `postgresql://` | `postgres` | tokio-postgres | Pure Rust, no libpq |
 | `mysql://` | `mysql` | mysql_async | Pure Rust, no libmysqlclient |
-| `redb://path/to/file.db` | `redb` | redb B-tree storage | Pure Rust, file-backed |
-| `fjall://path/to/dir` | `fjall` | fjall LSM-tree storage | Pure Rust, file-backed |
-| `sqlite://path.db` or `sqlite::memory:` | `sqlite` | Limbo (Pure Rust SQLite) | No libsqlite3 |
+| `sqlite://path` / `sqlite::memory:` | `sqlite` | oxisqlite (C-free fork of limbo) | Pure Rust, no libsqlite3 |
 | `datafusion://` | `datafusion` | Apache DataFusion OLAP | Use `connect_datafusion()` |
 
-## Entry Points
+### Named parameters
 
-### `connect(uri)` → `Box<dyn Connection>`
+`execute_named` and `query_named` are default methods on the `Connection`
+trait (defined in `oxisql-core`). They accept `&[(&str, &dyn ToSqlValue)]`,
+support `:name`, `$name`, and `@name` placeholders, and rewrite them to
+positional `$N` form before dispatch. Every backend inherits them — no
+per-backend code, no extra imports beyond the prelude.
 
-```rust
-let conn: Box<dyn oxisql::Connection> = oxisql::connect("memory://").await?;
-let conn = oxisql::connect("postgres://user:pass@host/db").await?;
-let conn = oxisql::connect("mysql://user:pass@host/db").await?;
-let conn = oxisql::connect("sqlite:///tmp/mydb.sqlite3").await?;
-let conn = oxisql::connect("redb:///tmp/mydb.redb").await?;
-let conn = oxisql::connect("fjall:///tmp/mydb.fjall").await?;
+### Pooling
+
+```rust,no_run
+#[tokio::main]
+async fn main() -> Result<(), oxisql::OxiSqlError> {
+    // Type-erased pool (any backend URI):
+    let pool = oxisql::connect_pooled("memory://", 4).await?;
+    let conn = pool.get().await?;
+    conn.execute("CREATE TABLE t (id INTEGER)", &[]).await?;
+
+    // Or a typed OxidbPool for backend-specific access:
+    let typed = oxisql::connect_pool("memory://", 4).await?;
+    typed.health_check().await?;
+    Ok(())
+}
 ```
 
-### `connect_pooled(uri, size)` → `Box<dyn ConnectionPool>`
+### DataFusion (OLAP)
 
-Returns a type-erased pool. Pool size controls the maximum number of connections.
-
-```rust
-let pool = oxisql::connect_pooled("memory://", 4).await?;
-let conn = pool.get().await?;
+```rust,no_run
+#[tokio::main]
+async fn main() -> Result<(), oxisql::OxiSqlError> {
+    // DataFusion is an OLAP engine, not a single connection — use this entry point.
+    let _ctx = oxisql::connect_datafusion("datafusion://").await?;
+    // _ctx is an OxiSqlContext for registering tables and running OLAP queries.
+    Ok(())
+}
 ```
 
-Requires the matching `pool-*` feature: `pool-embedded`, `pool-postgres`, or `pool-mysql`.
-
-### `connect_pool(uri, size)` → `OxidbPool`
-
-Returns a typed `oxisql_pool::OxidbPool` enum for backend-specific pool access.
-
-```rust
-let pool = oxisql::connect_pool("memory://", 4).await?;
-pool.health_check().await?;
-let metrics = pool.metrics();
-println!("active={}, idle={}", metrics.active, metrics.idle);
-```
-
-### `connect_datafusion(uri)` → `OxiSqlContext`
-
-DataFusion is an OLAP engine, not a single-connection backend. Use this function instead of `connect()`.
-
-```rust
-let ctx = oxisql::connect_datafusion("datafusion://").await?;
-// ctx is an OxiSqlContext for registering tables and running OLAP queries
-```
-
-## Feature Flags
-
-| Feature | URI scheme | Description |
-|---------|-----------|-------------|
-| `embedded` | `memory://` | GlueSQL in-memory engine |
-| `postgres` | `postgres://` / `postgresql://` | tokio-postgres, Pure Rust |
-| `mysql` | `mysql://` | mysql_async, Pure Rust |
-| `redb` | `redb://` | redb-backed persistent embedded SQL (enables `embedded`) |
-| `fjall` | `fjall://` | fjall-backed persistent embedded SQL (enables `embedded`) |
-| `sled` | — | sled-backed persistent embedded SQL (enables `embedded`) |
-| `sqlite` | `sqlite://` / `sqlite::memory:` | Pure-Rust SQLite via Limbo |
-| `datafusion` | `datafusion://` | Apache DataFusion OLAP layer |
-| `pool-embedded` | `memory://` | `EmbeddedPool` |
-| `pool-postgres` | `postgres://` | `OxidbPgPool` via deadpool-postgres |
-| `pool-mysql` | `mysql://` | `MysqlPool` via custom deadpool Manager |
-| `pool-sqlite-compat` | `sqlite://` | `SqliteCompatPool` |
-| `migrate` | — | SQL migration runner via `oxisql_migrate` |
-
-## Re-exported types at crate root
-
-All commonly used types from `oxisql-core` are re-exported at the crate root:
-
-- `Connection`, `Transaction`, `ConnectionPool`
-- `Value`, `Row`, `RowSet`, `FromValue`, `ToSqlValue`
-- `OxiSqlError`
-- `TableInfo`, `ColumnInfo`, `IndexInfo`, `ForeignKeyInfo`, `TableType`
-- `LoggingConnection`, `MetricsConnection`, `ConnectionMetrics`, `MetricsSnapshot`
-- `RetryConnection`, `RetryPolicy`, `RetryPredicate`
-
-## Prelude
-
-```rust
-use oxisql::prelude::*;
-```
-
-Imports `Connection`, `Transaction`, `ConnectionPool`, `Value`, `Row`, `RowSet`, `FromValue`, `ToSqlValue`, `OxiSqlError`, schema types, and middleware types.
-
-## Backend-specific modules
-
-```rust
-// PostgreSQL-specific types (requires "postgres" feature)
-use oxisql::postgres::{PgConnection, PgError, PgTransaction, TlsMode};
-
-// MySQL-specific types (requires "mysql" feature)
-use oxisql::mysql::*;
-```
-
-## Named Parameters
-
-`Connection` provides default methods `execute_named` and `query_named` for named-placeholder SQL (`:param_name` syntax). Parameters are passed as a `&[(&str, &dyn ToSqlValue)]` slice and are resolved by name before execution, translating them to positional `$N` parameters internally.
-
-```rust
-conn.execute_named(
-    "INSERT INTO users (id, name) VALUES (:id, :name)",
-    &[("id", &42i64), ("name", &"Alice")],
-).await?;
-
-let rows = conn.query_named(
-    "SELECT * FROM users WHERE id = :id",
-    &[("id", &42i64)],
-).await?;
-```
-
-These methods are default implementations on `oxisql_core::Connection` and are available on every backend without extra imports.
-
-## `MultiConnection`
-
-`MultiConnection` fans out queries to multiple backends simultaneously:
-
-```rust
-use oxisql::MultiConnection;
-
-let multi = MultiConnection::new(vec![conn_a, conn_b]);
-// execute/query runs against all connections in parallel
-```
-
-## `ConnectOptions`
-
-Fine-grained options for establishing a connection:
-
-```rust
-use oxisql::ConnectOptions;
-
-let opts = ConnectOptions::new()
-    .timeout_ms(5_000)
-    .pool_size(10)
-    .require_tls(true);
-```
-
-## `BackendInfo`
-
-Inspect which backend would handle a given URI without opening a connection:
+### Inspecting a URI without connecting
 
 ```rust
 let info = oxisql::backend_info_for_uri("memory://").unwrap();
 assert_eq!(info.name, "embedded");
-// info.features == ["in-memory", "sql", "gluesql"]
+// info.features == ["in-memory", "sql", "gluesql"]; info.version == Some(crate version)
 
 let info = oxisql::backend_info_for_uri("postgres://").unwrap();
 assert_eq!(info.name, "postgres");
-// info.version == None (known only after handshake)
+// info.version == None (known only after the handshake)
 ```
 
-## Direct connection type re-exports
+### Re-exports
 
-```rust
-// requires "embedded" feature
-use oxisql::EmbeddedConnection;
+At the crate root and via `prelude`: `Connection`, `Transaction`,
+`ConnectionPool`, `Value`, `Row`, `RowSet`, `FromValue`, `ToSqlValue`,
+`OxiSqlError`, the schema types (`TableInfo`, `ColumnInfo`, `IndexInfo`,
+`ForeignKeyInfo`, `TableType`), and the middleware wrappers
+(`LoggingConnection`, `MetricsConnection`, `MetricsSnapshot`,
+`RetryConnection`, `RetryPolicy`, `RetryPredicate`).
 
-// requires "redb" feature
-use oxisql::RedbEmbeddedConnection;
+Feature-gated module re-exports: `oxisql::postgres`, `oxisql::mysql`,
+`oxisql::datafusion`, `oxisql::pool`, `oxisql::migrate`.
 
-// requires "fjall" feature
-use oxisql::FjallEmbeddedConnection;
+Feature-gated direct connection types: `EmbeddedConnection` (`embedded`),
+`RedbEmbeddedConnection` (`redb`), `FjallEmbeddedConnection` (`fjall`),
+`SledEmbeddedConnection` (`sled`), `SqliteConnection` (`sqlite`).
 
-// requires "sqlite" feature
-use oxisql::SqliteConnection;
+## Feature flags
+
+| Feature | URI scheme | Description |
+|---------|------------|-------------|
+| `embedded` | `memory://` | GlueSQL in-memory engine |
+| `postgres` | `postgres://` / `postgresql://` | tokio-postgres, Pure Rust |
+| `mysql` | `mysql://` | mysql_async, Pure Rust |
+| `redb` | `redb://` | redb-backed persistent embedded SQL (implies `embedded`) |
+| `fjall` | `fjall://` | fjall-backed persistent embedded SQL (implies `embedded`) |
+| `sled` | `sled://` | sled-backed persistent embedded SQL (implies `embedded`) |
+| `sqlite` | `sqlite://` / `sqlite::memory:` | Pure-Rust SQLite-compat via oxisqlite (C-free fork of limbo) |
+| `datafusion` | `datafusion://` | Apache DataFusion OLAP layer |
+| `pool-embedded` | `memory://` | In-memory connection pool |
+| `pool-postgres` | `postgres://` | deadpool + tokio-postgres |
+| `pool-mysql` | `mysql://` | deadpool + mysql_async |
+| `pool-sqlite-compat` | `sqlite://` | Pool over the oxisqlite backend |
+| `migrate` | — | SQL migration runner via `oxisql-migrate` |
+| `repl` | — | `oxisql-repl` binary (implies `embedded`) |
+
+### REPL binary
+
+With `--features repl`, the `oxisql-repl` binary connects to any URI (default
+`memory://`) and offers dot commands: `.help`, `.tables`, `.schema <table>`,
+`.quit`. `SELECT`/`WITH`/`EXPLAIN` render as tables; other statements report a
+row count.
+
+```bash
+cargo run --features repl --bin oxisql-repl -- "memory://"
 ```
 
-## Version
+## Test coverage
 
-```rust
-let v: &str = oxisql::version(); // returns env!("CARGO_PKG_VERSION")
-```
+**80 tests** pass with `--all-features` (2 are `#[ignore]`d live-server-gated
+portability tests requiring a running Postgres / MySQL).
 
-## Test Status
+## Part of the OxiSQL workspace
 
-As of 2026-05-30: **79 tests passing, 2 skipped** (live-Postgres and live-MySQL portability tests are `#[ignore]`d).
+`oxisql` is one of 17 crates in the OxiSQL workspace (10 facade/driver crates
+plus a 7-crate C-free `oxisqlite-*` engine). See the
+[workspace README](../../README.md) for the full architecture, backend matrix,
+and the 1,720 workspace tests.
 
 ## License
 
-Apache-2.0 — COOLJAPAN OU (Team Kitasan)
+Apache-2.0 — COOLJAPAN OU (Team Kitasan).
+Copyright © 2024–2026 COOLJAPAN OU (Team Kitasan).
+Repository: <https://github.com/cool-japan/oxisql>

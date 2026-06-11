@@ -165,21 +165,29 @@ impl BackendInfo {
     }
 
     /// Metadata for the PostgreSQL backend.
+    ///
+    /// `version` is `None` here because the server version is not known until
+    /// after the connection handshake.
+    // TODO: populate version from server handshake once supported.
     #[must_use]
     pub fn postgres() -> Self {
         Self {
             name: "postgres",
-            version: None,
+            version: None, // populated after handshake — not known statically
             features: vec!["tcp", "tls", "prepared-statements"],
         }
     }
 
     /// Metadata for the MySQL backend.
+    ///
+    /// `version` is `None` here because the server version is not known until
+    /// after the connection handshake.
+    // TODO: populate version from server handshake once supported.
     #[must_use]
     pub fn mysql() -> Self {
         Self {
             name: "mysql",
-            version: None,
+            version: None, // populated after handshake — not known statically
             features: vec!["tcp", "tls", "prepared-statements"],
         }
     }
@@ -220,13 +228,19 @@ impl BackendInfo {
         }
     }
 
-    /// Metadata for the Pure-Rust SQLite-compat (Limbo) backend.
+    /// Metadata for the Pure-Rust SQLite-compat backend (OxiSQLite — C-free fork).
+    ///
+    /// The version reflects the statically-known OxiSQLite engine version.  For
+    /// network backends (Postgres, MySQL) the server version is not known until
+    /// after the connection handshake; those leave `version: None`.
+    // TODO: populate postgres/mysql version from server handshake once supported.
     #[must_use]
     pub fn sqlite_compat() -> Self {
         Self {
             name: "sqlite",
-            version: Some("limbo-0.0.22".to_string()),
-            features: vec!["sqlite-compat", "pure-rust", "limbo", "embedded"],
+            // Statically-known OxiSQLite engine version (C-free fork of limbo 0.0.22).
+            version: Some("oxisqlite 0.1.0".to_string()),
+            features: vec!["sqlite-compat", "pure-rust", "oxisqlite", "embedded"],
         }
     }
 }
@@ -304,6 +318,9 @@ pub use oxisql_embedded::SledEmbeddedConnection;
 pub use oxisql_sqlite_compat::SqliteConnection;
 
 /// Options for establishing a database connection.
+///
+/// Can be constructed manually via the builder methods, or automatically
+/// populated from a URI query string using [`ConnectOptions::from_uri`].
 #[derive(Debug, Clone, Default)]
 pub struct ConnectOptions {
     /// Connection timeout in milliseconds. None = no timeout.
@@ -312,6 +329,12 @@ pub struct ConnectOptions {
     pub pool_size: Option<usize>,
     /// TLS mode — true to require TLS, false to disable.
     pub require_tls: bool,
+    /// Application name hint forwarded to the server where supported.
+    pub application_name: Option<String>,
+    /// SSL mode string (e.g. `"require"`, `"prefer"`, `"disable"`).
+    pub sslmode: Option<String>,
+    /// Unknown query-string keys collected verbatim.
+    pub extra: std::collections::HashMap<String, String>,
 }
 
 impl ConnectOptions {
@@ -336,6 +359,92 @@ impl ConnectOptions {
     pub fn require_tls(mut self, require: bool) -> Self {
         self.require_tls = require;
         self
+    }
+
+    /// Set the application name hint.
+    pub fn application_name(mut self, name: impl Into<String>) -> Self {
+        self.application_name = Some(name.into());
+        self
+    }
+
+    /// Parse the query string portion of `uri` (everything after `?`) and
+    /// populate the recognised fields on `self`.  Unknown keys are inserted
+    /// into [`ConnectOptions::extra`].
+    ///
+    /// Recognised keys:
+    ///
+    /// | Key               | Maps to                             |
+    /// |-------------------|-------------------------------------|
+    /// | `pool_max`        | `pool_size`                         |
+    /// | `connect_timeout` | `connect_timeout_ms` (seconds → ms) |
+    /// | `sslmode`         | `sslmode`                           |
+    /// | `application_name`| `application_name`                  |
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// let opts = oxisql::ConnectOptions::new()
+    ///     .with_uri_params("sqlite://path.db?pool_max=8&connect_timeout=5");
+    /// assert_eq!(opts.pool_size, Some(8));
+    /// assert_eq!(opts.connect_timeout_ms, Some(5_000));
+    /// ```
+    #[must_use]
+    pub fn with_uri_params(mut self, uri: &str) -> Self {
+        let query = match uri.split_once('?') {
+            Some((_, q)) if !q.is_empty() => q,
+            _ => return self,
+        };
+        for pair in query.split('&') {
+            let (key, val) = match pair.split_once('=') {
+                Some(kv) => kv,
+                None => {
+                    // bare key with no value — skip silently
+                    continue;
+                }
+            };
+            let key = key.trim();
+            let val = val.trim();
+            match key {
+                "pool_max" => {
+                    if let Ok(n) = val.parse::<usize>() {
+                        self.pool_size = Some(n);
+                    }
+                }
+                "connect_timeout" => {
+                    // Value is in seconds; store as milliseconds
+                    if let Ok(secs) = val.parse::<u64>() {
+                        self.connect_timeout_ms = Some(secs.saturating_mul(1_000));
+                    }
+                }
+                "sslmode" => {
+                    self.sslmode = Some(val.to_string());
+                    if matches!(val, "require" | "verify-ca" | "verify-full") {
+                        self.require_tls = true;
+                    }
+                }
+                "application_name" => {
+                    self.application_name = Some(val.to_string());
+                }
+                _ => {
+                    self.extra.insert(key.to_string(), val.to_string());
+                }
+            }
+        }
+        self
+    }
+
+    /// Convenience constructor: parse a URI and build `ConnectOptions` from
+    /// any recognized query parameters.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// let opts = oxisql::ConnectOptions::from_uri("memory://?pool_max=4");
+    /// assert_eq!(opts.pool_size, Some(4));
+    /// ```
+    #[must_use]
+    pub fn from_uri(uri: &str) -> Self {
+        Self::new().with_uri_params(uri)
     }
 }
 

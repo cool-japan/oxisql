@@ -5,6 +5,11 @@ deny = [
     { name = "openssl-sys" },
     { name = "native-tls" },
     { name = "ring" },
+    { name = "mimalloc" },
+    { name = "libmimalloc-sys" },
+    { name = "libgit2-sys" },
+    { name = "libz-sys" },
+    { name = "simsimd" },
 ]
 
 [licenses]
@@ -14,7 +19,11 @@ allow = [
     "ISC",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "Unicode-DFS-2016",
     "CC0-1.0",
+    "Zlib",
+    "Unicode-3.0",
+    # MPL-2.0: file-level copyleft, coexists with Apache-2.0 per MPL §3.3
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8

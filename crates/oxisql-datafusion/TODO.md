@@ -1,64 +1,66 @@
-# oxisql-datafusion TODO
+# oxisql-datafusion — TODO
 
-## Status
-DataFusion `TableProvider` implementation serving a fixed snapshot of `oxisql_core::Row`s. `OxiSqlTableProvider` with `from_rows` constructor, in-process filter pushdown (`Inexact` for binary comparisons and IS NULL/IS NOT NULL), and range-based partitioning via `with_range_partition`. Type mapping from `Value` to Arrow arrays (Boolean, Int64, Float64, Utf8, LargeBinary, Timestamp, Date, Decimal128, Array). `OxiSqlFusionError` with OxiSql, Arrow, DataFusion, and SchemaMismatch variants.
+**Status:** Alpha · v0.1.2 (in development) · 83 tests pass (4 ignored).
 
-## Core Implementation
-- [x] Add live/streaming table provider (`OxiSqlStreamProvider`) — drive a real `oxisql_core::Connection` at query time, yielding batches incrementally instead of materializing all rows upfront (~120 SLOC)
-- [x] Add filter pushdown — translate DataFusion `Expr` filters into SQL WHERE clauses to push predicates to the backend database (~80 SLOC)
-- [x] Add projection pushdown — generate `SELECT col1, col2` instead of `SELECT *` based on requested projection columns (~30 SLOC)
-- [x] Add limit pushdown — append `LIMIT N` to the backend SQL query when DataFusion requests a row limit (~15 SLOC)
-- [x] Add sort pushdown — append `ORDER BY` to the backend SQL query when DataFusion can delegate sorting (~25 SLOC)
-- [x] Add custom UDF registration — `register_scalar_function(name, impl)` for user-defined scalar functions in DataFusion context (~40 SLOC)
-- [x] Add custom UDAF registration — `register_aggregate_function(name, impl)` for user-defined aggregates (~40 SLOC)
-- [x] Add async query execution — implement DataFusion's async `ExecutionPlan` with proper partitioning and streaming output (~60 SLOC)
-- [x] Add multi-partition support — split large result sets across multiple partitions for parallel scan (~40 SLOC)
-- [x] Add query plan visualization — `explain_plan(sql)` returning DataFusion's logical and physical plan as formatted strings (~25 SLOC)
-- [x] Add catalog integration — register multiple OxiSQL tables in a DataFusion `SessionContext` catalog for cross-table queries (~40 SLOC)
-- [x] Add view support — register SQL views backed by OxiSQL connections (~30 SLOC)
-- [x] Add extended type mapping — Date32, Date64, Timestamp(Microsecond), Timestamp(Millisecond), Decimal128, Utf8/LargeUtf8, Binary types in `build_column` (~40 SLOC)
-- [x] Add `Date32` and `Date64` column builders for `Value::Date` (~15 SLOC)
-- [x] Add `Timestamp` column builder for `Value::Timestamp` with timezone support (~20 SLOC)
-- [x] Add `Decimal128` column builder for `Value::Decimal` (~20 SLOC)
-- [x] Add `List` column builder for `Value::Array` (~25 SLOC)
-- [x] Add statistics reporting — implement `TableProvider::statistics()` returning row count and column-level statistics (~30 SLOC)
-- [x] Add table partitioning — support partitioned scans by range or hash on a partition key (~40 SLOC)
+Apache DataFusion 53.x bridge exposing OxiSQL-backed tables to OLAP SQL. Ships a snapshot provider (`OxiSqlTableProvider`) and a live-streaming provider (`OxiSqlStreamProvider`), an `OxiSqlContext` `SessionContext` wrapper, filter/projection/limit/sort pushdown, multi-table catalog registration for cross-table joins, full `Value` ↔ Arrow type mapping, and range-based partitioning for parallel scans.
 
-## API Improvements
-- [x] Add `OxiSqlTableProvider::from_connection(conn, table_name, schema)` — construct by querying a live connection (~20 SLOC)
-- [x] Add `OxiSqlTableProvider::refresh()` — re-snapshot the backing data from the connection (~15 SLOC)
-- [x] Add `OxiSqlContext` — a wrapper around `SessionContext` pre-configured with OxiSQL catalog, UDFs, and settings (~30 SLOC)
-- [x] Add `register_oxisql_table(ctx, name, conn, schema)` — one-line registration of an OxiSQL-backed table in DataFusion (~15 SLOC)
-- [x] Add `OxiSqlFusionError::UnsupportedType` variant for unmapped Arrow types (~5 SLOC)
-- [x] Implement `Display` for `OxiSqlTableProvider` — show table name, schema, row count (~10 SLOC)
-- [x] Add `execute_sql(ctx, sql)` convenience function returning `Vec<RecordBatch>` (~20 SLOC)
+## Done
 
-## Testing
-- [x] Test live streaming provider — connect to in-memory embedded DB, insert rows, query through DataFusion (~30 SLOC)
-- [x] Test filter pushdown — verify WHERE predicates are translated to SQL and reduce returned rows (~25 SLOC)
-- [x] Test projection pushdown — verify only requested columns are fetched from the backend (~20 SLOC)
-- [x] Test limit pushdown — verify LIMIT reduces backend query result size (~15 SLOC)
-- [x] Test multi-table JOIN through DataFusion — register two OxiSQL tables and execute a JOIN query (~25 SLOC)
-- [x] Test aggregation queries — COUNT(*) through DataFusion on OxiSQL snapshot data (~20 SLOC)
-- [x] Test filter pushdown on snapshot provider — verify `Inexact` classification and equality filtering (~20 SLOC)
-- [x] Test range partition — sort+split by key column, verify row count and order (~20 SLOC)
-- [x] Test window functions — ROW_NUMBER, RANK through DataFusion on OxiSQL data (~20 SLOC)
-- [x] Test NULL handling — verify null values propagate correctly through Arrow arrays (~15 SLOC)
-- [x] Test schema mismatch detection — rows with fewer values than fields produce NULLs (~10 SLOC)
-- [x] Test extended types — Date, Timestamp, Decimal columns through DataFusion (~20 SLOC)
-- [x] Benchmark DataFusion query execution on OxiSQL-backed tables — `bench_snapshot_provider` in `datafusion_benchmarks.rs` benchmarks register+plan+execute for 100/1000/10000 rows (~30 SLOC)
+### Providers & context
+- [x] `OxiSqlTableProvider` snapshot provider — `from_rows`, `from_connection`, `refresh`, `with_range_partition`.
+- [x] `OxiSqlStreamProvider` live-streaming provider — `new`, `with_sort` (driving a real `Connection` at scan time, yielding batches incrementally).
+- [x] `SortOrder::Asc` / `SortOrder::Desc` ordering for the streaming provider.
+- [x] `OxiSqlContext` — `new`, `from_session_context`, `register_table`, `register_snapshot`, `register_view`, `deregister_table`, `execute_sql`, `sql` (→ `DataFrame`), `explain_plan`, `register_scalar_function`, `register_aggregate_function`, `register_parquet`, `session_context` / `into_session_context`.
+- [x] Free functions `register_oxisql_table` and `register_embedded_table`.
+- [x] Facade entry point: `oxisql::connect_datafusion("datafusion://")` (and the `memory://` alias) → `OxiSqlContext`.
 
-## Performance
-- [x] Benchmark in-memory scan vs streaming scan — `bench_snapshot_provider` benchmarks the in-memory scan path for 100/1000/10000 rows; streaming path benchmarked separately when OxiSqlStreamProvider harness is available (~30 SLOC)
-- [x] Benchmark filter pushdown speedup — compare DataFusion post-filter vs backend pre-filter (~25 SLOC)
-- [x] Benchmark RecordBatch construction overhead for varying column counts and row counts — `bench_record_batch_construction` benchmarks `from_rows` for 4/16 columns over 1000 rows (~25 SLOC)
-- [x] Profile Arrow array builder memory allocation for large datasets (~20 SLOC)
-- [x] Benchmark multi-partition parallel scan vs single-partition scan (~25 SLOC)
+### Pushdown & types
+- [x] Filter pushdown — binary comparisons (`=`, `<>`, `<`, `<=`, `>`, `>=`) and `IS [NOT] NULL` → SQL `WHERE`; snapshot filters reported as `Inexact`.
+- [x] Projection pushdown — `SELECT` only the requested columns.
+- [x] Limit pushdown — append `LIMIT N`.
+- [x] Sort pushdown — append `ORDER BY` (streaming provider).
+- [x] Full `Value` ↔ Arrow mapping for all 13 variants (Null, Bool, I64, F64, Text, Blob, Timestamp, Date, Time, Uuid, Json, Decimal, Array).
+- [x] `TableProvider::statistics()` reporting (row count and column-level stats).
 
-## Integration
-- [x] Integration with `oxisql-embedded` — register GlueSQL tables in DataFusion for OLAP queries on embedded data (~30 SLOC)
-- [x] Integration with `oxisql-parse` — `plan_bridge` module converts `oxisql_parse::LogicalPlan` to DataFusion `LogicalPlan` (Scan, Limit, Empty structural; all others via SQL round-trip); gated behind `parse` feature flag (~120 SLOC, 7 tests)
-- [x] Integration with `oxisql-postgres` — serve live Postgres tables through DataFusion with pushdown (~30 SLOC)
-- [x] Integration with `oxisql-mysql` — serve live MySQL tables through DataFusion with pushdown (~30 SLOC)
-- [x] Integration with `oxistore-columnar` — use DataFusion to query Parquet files via oxistore-columnar reader (~25 SLOC)
-- [x] Integration with `oxisql` facade — `oxisql::datafusion::register_table(ctx, conn, name)` convenience function (~15 SLOC) — `oxisql::datafusion::{register_table, context}` in `crates/oxisql/src/lib.rs:315`
+### Parallelism & catalog
+- [x] Range-based partitioning (`with_range_partition`) for parallel scans.
+- [x] Multi-table catalog registration in a single `SessionContext` for cross-table joins.
+
+### Features
+- [x] `parse` — `plan_bridge` (`sql_to_datafusion_plan` / `to_datafusion_plan`): converts `oxisql_parse::LogicalPlan` → DataFusion `LogicalPlan` (Scan/Filter/Project/Limit/Empty structurally via `parse_sql_expr`; other nodes via SQL round-trip).
+- [x] `columnar` — `ParquetTableProvider` over `oxistore-columnar`.
+- [x] `mysql` / `postgres` / `sqlite` — optional backend wiring for cross-backend testing.
+
+### Errors & quality
+- [x] `OxiSqlFusionError` — `OxiSql`, `Arrow`, `DataFusion`, `SchemaMismatch`, `UnsupportedType` variants.
+- [x] 83 tests — live streaming, filter/projection/limit pushdown, multi-table JOIN, aggregation, window functions, range partition, NULL handling, schema-mismatch detection, extended types, structural plan_bridge Filter+Project lowering.
+- [x] Criterion benchmarks (`benches/datafusion_benchmarks.rs`) — snapshot register+plan+execute, filter-pushdown speedup, RecordBatch construction, multi-partition scan.
+
+## Roadmap / next
+- [~] Promote from **Alpha** to **Beta**: stabilise the provider/context API and reduce SQL round-trips in `plan_bridge`.
+- [x] Push more `plan_bridge` node types down structurally (Projection, Filter, Aggregate, Join) instead of round-tripping through SQL. (done 2026-06-10)
+  - **Goal:** `Filter` and `Project` oxisql-parse nodes lower to native DataFusion `LogicalPlan` nodes instead of emitting SQL; SQL round-trip remains as fallback for other shapes.
+  - **Design:** In `src/plan_bridge.rs` (behind the existing `#[cfg(feature = "parse")]`): after building the structural input DF plan, use DataFusion 53.1's `SessionContext::parse_sql_expr(sql_str, &DFSchema)` (gated by the already-enabled `sql` feature) to parse each string predicate/column into a DataFusion `Expr`. Then apply `LogicalPlanBuilder::from(input).filter(expr)?.build()` (for Filter) and `LogicalPlanBuilder::from(input).project(exprs)?.build()` (for Project). Special-case wildcard `*` in column lists → skip structural lowering for that node, fall through to the SQL round-trip. Keep `sql_to_datafusion_plan` as the fallback for Join/Aggregate/Window/SetOp/CTE/subqueries and for any `parse_sql_expr` error. Implement as a "try-structural, catch-fallback" wrapper.
+  - **Files:** `src/plan_bridge.rs`
+  - **Tests:** Filter plan → DF Filter node (assert via DF plan display); Project plan → DF Project node; both produce identical rows to the SQL round-trip on an in-memory table; wildcard `SELECT *` falls back cleanly; unsupported shape (Aggregate) falls back cleanly. In-memory data only.
+  - **Risk:** Medium — `parse_sql_expr` requires a `DFSchema` from the input; schema must be resolved before the call. Wildcard and unresolved column names are the main edge cases. The SQL round-trip fallback makes failures safe.
+- [x] Pushdown for `IN`, `BETWEEN`, `LIKE`, and conjunctive/disjunctive predicate trees. (done 2026-06-10)
+  - **Goal:** Both the streaming and snapshot provider paths handle `Expr::InList`, `Expr::Between`, `Expr::Like`, and recursive `AND`/`OR`/`NOT` predicate trees.
+  - **Design:** **Streaming path** (`stream.rs:389-449`, `can_push_filter`/`expr_to_sql`): already handles AND/OR/NOT. Add arms for `Expr::InList { expr, list, negated }` → SQL `x IN (a,b,c)` / `x NOT IN (...)`; `Expr::Between { expr, low, high, negated }` → `x BETWEEN low AND high` / `x NOT BETWEEN`; `Expr::Like { expr, pattern, escape_char, negated, case_insensitive }` → SQL `x [I]LIKE 'p'` / `x NOT [I]LIKE 'p'`. **Snapshot path** (`provider.rs:182-281`, `is_simple_filter`/`eval_filter_on_row`): currently handles only 6 binary comparisons + IS [NOT] NULL. Add `And`/`Or`/`Not` recursive arms to both `is_simple_filter` and `eval_filter_on_row`; add `InList`, `Between`, `Like` evaluation against `oxisql_core::Value` using its existing comparison semantics.
+  - **Files:** `src/stream.rs` (+InList/Between/Like arms in can_push_filter + expr_to_sql), `src/provider.rs` (+And/Or/Not recursion + InList/Between/Like eval in is_simple_filter + eval_filter_on_row)
+  - **Tests:** streaming: IN list, BETWEEN range, LIKE pattern, NOT IN, NOT BETWEEN, NOT LIKE; snapshot: AND/OR/NOT combinations, IN/BETWEEN/LIKE eval; proptest: streaming SQL and snapshot result agree for same predicate + random rows
+  - **Risk:** Like evaluation against `oxisql_core::Value::Text` — implement `%`/`_` wildcard matching with proper SQL semantics. ILIKE (case-insensitive) handled by lowercasing both sides.
+- [x] Hash partitioning in addition to range partitioning. (done 2026-06-10)
+  - **Goal:** `OxiSqlTableProvider::with_hash_partition(key_column, n)` distributes rows into n buckets by key hash; `scan()` consumes partitions generically (already does so — purely additive).
+  - **Design:** `with_range_partition` at `provider.rs:135-169` sorts rows by key column and fills `self.partitions: Vec<Arc<Vec<Row>>>`. Add sibling `with_hash_partition(key_column: &str, n: usize) -> Result<Self>`: for each row, compute `hash(row[key_column]) % n` and append to `partitions[bucket]`. Hash over `oxisql_core::Value`: match each variant and hash its repr (I64 via its bits, F64 via its bits, Text via bytes, Blob via bytes, Null as a fixed sentinel, UUID as its u128, etc.) using `std::hash::DefaultHasher` or a simple FNV. `scan()` at `provider.rs:335-385` consumes `self.partitions` generically — no change.
+  - **Files:** `src/provider.rs` (+with_hash_partition method)
+  - **Tests:** n=3 partitions cover all rows (union = original, no duplication); uniform-ish distribution assertion (no empty bucket for >n rows); hash stability across calls; scan over hash partitions returns all rows
+  - **Risk:** `Value::F64` hashing: NaN != NaN in IEEE 754 but should hash consistently — treat NaN as a canonical bit pattern. Null hashes consistently via a fixed constant.
+- [x] Statistics-driven partition sizing for the streaming provider. (`with_auto_partition` added to both `OxiSqlTableProvider` and `OxiSqlStreamProvider`; done 2026-06-10)
+- [ ] Richer Arrow type coverage (e.g. nested/struct columns) as upstream support firms up.
+
+## Known limitations
+- **Alpha.** APIs may shift before the first stable release.
+- Some logical-plan operators in the `parse` bridge fall back to a SQL round-trip rather than a native DataFusion plan node (only Scan/Limit/Empty are mapped structurally today).
+- Snapshot-provider filters are `Inexact`: DataFusion re-applies its own post-filter, so a pushed predicate is an optimisation, not the sole correctness guarantee.
+- The `mysql` / `postgres` integration tests require live servers and are ignored by default.

@@ -144,6 +144,19 @@ pub enum LogicalPlan {
         /// `true` when the expression is `NOT IN`.
         negated: bool,
     },
+    /// A plan node that materializes named expression bindings for CSE.
+    ///
+    /// Each `(alias, expr_string)` pair in `bindings` declares a named
+    /// intermediate value that downstream nodes can reference by alias.
+    /// A `Compute` node is an optimization artifact introduced by the
+    /// common-subexpression-elimination pass; it adds zero compute overhead
+    /// and is transparent to most plan traversals.
+    Compute {
+        /// The input plan whose output rows are annotated with bindings.
+        input: Box<LogicalPlan>,
+        /// Named expression bindings: `(alias, expr_string)` pairs.
+        bindings: Vec<(String, String)>,
+    },
 }
 
 /// Set-operation kind.
@@ -185,6 +198,12 @@ pub enum JoinType {
     Full,
     /// `CROSS JOIN` — cartesian product.
     Cross,
+    /// Semi-join: return each left row that has at least one matching right row.
+    /// Used internally by the decorrelation pass (e.g. `EXISTS` rewrites).
+    LeftSemi,
+    /// Anti-join: return each left row that has *no* matching right row.
+    /// Used internally by the decorrelation pass (e.g. `NOT EXISTS` rewrites).
+    LeftAnti,
 }
 
 /// A single `ORDER BY` sort key.

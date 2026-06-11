@@ -218,6 +218,7 @@ fn collect_table_names_inner(plan: &LogicalPlan, out: &mut Vec<String>) {
         } => {
             collect_table_names_inner(query, out);
         }
+        LogicalPlan::Compute { input, .. } => collect_table_names_inner(input, out),
         LogicalPlan::CteRef { .. } | LogicalPlan::Values { .. } | LogicalPlan::Empty => {}
     }
 }

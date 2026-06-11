@@ -1,31 +1,42 @@
-# oxisql-parse — SQL parsing utilities for OxiSQL
+# oxisql-parse — SQL parsing, planning, and optimization for OxiSQL
 
 [![Crates.io](https://img.shields.io/crates/v/oxisql-parse.svg)](https://crates.io/crates/oxisql-parse)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 
-`oxisql-parse` provides SQL parsing, normalization, query building, logical planning, optimization, and an LRU parse cache. It re-exports the most commonly needed `sqlparser` AST types and wraps them with OxiSQL-idiomatic APIs.
+> sqlparser facade with dialect-aware parsing, a fluent query builder, logical planning, a rule-based optimizer, and an LRU parse cache.
+
+## What it is
+
+`oxisql-parse` wraps [`sqlparser`](https://crates.io/crates/sqlparser) with
+OxiSQL-idiomatic APIs: dialect-aware parsing, a fluent `QueryBuilder`, a
+logical planner, a rule-based optimizer, DML planning, a cost model, a schema
+validator, aggregate / window helpers, an `explain` pretty-printer, and a
+thread-safe LRU parse cache. It re-exports the most commonly needed
+`sqlparser` AST types. The crate is Pure Rust and has **no feature flags**.
 
 ## Installation
 
 ```toml
 [dependencies]
-oxisql-parse = "0.1.1"
+oxisql-parse = "0.1.2"
 ```
 
-## Quick Start
+MSRV 1.89 · edition 2021 · Apache-2.0.
 
-```rust
+## Quick start
+
+```rust,no_run
 use oxisql_parse::{parse, parse_one, is_read_only, QueryBuilder, ParseCache, SqlDialect};
 
-// Parse multiple statements
-let stmts = parse("SELECT 1; SELECT 2").unwrap();
+// Parse multiple statements.
+let stmts = parse("SELECT 1; SELECT 2")?;
 assert_eq!(stmts.len(), 2);
 
-// Parse a single statement
-let stmt = parse_one("SELECT 42").unwrap();
+// Parse a single statement and classify it.
+let stmt = parse_one("SELECT 42")?;
 assert!(is_read_only(&stmt));
 
-// Fluent query builder
+// Fluent query builder.
 let sql = QueryBuilder::select(&["id", "name", "email"])
     .from("users")
     .join("orders", "users.id = orders.user_id")
@@ -33,159 +44,145 @@ let sql = QueryBuilder::select(&["id", "name", "email"])
     .order_by("users.name", true)
     .limit(10)
     .offset(20)
-    .build()
-    .expect("valid query");
+    .build()?;
 
-// LRU parse cache
+// Thread-safe LRU parse cache, keyed by (sql, dialect).
 let cache = ParseCache::new(32);
-let stmts = cache.parse("SELECT 1", SqlDialect::Generic).unwrap();
+let _ = cache.parse("SELECT 1", SqlDialect::Generic)?;
 assert_eq!(cache.len(), 1);
+# Ok::<(), oxisql_core::OxiSqlError>(())
 ```
 
-## API Overview
+## Key API
 
-### Parsing functions
+### Parsing
 
 | Function | Description |
 |----------|-------------|
-| `parse(sql)` | Parse SQL using the generic dialect, return `Vec<Statement>` |
-| `parse_one(sql)` | Parse exactly one statement, error if 0 or 2+ |
+| `parse(sql)` | Parse with the generic dialect → `Vec<Statement>` |
+| `parse_one(sql)` | Parse exactly one statement (error if 0 or 2+) |
 | `parse_with_dialect(sql, dialect)` | Parse with a specific `SqlDialect` |
-| `parse_one_with_dialect(sql, dialect)` | Single-statement parse with dialect |
-| `parse_postgres(sql)` | Shorthand for PostgreSQL dialect |
-| `parse_mysql(sql)` | Shorthand for MySQL dialect |
-| `parse_sqlite(sql)` | Shorthand for SQLite dialect |
+| `parse_one_with_dialect(sql, dialect)` | Single-statement parse with a dialect |
+| `parse_postgres` / `parse_mysql` / `parse_sqlite` | Dialect shorthands |
 | `format(stmt)` | Serialize a parsed `Statement` back to SQL text |
 
-### `SqlDialect` enum
+`SqlDialect`: `Generic`, `Postgres`, `MySQL`, `SQLite`.
 
-`Generic`, `Postgres`, `MySQL`, `SQLite` — selects the sqlparser dialect for parsing.
-
-### Analysis utilities (from `analysis` module)
+### Analysis (`analysis` module)
 
 | Function | Description |
 |----------|-------------|
-| `is_read_only(stmt)` | True if statement is a SELECT (no side effects) |
-| `normalize(sql)` | Normalize whitespace and casing |
-| `extract_tables(stmt)` | Extract referenced table names |
-| `extract_columns(stmt)` | Extract referenced column names |
-| `count_params(sql)` | Count `$N` positional parameters in SQL text |
+| `is_read_only(stmt)` | True if the statement is a SELECT (no side effects) |
+| `normalize(sql)` | Canonicalize whitespace and casing |
+| `extract_tables(stmt)` | Referenced table names |
+| `extract_columns(stmt)` | Referenced column names |
+| `count_params(sql)` | Count `$N` positional parameters |
 
 ### `QueryBuilder`
 
-Fluent builder for SELECT statements. All methods return `Self` for chaining.
+Fluent SELECT builder; chaining methods return `Self`.
 
 | Method | Description |
 |--------|-------------|
-| `QueryBuilder::select(columns)` | Start a SELECT with given columns |
-| `QueryBuilder::select_all()` | Start a `SELECT *` |
-| `.distinct()` | Add `DISTINCT` |
-| `.from(table)` | Set the FROM table |
-| `.join(table, on)` | Add `INNER JOIN` |
-| `.left_join(table, on)` | Add `LEFT JOIN` |
-| `.right_join(table, on)` | Add `RIGHT JOIN` |
-| `.where_clause(condition)` | Add a WHERE condition (multiple → AND) |
-| `.group_by(expr)` | Add a GROUP BY expression |
-| `.having(condition)` | Set the HAVING clause |
-| `.order_by(expr, ascending)` | Add ORDER BY (true=ASC, false=DESC) |
-| `.limit(n)` | Set LIMIT |
-| `.offset(n)` | Set OFFSET |
-| `.build()` | Produce the SQL string |
-| `.build_and_parse()` | Build and immediately validate with sqlparser |
-| `.build_ref()` | Build without consuming `self` |
+| `select(columns)` / `select_all()` | Start a SELECT / `SELECT *` |
+| `distinct()` | Add `DISTINCT` |
+| `from(table)` | Set the FROM table |
+| `join` / `left_join` / `right_join` | Add INNER / LEFT / RIGHT JOIN |
+| `where_clause(cond)` | Add a WHERE condition (multiple → AND) |
+| `group_by(expr)` / `having(cond)` | GROUP BY / HAVING |
+| `order_by(expr, ascending)` | ORDER BY (`true` = ASC) |
+| `limit(n)` / `offset(n)` | LIMIT / OFFSET |
+| `build()` / `build_and_parse()` | Produce SQL / build and validate via sqlparser |
 
-Static DML helpers (return `String` directly):
+Static DML helpers return a `String` directly:
 
 ```rust
-QueryBuilder::insert("users", &["id", "name"], &["1", "'Alice'"])
+# use oxisql_parse::QueryBuilder;
+QueryBuilder::insert("users", &["id", "name"], &["1", "'Alice'"]);
 // → "INSERT INTO users (id, name) VALUES (1, 'Alice')"
-
-QueryBuilder::update("users", &[("name", "'Bob'")], Some("id = 42"))
+QueryBuilder::update("users", &[("name", "'Bob'")], Some("id = 42"));
 // → "UPDATE users SET name = 'Bob' WHERE id = 42"
-
-QueryBuilder::delete("users", Some("id = 99"))
+QueryBuilder::delete("users", Some("id = 99"));
 // → "DELETE FROM users WHERE id = 99"
 ```
 
-### `ParseCache`
-
-Thread-safe LRU cache for parsed SQL ASTs. Cache key is `(sql_text, SqlDialect)`.
-
-| Method | Description |
-|--------|-------------|
-| `ParseCache::new(capacity)` | Create cache; capacity 0 is promoted to 1 |
-| `cache.parse(sql, dialect)` | Return cached result or parse and cache |
-| `cache.len()` | Number of cached entries |
-| `cache.is_empty()` | True when no entries cached |
-| `cache.clear()` | Evict all entries |
-
 ### Logical planner
 
-| Function / Type | Description |
-|-----------------|-------------|
-| `plan_query(stmt)` | Convert a parsed `Statement` into `LogicalPlan` |
-| `plan_statement(stmt)` | Alias for `plan_query` |
-| `LogicalPlan` | Enum: `Scan`, `Filter`, `Projection`, `Join`, `Aggregate`, `Sort`, `Limit`, `SetOp`, `Subquery`, `Values`, `Empty` |
+| Item | Description |
+|------|-------------|
+| `plan_query(stmt)` / `plan_statement(stmt)` | Parsed `Statement` → `LogicalPlan` |
+| `LogicalPlan` | `Scan`, `Filter`, `Projection`, `Join`, `Aggregate`, `Sort`, `Limit`, `SetOp`, `Subquery`, `Values`, `Empty` |
 | `JoinType` | `Inner`, `Left`, `Right`, `Full`, `Cross` |
-| `SortExpr` | `{ expr, ascending, nulls_first }` |
 
 ### Optimizer
 
-| Type / Function | Description |
-|-----------------|-------------|
-| `optimize(plan)` | Apply the default four-pass optimizer |
-| `Optimizer::new()` | Build a custom multi-pass optimizer |
-| `PredicatePushdown` | Push WHERE filters below joins (predicate pushdown) |
-| `ProjectionPruning` | Remove unused column projections |
+| Item | Description |
+|------|-------------|
+| `optimize(plan)` | Apply the default pass pipeline |
+| `Optimizer` | Builder for a custom multi-pass optimizer |
+| `PredicatePushdown` | Push WHERE filters below joins |
+| `ProjectionPruning` | Drop unused column projections |
 | `ConstantFolding` | Evaluate constant expressions at plan time |
 | `LimitPushThrough` | Push LIMIT through projections |
-| `JoinAlgorithmPass` | Apply `JoinAlgoHint` to join nodes |
-| `OptPass` | Trait implemented by all optimization passes |
+| `JoinAlgorithmPass` | Annotate join nodes with an algorithm hint |
+| `OptPass` | Trait implemented by every pass |
 
 ### DML planning
 
-| Type / Function | Description |
-|-----------------|-------------|
-| `plan_dml(stmt)` | Convert INSERT/UPDATE/DELETE to `DmlPlan` |
-| `DmlPlan` | `Insert { table, columns, values }`, `Update { ... }`, `Delete { ... }` |
-
-### Cost model
-
-| Type | Description |
+| Item | Description |
 |------|-------------|
-| `CostModel` | Estimates query cost from a `TableStats` map |
-| `TableStats` | `{ row_count, avg_row_bytes, index_names }` |
-| `CostEstimate` | `{ total_cost, estimated_rows }` |
+| `plan_dml(stmt)` | INSERT / UPDATE / DELETE → `DmlPlan` |
+| `DmlPlan` | `Insert`, `InsertSelect`, `Update`, `Upsert`, `Delete` |
 
-### Schema validator
+### Cost model, validation, aggregates, windows, explain
 
-| Type | Description |
+| Item | Description |
 |------|-------------|
-| `SchemaValidator` | Validates column/table references against a schema map |
-| `ValidationError` | `UnknownTable`, `UnknownColumn`, `AmbiguousColumn` |
+| `CostModel` / `TableStats` / `CostEstimate` | Estimate query cost from table statistics |
+| `SchemaValidator` / `ValidationError` | Validate references against a schema (`UnknownTable`, `UnknownColumn`, `AmbiguousColumn`) |
+| `extract_aggregates(expr)` / `AggFunc` | Aggregate extraction; `Count`, `Sum`, `Avg`, `Min`, `Max` |
+| `window` module | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `NTILE` |
+| `explain(plan, verbose)` | Human-readable plan tree |
 
-### Aggregate helpers
+### `ParseCache`
 
-| Function / Type | Description |
-|-----------------|-------------|
-| `extract_aggregates(expr)` | Extract aggregate expressions from an AST node |
-| `is_aggregate_expr(expr)` | True if expression contains an aggregate call |
-| `AggFunc` | `Count`, `Sum`, `Avg`, `Min`, `Max` |
-| `AggregateExpr` | `{ func, arg, alias }` |
+Thread-safe LRU cache keyed by `(sql, dialect)`.
 
-### Explain
+| Method | Description |
+|--------|-------------|
+| `ParseCache::new(capacity)` | Create (capacity 0 is promoted to 1) |
+| `parse(sql, dialect)` | Return cached result or parse and cache |
+| `len()` / `is_empty()` / `clear()` | Inspect / evict |
 
-```rust
-use oxisql_parse::{plan_query, explain, parse_one};
-let stmt = parse_one("SELECT id FROM users WHERE id = 1").unwrap();
-let plan = plan_query(&stmt);
-let text = explain(&plan, false); // false = no verbose output
+```rust,no_run
+use oxisql_parse::{plan_query, optimize, explain, parse_one};
+
+let stmt = parse_one("SELECT id FROM users WHERE id = 1")?;
+let plan = optimize(plan_query(&stmt));
+println!("{}", explain(&plan, false)); // false = non-verbose
+# Ok::<(), oxisql_core::OxiSqlError>(())
 ```
 
-## Test Status
+Re-exports common `sqlparser` AST types (`Statement`, `Expr`, `SelectItem`,
+`TableFactor`, `JoinConstraint`, …) for downstream backends.
 
-As of 2026-05-30: **118 tests passing**.
+## Feature flags
+
+None.
+
+## Test coverage
+
+**129 tests** pass.
+
+## Part of the OxiSQL workspace
+
+`oxisql-parse` is one of 17 crates in the OxiSQL workspace (10 facade/driver
+crates plus a 7-crate C-free `oxisqlite-*` engine). See the
+[workspace README](../../README.md) for the full architecture and the 1,720
+workspace tests.
 
 ## License
 
-Apache-2.0 — COOLJAPAN OU (Team Kitasan)
+Apache-2.0 — COOLJAPAN OU (Team Kitasan).
+Copyright © 2024–2026 COOLJAPAN OU (Team Kitasan).
+Repository: <https://github.com/cool-japan/oxisql>

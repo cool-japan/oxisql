@@ -399,6 +399,47 @@ async fn test_explain_join() {
     );
 }
 
+#[tokio::test]
+async fn test_explain_select_has_cost_annotations() {
+    let conn = EmbeddedConnection::open_memory().expect("open_memory should not fail");
+    let plan = conn
+        .explain("SELECT id, name FROM users WHERE id = 1")
+        .await
+        .expect("explain should succeed");
+    assert!(!plan.is_empty(), "explain result must be non-empty");
+    assert!(
+        plan.contains("rows=") && plan.contains("cost="),
+        "cost-based explain should contain 'rows=' and 'cost=', got: {plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_explain_insert_fallback() {
+    let conn = EmbeddedConnection::open_memory().expect("open_memory should not fail");
+    let plan = conn
+        .explain("INSERT INTO t VALUES (1)")
+        .await
+        .expect("explain should succeed");
+    assert!(!plan.is_empty(), "explain result must be non-empty");
+    assert!(
+        plan.contains("Insert") || plan.contains("INSERT"),
+        "INSERT explain should contain 'Insert' or 'INSERT' via fallback, got: {plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_explain_malformed_no_panic() {
+    let conn = EmbeddedConnection::open_memory().expect("open_memory should not fail");
+    let plan = conn
+        .explain("NOT VALID SQL !!@#")
+        .await
+        .expect("explain on malformed SQL should not error");
+    assert!(
+        !plan.is_empty(),
+        "explain on malformed SQL should return non-empty string, got: {plan}"
+    );
+}
+
 // ── JSON helper tests ─────────────────────────────────────────────────────────
 
 #[tokio::test]

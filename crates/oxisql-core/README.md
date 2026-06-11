@@ -1,81 +1,93 @@
 # oxisql-core — Core traits and types for OxiSQL
 
 [![Crates.io](https://img.shields.io/crates/v/oxisql-core.svg)](https://crates.io/crates/oxisql-core)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 
-`oxisql-core` defines the public API surface that every OxiSQL backend must implement. It contains no storage logic — concrete backends live in `oxisql-embedded`, `oxisql-postgres`, `oxisql-mysql`, etc.
+> Core async traits, the 13-variant `Value` enum, error types, and middleware shared by all OxiSQL backends.
+
+## What it is
+
+`oxisql-core` defines the public API surface that every OxiSQL backend must
+implement. It contains no storage logic — concrete backends live in
+`oxisql-embedded`, `oxisql-postgres`, `oxisql-mysql`, `oxisql-sqlite-compat`,
+and `oxisql-datafusion`. The crate is Pure Rust, has **no feature flags**, and
+contains **zero `unsafe`**.
 
 ## Installation
 
 ```toml
 [dependencies]
-oxisql-core = "0.1.1"
+oxisql-core = "0.1.2"
 ```
 
-## Quick Start
+MSRV 1.89 · edition 2021 · Apache-2.0.
 
-```rust
+## Quick start
+
+```rust,no_run
 use oxisql_core::{Row, Value};
 
 let row = Row::new(
     vec!["id".into(), "name".into()],
     vec![Value::I64(42), Value::Text("Alice".into())],
 );
-let id: i64 = row.try_get("id").unwrap();
-let name: String = row.try_get("name").unwrap();
+
+let id: i64 = row.try_get("id")?;
+let name: String = row.try_get("name")?;
 assert_eq!(id, 42);
 assert_eq!(name, "Alice");
+# Ok::<(), oxisql_core::OxiSqlError>(())
 ```
 
 ### Named parameters
 
-All backends automatically inherit `execute_named` and `query_named` as
-default methods on `Connection`. Placeholders may use `:name`, `$name`, or
-`@name` syntax; repeated use of the same name reuses the same positional value.
+`execute_named` / `query_named` are **default methods** on `Connection`, so
+every backend inherits them automatically. Placeholders may use `:name`,
+`$name`, or `@name`; repeated use of the same name reuses the same positional
+value.
 
-```rust
-// execute_named — DML/DDL with named params
-conn.execute_named(
-    "INSERT INTO users (id, name) VALUES (:id, :name)",
-    &[("id", &42i64 as &dyn ToSqlValue), ("name", &"Alice" as &dyn ToSqlValue)],
-).await?;
+```rust,no_run
+use oxisql_core::{Connection, ToSqlValue};
 
-// query_named — SELECT with named params
-let rows = conn.query_named(
-    "SELECT * FROM users WHERE id = :id",
-    &[("id", &42i64 as &dyn ToSqlValue)],
-).await?;
+async fn demo(conn: &dyn Connection) -> Result<(), oxisql_core::OxiSqlError> {
+    conn.execute_named(
+        "INSERT INTO users (id, name) VALUES (:id, :name)",
+        &[("id", &42i64 as &dyn ToSqlValue), ("name", &"Alice" as &dyn ToSqlValue)],
+    ).await?;
+
+    let rows = conn.query_named(
+        "SELECT * FROM users WHERE id = :id",
+        &[("id", &42i64 as &dyn ToSqlValue)],
+    ).await?;
+    let _ = rows;
+    Ok(())
+}
 ```
 
-## API Overview
+## Key API
 
 ### `Connection` trait
 
-All backends implement `Connection` (from `traits.rs`). It is `Send + Sync` and fully async via `async_trait`.
+`Send + Sync`, fully async via `async_trait`.
 
 | Method | Description |
 |--------|-------------|
-| `execute(&self, sql, params)` | Execute DML/DDL, return rows-affected count |
-| `query(&self, sql, params)` | Execute SELECT, return `Vec<Row>` |
-| `execute_named(&self, sql, params)` | Execute DML/DDL with named parameters (default method) |
-| `query_named(&self, sql, params)` | Execute SELECT with named parameters (default method) |
-| `transaction(&self)` | Begin a transaction, return `Box<dyn Transaction>` |
-| `execute_batch(&self, sql)` | Execute multiple semicolon-separated statements |
-| `ping(&self)` | Lightweight connectivity check (`SELECT 1`) |
-| `prepare(&self, sql)` | Compile a statement for repeated execution |
-| `tables(&self)` | List all tables (schema introspection) |
-| `columns(&self, table)` | List columns of a named table |
-| `indexes(&self, table)` | List indexes on a named table |
-| `foreign_keys(&self, table)` | List FK constraints on a named table |
-| `query_stream(...)` | Execute SELECT, return `Pin<Box<dyn Stream<Item=...>>>` |
+| `execute(sql, params)` | Execute DML/DDL, return rows-affected count |
+| `query(sql, params)` | Execute SELECT, return `Vec<Row>` |
+| `execute_named(sql, params)` | DML/DDL with named parameters (default method) |
+| `query_named(sql, params)` | SELECT with named parameters (default method) |
+| `transaction()` | Begin a transaction → `Box<dyn Transaction>` |
+| `execute_batch(sql)` | Execute multiple semicolon-separated statements |
+| `ping()` | Lightweight connectivity check (`SELECT 1`) |
+| `prepare(sql)` | Compile a statement for repeated execution |
+| `tables()` | List all tables |
+| `columns(table)` | List columns of a named table |
+| `indexes(table)` | List indexes on a named table |
+| `foreign_keys(table)` | List FK constraints on a named table |
+| `query_stream(...)` | SELECT → `Pin<Box<dyn Stream<Item = ...>>>` |
 
-Positional parameters use `$1`, `$2`, … notation. The `params` argument is `&[&dyn ToSqlValue]`.
-
-Named-parameter methods accept `&[(&str, &dyn ToSqlValue)]`. Placeholders
-`:name`, `$name`, and `@name` are all supported; the same name may appear
-multiple times and will always bind to the same value. Both methods are
-**default** implementations on the `Connection` trait — every backend
-inherits them automatically with no additional code.
+Positional parameters use `$1`, `$2`, … with `params: &[&dyn ToSqlValue]`.
+Named-parameter methods take `&[(&str, &dyn ToSqlValue)]`.
 
 ### `Transaction` trait
 
@@ -83,13 +95,13 @@ Obtained via `Connection::transaction()`. Dropped without commit → implicit ro
 
 | Method | Description |
 |--------|-------------|
-| `execute(&mut self, sql, params)` | DML/DDL inside the transaction |
-| `query(&mut self, sql, params)` | SELECT inside the transaction |
-| `commit(self: Box<Self>)` | Commit all changes |
-| `rollback(self: Box<Self>)` | Roll back all changes |
-| `savepoint(&mut self, name)` | Create a named savepoint |
-| `release_savepoint(&mut self, name)` | Release (discard) a savepoint |
-| `rollback_to_savepoint(&mut self, name)` | Roll back to a named savepoint |
+| `execute(sql, params)` | DML/DDL inside the transaction |
+| `query(sql, params)` | SELECT inside the transaction |
+| `commit()` | Commit all changes |
+| `rollback()` | Roll back all changes |
+| `savepoint(name)` | Create a named savepoint |
+| `release_savepoint(name)` | Release (discard) a savepoint |
+| `rollback_to_savepoint(name)` | Roll back to a named savepoint |
 
 ### `ConnectionPool` trait
 
@@ -97,12 +109,12 @@ Object-safe (`Box<dyn ConnectionPool>` is valid).
 
 | Method | Description |
 |--------|-------------|
-| `get(&self)` | Check out a `Box<dyn Connection + Send>` |
-| `pool_size(&self)` | Maximum pool capacity |
-| `idle_count(&self)` | Connections available for checkout |
-| `active_count(&self)` | Connections currently checked out |
-| `health_check(&self)` | Verify pool is healthy |
-| `close(&self)` | Drain idle connections, prevent new checkouts |
+| `get()` | Check out a `Box<dyn Connection + Send>` |
+| `pool_size()` | Maximum pool capacity |
+| `idle_count()` | Connections available for checkout |
+| `active_count()` | Connections currently checked out |
+| `health_check()` | Verify the pool is healthy |
+| `close()` | Drain idle connections, prevent new checkouts |
 
 ### `Value` enum — 13 variants
 
@@ -114,70 +126,70 @@ Object-safe (`Box<dyn ConnectionPool>` is valid).
 | `F64(f64)` | `f64` | REAL / DOUBLE PRECISION |
 | `Text(String)` | `String` | TEXT / VARCHAR |
 | `Blob(Vec<u8>)` | `Vec<u8>` | BYTEA / BLOB |
+| `Decimal(String)` | exact decimal as string | NUMERIC / DECIMAL |
 | `Timestamp(i64)` | microseconds since epoch (UTC) | TIMESTAMP / TIMESTAMPTZ |
 | `Date(i32)` | days since Unix epoch | DATE |
 | `Time(i64)` | microseconds since midnight | TIME |
 | `Uuid(u128)` | 128-bit UUID | UUID |
 | `Json(String)` | UTF-8 JSON string | JSON / JSONB |
-| `Decimal(String)` | exact decimal as string | NUMERIC / DECIMAL |
 | `Array(Vec<Value>)` | ordered collection | e.g. INTEGER[] |
 
-`Value` implements `Display`, `PartialOrd` (cross-type comparisons return `None`), and `From<bool/i32/i64/f64/String/&str/Vec<u8>/Option<T>>`.
+`Value` implements `Display`, `PartialOrd` (cross-type comparisons return
+`None`), and `From<bool/i32/i64/f64/String/&str/Vec<u8>/Option<T>>`.
 
 ### `Row` and `RowSet`
 
-`Row` stores column names and values with an O(1) HashMap index for column lookups.
+`Row` stores column names and values with an O(1) `HashMap` index for lookups.
 
 | Method | Description |
 |--------|-------------|
 | `Row::new(columns, values)` | Construct from parallel vecs |
-| `row.get(col)` | Look up by column name → `Option<&Value>` |
-| `row.get_by_index(i)` | Look up by zero-based index |
-| `row.try_get::<T>(col)` | Type-safe extraction via `FromValue` |
-| `row.try_get_by_index::<T>(i)` | Type-safe extraction by index |
-| `row.column_count()` | Number of columns |
-| `row.is_null(col)` | True if column exists and is NULL |
-| `row.into_values()` | Consume, return `Vec<Value>` |
-| `row.columns()` | Ordered column names |
+| `get(col)` | Look up by name → `Option<&Value>` |
+| `get_by_index(i)` | Look up by zero-based index |
+| `try_get::<T: FromValue>(col)` | Type-safe extraction by name |
+| `try_get_by_index::<T>(i)` | Type-safe extraction by index |
+| `column_count()` | Number of columns |
+| `is_null(col)` | True if the column exists and is NULL |
+| `into_values()` | Consume → `Vec<Value>` |
+| `columns()` | Ordered column names |
 
-`RowSet` wraps `Vec<Row>` with convenience methods: `len()`, `is_empty()`, `column_count()`, `columns()`, `rows()`, `into_rows()`, `from_rows(Vec<Row>)`.
+`RowSet` wraps `Vec<Row>`: `len()`, `is_empty()`, `column_count()`,
+`columns()`, `rows()`, `into_rows()`, `from_rows(Vec<Row>)`.
 
-### `FromValue` trait
+### `FromValue` / `ToSqlValue`
 
-Extracts typed values from `Value`. Returns `OxiSqlError::TypeMismatch` on mismatch.
+`FromValue` extracts typed values from `Value`, returning
+`OxiSqlError::TypeMismatch` on a mismatch. Impls: `bool`, `i32` (range-checked),
+`i64`, `f64` (accepts I64 coercion), `String` (accepts Text/Json/Decimal/Uuid),
+`Vec<u8>`, `u128` (from Uuid), `Option<T>` (`Ok(None)` for Null).
 
-Implementations: `bool`, `i32` (range-checked), `i64`, `f64` (accepts I64 coercion), `String` (accepts Text/Json/Decimal/Uuid), `Vec<u8>`, `u128` (from Uuid), `Option<T>` (Ok(None) for Null).
-
-### `ToSqlValue` trait
-
-Converts Rust types to `Value` for use as query parameters.
-
-Implementations: `i64`, `i32`, `f64`, `str`, `String`, `bool`, `Vec<u8>`, `Option<T>`, `&T` (blanket), `Value` (pass-through).
+`ToSqlValue` converts Rust types to `Value` for query parameters. Impls: `i64`,
+`i32`, `f64`, `str`, `String`, `bool`, `Vec<u8>`, `Option<T>`, `&T` (blanket),
+`Value` (pass-through).
 
 ### `params` module
 
-The `params` module exposes the named-parameter plumbing used by the default
-`Connection` methods, but is also available for direct use in custom backends
-or middleware.
+The named-parameter plumbing behind the default `Connection` methods, also
+usable directly in custom backends or middleware.
 
 | Function | Description |
 |----------|-------------|
-| `rewrite_named_params(sql)` | Rewrite `:name`/`$name`/`@name` placeholders to positional `$1`/`$2`/… and return the ordered name list |
-| `bind_named_params(names, params)` | Map the ordered name list to a positional `Vec<&dyn ToSqlValue>` slice, returning `OxiSqlError::Params` if a name is missing |
+| `rewrite_named_params(sql)` | Rewrite `:name`/`$name`/`@name` to positional `$1`/`$2`/… and return the ordered name list |
+| `bind_named_params(names, params)` | Map the name list to a positional `Vec<&dyn ToSqlValue>`, erroring with `OxiSqlError::Params` on a missing name |
 
-### `OxiSqlError` variants
+### `OxiSqlError` — 11 variants
 
 | Variant | Description |
 |---------|-------------|
 | `Parse(String)` | SQL could not be parsed |
 | `Execution(String)` | Statement failed during execution |
 | `NotConnected` | No connection available |
-| `TypeMismatch { expected, got }` | Value had unexpected type |
+| `TypeMismatch { expected, got }` | Value had an unexpected type |
 | `ConstraintViolation(String)` | Unique or FK constraint violated |
 | `Timeout(String)` | Connection or query timeout |
 | `ConnectionPool(String)` | Pool exhausted or build failure |
 | `Migration(String)` | Migration error |
-| `UnsupportedUri(String)` | URI scheme not supported by backend |
+| `UnsupportedUri(String)` | URI scheme not supported by the backend |
 | `Params(String)` | Missing or invalid named parameter |
 | `Other(String)` | Any other error |
 
@@ -191,14 +203,46 @@ or middleware.
 | `IndexInfo` | `name`, `columns: Vec<String>`, `unique`, `primary` |
 | `ForeignKeyInfo` | `constraint_name`, `column`, `foreign_table`, `foreign_column` |
 
+### Type registry
+
+- `TypeRegistry` — maps SQL type-name strings to the `SqlType` enum;
+  case-insensitive, alias-aware (e.g. `INT4` → `Integer`, `JSONB` → `Json`).
+- `SqlType` — `Integer`, `BigInt`, `SmallInt`, `Float`, `Double`, `Decimal`,
+  `Text`, `VarChar(Option<u32>)`, `Blob`, `Boolean`, `Timestamp`, `Date`,
+  `Time`, `Uuid`, `Json`, `Array(Box<SqlType>)`, `Unknown(String)`.
+
+### Middleware
+
+Composable wrappers over any `Connection`:
+
+- `LoggingConnection` — logs every SQL operation with timing.
+- `MetricsConnection` — per-operation counters and latencies, snapshot via `MetricsSnapshot`.
+- `RetryConnection` — retries transient failures with a configurable `RetryPolicy` (`RetryPredicate` decides which errors are retryable).
+
 ### Other public types
 
-- `Cursor` — forward-only row cursor with `advance()`, `peek()`, `reset()`, `skip_by()`, implements `Iterator<Item=Row>`
-- `PreparedStatement` — compiled statement for repeated execution
-- `SelectBuilder`, `InsertBuilder`, `UpdateBuilder`, `DeleteBuilder` — type-safe query builders
-- `TypeRegistry` — maps SQL type name strings to `SqlType` enum; case-insensitive, supports aliases (e.g. `INT4` → `Integer`, `JSONB` → `Json`)
-- `SqlType` — `Integer`, `BigInt`, `SmallInt`, `Float`, `Double`, `Decimal`, `Text`, `VarChar(Option<u32>)`, `Blob`, `Boolean`, `Timestamp`, `Date`, `Time`, `Uuid`, `Json`, `Array(Box<SqlType>)`, `Unknown(String)`
+- `Cursor` — forward-only row cursor (`advance`, `peek`, `reset`, `skip_by`); implements `Iterator<Item = Row>`.
+- `PreparedStatement` — compiled statement for repeated execution.
+- `SelectBuilder` / `InsertBuilder` / `UpdateBuilder` / `DeleteBuilder` — type-safe query builders producing a `BuiltQuery`.
+- `Migrator` — async migration trait (`apply`, `rollback`, `status`, `pending`).
+
+## Feature flags
+
+None. `oxisql-core` is dependency-light and always Pure Rust.
+
+## Test coverage
+
+**114 tests** pass.
+
+## Part of the OxiSQL workspace
+
+`oxisql-core` is the foundation crate of the OxiSQL workspace (17 crates: 10
+facade/driver crates plus a 7-crate C-free `oxisqlite-*` engine). See the
+[workspace README](../../README.md) for the full architecture and the 1,720
+workspace tests.
 
 ## License
 
-Apache-2.0 — COOLJAPAN OU (Team Kitasan)
+Apache-2.0 — COOLJAPAN OU (Team Kitasan).
+Copyright © 2024–2026 COOLJAPAN OU (Team Kitasan).
+Repository: <https://github.com/cool-japan/oxisql>

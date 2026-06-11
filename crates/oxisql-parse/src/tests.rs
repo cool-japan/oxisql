@@ -195,6 +195,145 @@ fn extract_columns_join() {
     assert!(cols.contains(&"user_id".to_string()));
 }
 
+// ── explain_verbose tests ─────────────────────────────────────────────────────
+
+#[test]
+fn explain_verbose_contains_rows_annotation() {
+    let stmt = parse_one("SELECT * FROM orders").expect("parse");
+    let plan = plan_statement(&stmt).expect("plan");
+    let model = CostModel::new();
+    let text = explain_verbose(&plan, &model);
+    assert!(
+        text.contains("rows="),
+        "verbose explain should contain rows=: {text}"
+    );
+    assert!(
+        text.contains("cost="),
+        "verbose explain should contain cost=: {text}"
+    );
+}
+
+#[test]
+fn explain_verbose_scan_50000_rows() {
+    let stmt = parse_one("SELECT * FROM orders").expect("parse");
+    let plan = plan_statement(&stmt).expect("plan");
+    let model = CostModel::new().with_table_stats(
+        "orders",
+        TableStats {
+            row_count: 50_000,
+            avg_row_size_bytes: 128,
+            ..Default::default()
+        },
+    );
+    let text = explain_verbose(&plan, &model);
+    assert!(
+        text.contains("rows=50000"),
+        "verbose explain should show 50000 rows for Scan: {text}"
+    );
+}
+
+#[test]
+fn explain_verbose_filter_rows_less_than_scan() {
+    let stmt = parse_one("SELECT * FROM users WHERE active = true").expect("parse");
+    let plan = plan_statement(&stmt).expect("plan");
+    let model = CostModel::new();
+    let est = model.estimate(&plan);
+    // Filter should produce fewer rows than scan default (10_000).
+    assert!(
+        est.rows < 10_000.0,
+        "filter rows should be less than scan rows: {}",
+        est.rows
+    );
+    let text = explain_verbose(&plan, &model);
+    assert!(!text.is_empty(), "verbose explain should not be empty");
+}
+
+// ── explain_json tests ────────────────────────────────────────────────────────
+
+#[test]
+fn explain_json_is_valid_json() {
+    let stmt = parse_one("SELECT id FROM orders WHERE status = 'open'").expect("parse");
+    let plan = plan_statement(&stmt).expect("plan");
+    let model = CostModel::new();
+    let json_str = explain_json(&plan, Some(&model));
+    let parsed: serde_json::Value = serde_json::from_str(&json_str)
+        .unwrap_or_else(|e| panic!("explain_json produced invalid JSON: {e}\noutput: {json_str}"));
+    assert!(parsed.is_object(), "JSON root should be an object");
+}
+
+#[test]
+fn explain_json_contains_scan_op() {
+    let stmt = parse_one("SELECT * FROM products").expect("parse");
+    let plan = plan_statement(&stmt).expect("plan");
+    let json_str = explain_json(&plan, None);
+    assert!(
+        json_str.contains("\"op\":\"Scan\""),
+        "JSON should contain op=Scan: {json_str}"
+    );
+}
+
+#[test]
+fn explain_json_without_cost_is_valid() {
+    let stmt = parse_one("SELECT a.id FROM a JOIN b ON a.id = b.a_id").expect("parse");
+    let plan = plan_statement(&stmt).expect("plan");
+    let json_str = explain_json(&plan, None);
+    let _parsed: serde_json::Value = serde_json::from_str(&json_str)
+        .unwrap_or_else(|e| panic!("explain_json (no cost) invalid JSON: {e}\noutput: {json_str}"));
+}
+
+#[test]
+fn explain_json_escapes_special_chars() {
+    // Build a plan with a predicate containing a double-quote.
+    // We construct the plan directly to embed the tricky string.
+    let plan = LogicalPlan::Filter {
+        input: Box::new(LogicalPlan::Scan {
+            table: "t".to_string(),
+            alias: None,
+            limit: None,
+        }),
+        predicate: r#"name = "foo\"bar""#.to_string(),
+    };
+    let json_str = explain_json(&plan, None);
+    // Must parse without error (quotes are escaped).
+    let _parsed: serde_json::Value = serde_json::from_str(&json_str)
+        .unwrap_or_else(|e| panic!("JSON escaping failed: {e}\noutput: {json_str}"));
+}
+
+#[test]
+fn explain_json_filter_rows_less_than_scan_rows() {
+    let stmt = parse_one("SELECT * FROM users WHERE active = true").expect("parse");
+    let plan = plan_statement(&stmt).expect("plan");
+    let model = CostModel::new();
+    let json_str = explain_json(&plan, Some(&model));
+    let v: serde_json::Value =
+        serde_json::from_str(&json_str).unwrap_or_else(|e| panic!("invalid JSON: {e}"));
+    // Root is Filter/Project (planner wraps in Project); dig into children to find Scan.
+    fn find_op<'a>(v: &'a serde_json::Value, op: &str) -> Option<&'a serde_json::Value> {
+        if v.get("op").and_then(|o| o.as_str()) == Some(op) {
+            return Some(v);
+        }
+        if let Some(children) = v.get("children").and_then(|c| c.as_array()) {
+            for child in children {
+                if let Some(found) = find_op(child, op) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    let scan_node = find_op(&v, "Scan");
+    let filter_node = find_op(&v, "Filter");
+    if let (Some(scan), Some(filter)) = (scan_node, filter_node) {
+        let scan_rows = scan.get("rows").and_then(|r| r.as_f64()).unwrap_or(0.0);
+        let filter_rows = filter.get("rows").and_then(|r| r.as_f64()).unwrap_or(0.0);
+        assert!(
+            filter_rows < scan_rows,
+            "filter rows ({filter_rows}) should be < scan rows ({scan_rows})"
+        );
+    }
+    // (if one node is missing, just verify valid JSON — already done above)
+}
+
 // ── New comprehensive tests ─────────────────────────────────────────────
 
 #[test]

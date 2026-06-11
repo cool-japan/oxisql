@@ -2,7 +2,7 @@
 //!
 //! # Mapping table
 //!
-//! | Limbo [`limbo::Value`]  | OxiSQL [`oxisql_core::Value`] |
+//! | Limbo `limbo::Value`    | OxiSQL [`oxisql_core::Value`] |
 //! |-------------------------|-------------------------------|
 //! | `Integer(i64)`          | `Value::I64(i64)`             |
 //! | `Real(f64)`             | `Value::F64(f64)`             |
@@ -14,27 +14,233 @@
 //! after they have been rewritten to `?` placeholders by [`rewrite_params`].
 //! Rich OxiSQL types that have no Limbo counterpart (Timestamp, Date, Time,
 //! Uuid, Decimal, Json) are stored as their string or integer representations.
+//!
+//! When the column's declared SQL type is known, [`limbo_to_core_typed`] can
+//! produce richer typed [`oxisql_core::Value`] variants instead of the raw storage-class
+//! representations.
 
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use limbo::Value as LimboValue;
 use oxisql_core::Value as CoreValue;
 
 use crate::error::SqliteCompatError;
 
+/// Unix epoch as a `NaiveDate` — used for day-count computations.
+const UNIX_EPOCH_DATE: fn() -> NaiveDate =
+    || NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch date is valid");
+
 /// Convert a single `limbo::Value` into an `oxisql_core::Value`.
+///
+/// This is the untyped fallback — all five Limbo storage classes are mapped
+/// directly without any enrichment.  Prefer [`limbo_to_core_typed`] when the
+/// column's declared SQL type is available.
 ///
 /// # Errors
 ///
 /// Returns [`SqliteCompatError::TypeMap`] for value variants that cannot be
 /// represented (currently none — all five Limbo types are mapped).
 pub fn limbo_to_core(val: LimboValue) -> Result<CoreValue, SqliteCompatError> {
+    limbo_to_core_typed(val, None)
+}
+
+/// Convert a single `limbo::Value` into a (possibly richer) `oxisql_core::Value`
+/// using an optional declared SQL type hint.
+///
+/// When `decl_type` matches a known rich type the stored integer or text is
+/// lifted into the corresponding typed variant:
+///
+/// | Declared type            | Storage       | Produced variant           |
+/// |--------------------------|---------------|----------------------------|
+/// | `DATE` (not DATETIME)    | Text / Int    | `Value::Date(days)`        |
+/// | `DATETIME` / `TIMESTAMP` | Text / Int    | `Value::Timestamp(µs)`     |
+/// | `TIME` (not TIMESTAMP)   | Text / Int    | `Value::Time(µs)`          |
+/// | `UUID`                   | Text / Blob16 | `Value::Uuid(u128)`        |
+///
+/// Comparison is case-insensitive and prefix-based (e.g. `"timestamp with tz"`
+/// still triggers `TIMESTAMP` handling).  If parsing fails the value falls back
+/// to the untyped variant instead of returning an error.
+///
+/// # Errors
+///
+/// Returns [`SqliteCompatError::TypeMap`] for value variants that cannot be
+/// represented (currently none — all five Limbo types are mapped).
+pub fn limbo_to_core_typed(
+    val: LimboValue,
+    decl_type: Option<&str>,
+) -> Result<CoreValue, SqliteCompatError> {
+    // Normalise the declared type for prefix matching (upper-case once).
+    let dt_upper: Option<String> = decl_type.map(|s| s.to_ascii_uppercase());
+    let dt = dt_upper.as_deref();
+
     let v = match val {
         LimboValue::Null => CoreValue::Null,
-        LimboValue::Integer(n) => CoreValue::I64(n),
         LimboValue::Real(f) => CoreValue::F64(f),
-        LimboValue::Text(s) => CoreValue::Text(s),
-        LimboValue::Blob(b) => CoreValue::Blob(b),
+
+        LimboValue::Integer(n) => {
+            if let Some(dt) = dt {
+                if is_datetime_type(dt) {
+                    return Ok(CoreValue::Timestamp(n));
+                } else if is_date_type(dt) {
+                    // Stored as days since epoch.
+                    let days = i32::try_from(n).unwrap_or(n as i32);
+                    return Ok(CoreValue::Date(days));
+                } else if is_time_type(dt) {
+                    return Ok(CoreValue::Time(n));
+                }
+            }
+            CoreValue::I64(n)
+        }
+
+        LimboValue::Text(s) => {
+            if let Some(dt) = dt {
+                if is_datetime_type(dt) {
+                    if let Some(ts) = parse_text_as_timestamp(&s) {
+                        return Ok(CoreValue::Timestamp(ts));
+                    }
+                } else if is_date_type(dt) {
+                    if let Some(days) = parse_text_as_date(&s) {
+                        return Ok(CoreValue::Date(days));
+                    }
+                } else if is_time_type(dt) {
+                    if let Some(us) = parse_text_as_time(&s) {
+                        return Ok(CoreValue::Time(us));
+                    }
+                } else if is_uuid_type(dt) {
+                    if let Some(u) = parse_text_as_uuid(&s) {
+                        return Ok(CoreValue::Uuid(u));
+                    }
+                }
+            }
+            CoreValue::Text(s)
+        }
+
+        LimboValue::Blob(b) => {
+            // UUID stored as raw 16-byte big-endian blob.
+            if let Some(dt) = dt {
+                if is_uuid_type(dt) && b.len() == 16 {
+                    let mut arr = [0u8; 16];
+                    arr.copy_from_slice(&b);
+                    let u = u128::from_be_bytes(arr);
+                    return Ok(CoreValue::Uuid(u));
+                }
+            }
+            CoreValue::Blob(b)
+        }
     };
     Ok(v)
+}
+
+// ── Declared-type predicate helpers ───────────────────────────────────────────
+
+/// True when `dt` (already upper-cased) indicates a DATETIME / TIMESTAMP type.
+///
+/// Must be checked **before** [`is_date_type`] because "DATETIME" starts with
+/// "DATE" and "TIMESTAMP" starts with "TIME".
+#[inline]
+fn is_datetime_type(dt: &str) -> bool {
+    dt.starts_with("DATETIME") || dt.starts_with("TIMESTAMP")
+}
+
+/// True when `dt` (already upper-cased) indicates a DATE-only type.
+///
+/// Checked only after ruling out DATETIME.
+#[inline]
+fn is_date_type(dt: &str) -> bool {
+    dt.starts_with("DATE")
+}
+
+/// True when `dt` (already upper-cased) indicates a TIME-of-day type.
+///
+/// Checked only after ruling out TIMESTAMP / DATETIME.
+#[inline]
+fn is_time_type(dt: &str) -> bool {
+    dt.starts_with("TIME")
+}
+
+/// True when `dt` (already upper-cased) indicates a UUID type.
+#[inline]
+fn is_uuid_type(dt: &str) -> bool {
+    dt.starts_with("UUID")
+}
+
+// ── Text parsing helpers ──────────────────────────────────────────────────────
+
+/// Parse an ISO-8601 datetime string into microseconds since Unix epoch.
+///
+/// Accepts `"YYYY-MM-DDTHH:MM:SS"`, `"YYYY-MM-DD HH:MM:SS"`, and variants
+/// with optional sub-second fractions.  Returns `None` on parse failure.
+fn parse_text_as_timestamp(s: &str) -> Option<i64> {
+    // Try the two common separator styles (T and space).
+    let fmt_t = "%Y-%m-%dT%H:%M:%S%.f";
+    let fmt_sp = "%Y-%m-%d %H:%M:%S%.f";
+    let fmt_t_no_frac = "%Y-%m-%dT%H:%M:%S";
+    let fmt_sp_no_frac = "%Y-%m-%d %H:%M:%S";
+
+    let dt: Option<NaiveDateTime> = NaiveDateTime::parse_from_str(s, fmt_t)
+        .or_else(|_| NaiveDateTime::parse_from_str(s, fmt_sp))
+        .or_else(|_| NaiveDateTime::parse_from_str(s, fmt_t_no_frac))
+        .or_else(|_| NaiveDateTime::parse_from_str(s, fmt_sp_no_frac))
+        .ok();
+
+    dt.map(|d| {
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .expect("epoch datetime is valid");
+        let dur = d.signed_duration_since(epoch);
+        dur.num_microseconds()
+            .unwrap_or(dur.num_milliseconds() * 1_000)
+    })
+}
+
+/// Parse an ISO-8601 date string `"YYYY-MM-DD"` into days since Unix epoch.
+///
+/// Returns `None` on parse failure.
+fn parse_text_as_date(s: &str) -> Option<i32> {
+    let d = NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
+    let epoch = UNIX_EPOCH_DATE();
+    // `signed_duration_since` is always in whole days here because both are
+    // date-only values.
+    let days = d.signed_duration_since(epoch).num_days();
+    i32::try_from(days).ok()
+}
+
+/// Parse a time-of-day string into microseconds since midnight.
+///
+/// Accepts `"HH:MM:SS"` and `"HH:MM:SS.ffffff"`.  Returns `None` on parse
+/// failure.
+fn parse_text_as_time(s: &str) -> Option<i64> {
+    let t: Option<NaiveTime> = NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
+        .or_else(|_| NaiveTime::parse_from_str(s, "%H:%M:%S"))
+        .ok();
+    t.map(|t| {
+        let midnight = NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is valid");
+        let dur = t.signed_duration_since(midnight);
+        dur.num_microseconds()
+            .unwrap_or(dur.num_milliseconds() * 1_000)
+    })
+}
+
+/// Parse a hyphenated UUID string `"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"` into
+/// a `u128`.  Returns `None` on parse failure.
+fn parse_text_as_uuid(s: &str) -> Option<u128> {
+    // Expect exactly 36 bytes: 8-4-4-4-12 hex with dashes.
+    if s.len() != 36 {
+        return None;
+    }
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 5 {
+        return None;
+    }
+    let expected_lens = [8usize, 4, 4, 4, 12];
+    for (part, &expected) in parts.iter().zip(expected_lens.iter()) {
+        if part.len() != expected {
+            return None;
+        }
+    }
+
+    // Concatenate all hex digits and parse as u128.
+    let hex: String = parts.concat();
+    u128::from_str_radix(&hex, 16).ok()
 }
 
 /// Convert an `oxisql_core::Value` into a `limbo::Value`.
@@ -110,6 +316,7 @@ pub fn core_to_limbo(val: &CoreValue) -> Result<LimboValue, SqliteCompatError> {
         }
         CoreValue::Decimal(s) | CoreValue::Json(s) => LimboValue::Text(s.clone()),
         CoreValue::Array(arr) => LimboValue::Text(format!("{arr:?}")),
+        CoreValue::TypedArray { values: arr, .. } => LimboValue::Text(format!("{arr:?}")),
     };
     Ok(v)
 }

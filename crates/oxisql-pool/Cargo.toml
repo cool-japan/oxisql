@@ -23,8 +23,6 @@ embedded = ["dep:gluesql", "dep:tokio", "dep:oxisql-embedded"]
 sqlite = ["dep:deadpool", "dep:oxisql-sqlite-compat", "dep:tokio"]
 # Transitional alias: sqlite-compat is a synonym for sqlite (both use the Limbo engine)
 sqlite-compat = ["sqlite"]
-# Legacy C-backed SQLite via rusqlite (C-FFI) — use only if you explicitly need the C backend
-sqlite-rusqlite = ["dep:deadpool", "dep:rusqlite", "dep:tokio"]
 # Enable QueryBuilder::execute_pooled integration (requires embedded)
 query-builder = ["embedded", "dep:oxisql-parse"]
 
@@ -41,7 +39,6 @@ deadpool-postgres = { workspace = true, optional = true }
 tokio-postgres = { workspace = true, optional = true }
 mysql_async = { workspace = true, optional = true }
 gluesql = { workspace = true, optional = true }
-rusqlite = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 thiserror.workspace = true
 

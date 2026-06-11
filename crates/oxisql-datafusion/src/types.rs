@@ -39,6 +39,13 @@ pub fn value_to_arrow_type(value: &Value) -> Option<DataType> {
             DataType::Utf8,
             true,
         )))),
+        // TypedArray carries an element-type hint from the backend but is stored
+        // the same way as an untyped Array at the Arrow layer.
+        Value::TypedArray { .. } => Some(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        )))),
     }
 }
 
@@ -126,6 +133,9 @@ fn build_column(
                     }
                     Some(Value::Array(vals)) => {
                         builder.append_value(format!("{}", Value::Array(vals.clone())).as_str());
+                    }
+                    Some(Value::TypedArray { values, .. }) => {
+                        builder.append_value(format!("{}", Value::Array(values.clone())).as_str());
                     }
                     Some(Value::Null) | None => builder.append_null(),
                     _ => builder.append_null(),
@@ -222,7 +232,7 @@ fn build_column(
             let mut builder = ListBuilder::new(inner);
             for row in rows {
                 match row.get_by_index(col_idx) {
-                    Some(Value::Array(vals)) => {
+                    Some(Value::Array(vals)) | Some(Value::TypedArray { values: vals, .. }) => {
                         let values_builder = builder.values();
                         for v in vals {
                             if v.is_null() {

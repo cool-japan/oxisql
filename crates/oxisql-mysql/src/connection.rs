@@ -29,8 +29,18 @@
 //! [`Transaction::commit`] or [`Transaction::rollback`] explicitly.  Dropping
 //! without an explicit terminal action rolls back implicitly (mysql_async's
 //! internal behaviour).
+//!
+//! # Warning surfacing
+//!
+//! MySQL reports a warning count in every `OkPacket`.  After each `execute` or
+//! `query` call, if the count is `> 0`, a follow-up `SHOW WARNINGS` query is
+//! issued on the same connection to retrieve the full list.  The results are
+//! stored in `last_warnings` (via an `Arc<Mutex<...>>` for interior mutability
+//! across `Clone` instances sharing the same pool) and accessible via
+//! [`Connection::last_warnings`].  When the server reports `0` warnings the
+//! extra round-trip is skipped entirely.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -39,12 +49,65 @@ use mysql_async::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts, T
 
 use oxisql_core::{
     ColumnInfo, Connection, ForeignKeyInfo, IndexInfo, OxiSqlError, PreparedStatement, Row,
-    TableInfo, TableType, ToSqlValue, Transaction, Value,
+    SqlWarning, TableInfo, TableType, ToSqlValue, Transaction, Value,
 };
 
 use crate::error::{classify_mysql_error, MysqlError};
 use crate::prepared::MySqlPrepared;
 use crate::types::{mysql_row_to_core, mysql_value_to_core};
+
+// ── warning helpers ───────────────────────────────────────────────────────────
+
+/// Fetch the current warning list from the server via `SHOW WARNINGS`.
+///
+/// Called only when the preceding statement's `OkPacket` reported
+/// `warnings_count > 0` — no extra round-trip on the common no-warning path.
+///
+/// Each row in the `SHOW WARNINGS` response has three columns:
+/// `Level VARCHAR`, `Code SMALLINT UNSIGNED`, `Message TEXT`.
+async fn fetch_show_warnings(conn: &mut mysql_async::Conn) -> Result<Vec<SqlWarning>, MysqlError> {
+    use oxisql_core::parse_warning_level;
+
+    let rows: Vec<mysql_async::Row> = conn
+        .query("SHOW WARNINGS")
+        .await
+        .map_err(MysqlError::Query)?;
+
+    let mut warnings = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        // Level column (VARCHAR)
+        let level_str: Option<mysql_async::Value> = row.take(0);
+        let level = match level_str {
+            Some(mysql_async::Value::Bytes(b)) => {
+                let s = String::from_utf8(b).unwrap_or_default();
+                parse_warning_level(&s)
+            }
+            _ => oxisql_core::SqlWarningLevel::Warning,
+        };
+
+        // Code column (SMALLINT UNSIGNED → UInt or Int in mysql_async)
+        let code_val: Option<mysql_async::Value> = row.take(1);
+        let code: u16 = match code_val {
+            Some(mysql_async::Value::UInt(n)) => u16::try_from(n).unwrap_or(u16::MAX),
+            Some(mysql_async::Value::Int(n)) => u16::try_from(n.max(0)).unwrap_or(u16::MAX),
+            _ => 0,
+        };
+
+        // Message column (TEXT)
+        let msg_val: Option<mysql_async::Value> = row.take(2);
+        let message = match msg_val {
+            Some(mysql_async::Value::Bytes(b)) => String::from_utf8(b).unwrap_or_default(),
+            _ => String::new(),
+        };
+
+        warnings.push(SqlWarning {
+            code,
+            level,
+            message,
+        });
+    }
+    Ok(warnings)
+}
 
 // ── TLS mode ──────────────────────────────────────────────────────────────────
 
@@ -150,6 +213,12 @@ pub fn core_value_to_mysql(v: &Value) -> mysql_async::Value {
             let json = format!("[{}]", items.join(","));
             mysql_async::Value::Bytes(json.into_bytes())
         }
+        Value::TypedArray { values, .. } => {
+            // MySQL doesn't have native typed arrays; send as JSON array
+            let items: Vec<String> = values.iter().map(|v| format!("{v}")).collect();
+            let json = format!("[{}]", items.join(","));
+            mysql_async::Value::Bytes(json.into_bytes())
+        }
     }
 }
 
@@ -161,10 +230,18 @@ pub fn core_value_to_mysql(v: &Value) -> mysql_async::Value {
 /// The `Pool` is internally synchronized; callers can share a `MyConnection`
 /// across async tasks without additional locking.
 ///
-/// `Clone` is cheap: `mysql_async::Pool` is internally reference-counted.
+/// `Clone` is cheap: both `mysql_async::Pool` and the `Arc`-wrapped warnings
+/// store are internally reference-counted.  Clones share the same warning store,
+/// so `last_warnings()` always reflects the most recent call made on *any*
+/// clone.
 #[derive(Clone)]
 pub struct MyConnection {
     pool: Pool,
+    /// Warnings from the most recently completed `execute` or `query` call.
+    ///
+    /// Wrapped in `Arc<Mutex<…>>` so that `Clone` instances share one store
+    /// and interior mutability is safe across the `&self` execute/query API.
+    last_warnings: Arc<Mutex<Vec<SqlWarning>>>,
 }
 
 impl MyConnection {
@@ -191,7 +268,10 @@ impl MyConnection {
         };
 
         let pool = build_pool(url, ssl_opts, None)?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            last_warnings: Arc::new(Mutex::new(Vec::new())),
+        })
     }
 
     /// Construct a `MyConnection` from a pre-existing `mysql_async::Pool`.
@@ -201,7 +281,10 @@ impl MyConnection {
     ///
     /// `Clone` is cheap: `mysql_async::Pool` is internally reference-counted.
     pub fn from_pool(pool: Pool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            last_warnings: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 
     // ── query analysis helpers ────────────────────────────────────────────────
@@ -249,7 +332,17 @@ impl Connection for MyConnection {
     /// MySQL uses `?` as the positional placeholder for parameters,
     /// unlike PostgreSQL which uses `$1`, `$2`, etc.
     /// Callers must use `?`-style placeholders in their SQL for MySQL.
+    ///
+    /// After execution, any server warnings are fetched via `SHOW WARNINGS`
+    /// (only when `warnings_count > 0` in the `OkPacket`; no extra round-trip
+    /// on the common no-warning path) and stored in `last_warnings`.
     async fn execute(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<u64, OxiSqlError> {
+        // Clear warnings before starting.
+        {
+            let mut store = self.last_warnings.lock().unwrap_or_else(|e| e.into_inner());
+            store.clear();
+        }
+
         let mut conn = self
             .pool
             .get_conn()
@@ -263,10 +356,21 @@ impl Connection for MyConnection {
             .map_err(|e| OxiSqlError::from(classify_mysql_error(e)))?;
 
         let affected = result.affected_rows();
+        // Read warning count before consuming the result set.
+        let warnings_count = result.warnings();
         result
             .drop_result()
             .await
             .map_err(|e| OxiSqlError::from(classify_mysql_error(e)))?;
+
+        // Conditional SHOW WARNINGS — skips extra round-trip when count is 0.
+        if warnings_count > 0 {
+            let fetched = fetch_show_warnings(&mut conn)
+                .await
+                .map_err(OxiSqlError::from)?;
+            let mut store = self.last_warnings.lock().unwrap_or_else(|e| e.into_inner());
+            *store = fetched;
+        }
 
         Ok(affected)
     }
@@ -278,10 +382,26 @@ impl Connection for MyConnection {
     /// Internally uses explicit `prep()` + `exec()` (binary protocol) so the server
     /// can cache the prepared-statement plan.  This is equivalent to calling
     /// [`MyConnection::query_binary`] but returns `OxiSqlError` for trait uniformity.
+    ///
+    /// After execution, any server warnings are fetched via `SHOW WARNINGS`
+    /// (only when the warning count from the last `OkPacket` is `> 0`) and
+    /// stored in `last_warnings`.
     async fn query(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<Vec<Row>, OxiSqlError> {
         self.query_internal(sql, params)
             .await
             .map_err(OxiSqlError::from)
+    }
+
+    /// Return any SQL warnings generated by the most recently completed
+    /// `execute` or `query` call on this connection.
+    ///
+    /// The list is cleared before each statement and repopulated from
+    /// `SHOW WARNINGS` only when the server reports `warnings_count > 0`.
+    fn last_warnings(&self) -> Vec<SqlWarning> {
+        self.last_warnings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Begin a transaction.
@@ -300,6 +420,13 @@ impl Connection for MyConnection {
     }
 
     async fn execute_batch(&self, sql: &str) -> Result<u64, OxiSqlError> {
+        // Clear warnings at the start of a batch; warnings from the last
+        // statement in the batch are captured at the end.
+        {
+            let mut store = self.last_warnings.lock().unwrap_or_else(|e| e.into_inner());
+            store.clear();
+        }
+
         let mut conn = self
             .pool
             .get_conn()
@@ -307,6 +434,7 @@ impl Connection for MyConnection {
             .map_err(|e| OxiSqlError::from(MysqlError::Connection(e)))?;
 
         let mut total = 0u64;
+        let mut last_warnings_count: u16 = 0;
         for stmt in sql.split(';') {
             let trimmed = stmt.trim();
             if !trimmed.is_empty() {
@@ -315,12 +443,23 @@ impl Connection for MyConnection {
                     .await
                     .map_err(|e| OxiSqlError::from(classify_mysql_error(e)))?;
                 total += result.affected_rows();
+                last_warnings_count = result.warnings();
                 result
                     .drop_result()
                     .await
                     .map_err(|e| OxiSqlError::from(classify_mysql_error(e)))?;
             }
         }
+
+        // Capture warnings from the last statement in the batch.
+        if last_warnings_count > 0 {
+            let fetched = fetch_show_warnings(&mut conn)
+                .await
+                .map_err(OxiSqlError::from)?;
+            let mut store = self.last_warnings.lock().unwrap_or_else(|e| e.into_inner());
+            *store = fetched;
+        }
+
         Ok(total)
     }
 
@@ -485,6 +624,7 @@ impl Connection for MyConnection {
                     column,
                     foreign_table,
                     foreign_column,
+                    ..Default::default()
                 })
             })
             .collect()
@@ -669,11 +809,21 @@ impl MyConnection {
     /// Errors that represent well-known MySQL conditions (e.g. constraint
     /// violations, connection loss) are run through [`classify_mysql_error`] before
     /// being returned as [`MysqlError`] variants.
+    ///
+    /// Clears `last_warnings` before the call and captures any server-reported
+    /// warnings into it afterwards (conditional `SHOW WARNINGS` — only when the
+    /// server reports `warnings_count > 0`).
     async fn query_internal(
         &self,
         sql: &str,
         params: &[&dyn ToSqlValue],
     ) -> Result<Vec<Row>, MysqlError> {
+        // Clear warnings before starting.
+        {
+            let mut store = self.last_warnings.lock().unwrap_or_else(|e| e.into_inner());
+            store.clear();
+        }
+
         let mut conn = self.pool.get_conn().await.map_err(MysqlError::Connection)?;
         let stmt = conn.prep(sql).await.map_err(classify_mysql_error)?;
         let mysql_params = core_params_to_mysql(params);
@@ -681,7 +831,23 @@ impl MyConnection {
             .exec(&stmt, mysql_params)
             .await
             .map_err(classify_mysql_error)?;
-        mysql_rows.into_iter().map(mysql_row_to_core).collect()
+
+        // After exec(), the warning count is available on the connection.
+        let warnings_count = conn.get_warnings();
+
+        let rows = mysql_rows
+            .into_iter()
+            .map(mysql_row_to_core)
+            .collect::<Result<Vec<Row>, _>>()?;
+
+        // Conditional SHOW WARNINGS — no extra round-trip when count is 0.
+        if warnings_count > 0 {
+            let fetched = fetch_show_warnings(&mut conn).await?;
+            let mut store = self.last_warnings.lock().unwrap_or_else(|e| e.into_inner());
+            *store = fetched;
+        }
+
+        Ok(rows)
     }
 
     /// Execute a query using an explicit server-side prepared statement (binary
@@ -1155,7 +1321,10 @@ impl MyConnectionBuilder {
             }
         }
 
-        Ok(MyConnection { pool })
+        Ok(MyConnection {
+            pool,
+            last_warnings: Arc::new(Mutex::new(Vec::new())),
+        })
     }
 
     /// Assemble a `PoolOpts` from pool configuration fields, if any were set.

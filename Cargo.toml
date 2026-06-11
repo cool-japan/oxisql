@@ -11,10 +11,18 @@ members = [
     "crates/oxisql-migrate",
     "crates/oxisql-sqlite-compat",
     "crates/oxisql",
+    # oxisqlite C-stripped fork (formerly vendor/limbo)
+    "crates/oxisqlite",
+    "crates/oxisqlite-core",
+    "crates/oxisqlite-ext",
+    "crates/oxisqlite-macros",
+    "crates/oxisqlite-sqlite3-parser",
+    "crates/oxisqlite-time",
+    "crates/oxisqlite-uuid",
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.89"
 authors = ["COOLJAPAN OU (Team Kitasan)"]
@@ -23,15 +31,15 @@ repository = "https://github.com/cool-japan/oxisql"
 description = "OxiSQL is the COOLJAPAN-blessed Pure-Rust database layer: a unified SQL surface that spans embedded engines, OLTP wire-protocol clients (Postgres, MySQL), and a SQLite-compatible embedded path — without `libpq`, `mysqlclient`, `libsqlite3`, or any C/C++ DB driver."
 
 [workspace.dependencies]
-oxisql-core           = { path = "crates/oxisql-core",           version = "0.1.1" }
-oxisql-parse          = { path = "crates/oxisql-parse",          version = "0.1.1" }
-oxisql-embedded       = { path = "crates/oxisql-embedded",       version = "0.1.1" }
-oxisql-postgres       = { path = "crates/oxisql-postgres",       version = "0.1.1" }
-oxisql-mysql          = { path = "crates/oxisql-mysql",          version = "0.1.1" }
-oxisql-datafusion     = { path = "crates/oxisql-datafusion",     version = "0.1.1" }
-oxisql-pool           = { path = "crates/oxisql-pool",           version = "0.1.1" }
-oxisql-migrate        = { path = "crates/oxisql-migrate",        version = "0.1.1" }
-oxisql-sqlite-compat  = { path = "crates/oxisql-sqlite-compat",  version = "0.1.1" }
+oxisql-core           = { path = "crates/oxisql-core",           version = "0.1.2" }
+oxisql-parse          = { path = "crates/oxisql-parse",          version = "0.1.2" }
+oxisql-embedded       = { path = "crates/oxisql-embedded",       version = "0.1.2" }
+oxisql-postgres       = { path = "crates/oxisql-postgres",       version = "0.1.2" }
+oxisql-mysql          = { path = "crates/oxisql-mysql",          version = "0.1.2" }
+oxisql-datafusion     = { path = "crates/oxisql-datafusion",     version = "0.1.2" }
+oxisql-pool           = { path = "crates/oxisql-pool",           version = "0.1.2" }
+oxisql-migrate        = { path = "crates/oxisql-migrate",        version = "0.1.2" }
+oxisql-sqlite-compat  = { path = "crates/oxisql-sqlite-compat",  version = "0.1.2" }
 
 # DataFusion backend — default-features=false avoids parquet/compression *-sys crates
 datafusion = { version = "53.1.0", default-features = false, features = ["sql"] }
@@ -51,9 +59,11 @@ rustls-pki-types        = { version = "1" }
 rustls-pemfile          = { version = "2" }
 tokio-rustls            = { version = "0.26", default-features = false, features = ["tls12"] }
 rustls-rustcrypto       = { version = "0.0.2-alpha" }
-oxitls                  = { version = "0.1.1", default-features = false, features = ["pure", "webpki-roots"] }
+oxitls                  = { version = "0.1.2", default-features = false, features = ["pure", "webpki-roots"] }
 bytes                   = { version = "1" }
-time                    = { version = "0.3.47", features = ["formatting", "macros"] }
+time                    = { version = "0.3.47", default-features = false, features = ["std", "formatting", "macros"] }
+tracing                 = { version = "0.1" }
+tracing-subscriber      = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 uuid                    = { version = "1.23.2" }
 
 # MySQL backend (Pure Rust, no libmysqlclient/mysqlclient-sys/openssl-sys)
@@ -78,12 +88,9 @@ log = { version = "0.4" }
 clap   = { version = "4", features = ["derive"] }
 anyhow = { version = "1" }
 
-# SQLite (C-FFI, feature-gated; bundled compiles SQLite from vendored C source)
-rusqlite = { version = "0.40.0", features = ["bundled"] }
-
-# Pure-Rust SQLite-compatible engine (Limbo, no C dependency)
-# index_experimental enables CREATE INDEX support in limbo 0.0.22
-limbo = { version = "0.0.22", features = ["index_experimental"] }
+# oxisqlite — Pure-Rust SQLite-compatible engine (C-stripped fork of limbo 0.0.22; no C/C++ deps)
+# index_experimental enables CREATE INDEX support
+oxisqlite = { path = "crates/oxisqlite", version = "0.1.0", features = ["index_experimental"] }
 
 # Persistent embedded storage — fjall LSM-tree (Pure Rust, optional)
 fjall = { version = "3.1.4" }
@@ -105,3 +112,12 @@ serde_json = { version = "1" }
 
 # OxiStore columnar Parquet backend (Pure Rust, optional)
 oxistore-columnar = { version = "0.1.1" }
+
+# ── Security patches ───────────────────────────────────────────────────────────
+# RUSTSEC-2026-0104: rustls-webpki 0.102.x panic in CRL parsing.
+# rustls-rustcrypto 0.0.2-alpha pins webpki = "0.102.0" (no newer release yet).
+# This local patch removes the webpki dep and routes alg_id through pki-types,
+# allowing Cargo to resolve rustls-webpki >= 0.103.13 for all other consumers.
+[patch.crates-io]
+rustls-rustcrypto = { path = "crates/rustls-rustcrypto-patched" }
+

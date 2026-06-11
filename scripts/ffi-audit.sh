@@ -14,8 +14,12 @@ cd "$(dirname "$0")/.."
 #
 # If you add a new crate and see a false positive here, document it above and
 # extend the allowlist grep below.
+#
+# Audits the Pure-Rust SQLite path (oxisqlite / oxisql-sqlite-compat) using
+# normal+build deps only (excludes dev-deps) so the check covers exactly what
+# ships to end users on the C-free oxisqlite path.
 
-FORBIDDEN=$(cargo tree 2>/dev/null \
+FORBIDDEN=$(cargo tree -e normal,build -p oxisql-sqlite-compat 2>/dev/null \
     | { grep -E '(-sys v|openssl|native-tls|ring v)' || true; } \
     | { grep -Ev '(core-foundation-sys|Security-sys|arrow-string)' || true; })
 

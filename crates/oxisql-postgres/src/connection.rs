@@ -395,6 +395,45 @@ impl PgConnection {
         PgPipeline::new(Arc::clone(&self.inner))
     }
 
+    /// Return a [`PostgresCancelToken`] that can be used to interrupt the
+    /// currently running query on this connection.
+    ///
+    /// The token is `Send + Sync` and may be moved to another task.  Call
+    /// [`PostgresCancelToken::cancel_query`] with the appropriate TLS
+    /// connector to send a cancel request to the server.
+    ///
+    /// # Note
+    ///
+    /// Because `PgConnection` wraps the client in an `Arc<Mutex<_>>`,
+    /// acquiring the cancel token requires a momentary lock on the inner
+    /// mutex.  The lock is held only for the duration of the synchronous
+    /// `cancel_token()` call on the underlying `tokio_postgres::Client`,
+    /// never across any `await`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use oxisql_postgres::{PgConnection, TlsMode};
+    ///
+    /// let conn = PgConnection::connect("host=localhost user=postgres", TlsMode::Disabled).await?;
+    /// let token = conn.cancel_token();
+    /// // Spawn a task that cancels after a short delay:
+    /// tokio::spawn(async move {
+    ///     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    ///     let _ = token.cancel_query(tokio_postgres::NoTls).await;
+    /// });
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn cancel_token(&self) -> PostgresCancelToken {
+        let client = self.inner.lock().await;
+        PostgresCancelToken {
+            inner: client.cancel_token(),
+        }
+    }
+
     /// Establish a fresh connection using the same URI and TLS mode as this
     /// connection.
     ///
@@ -750,6 +789,7 @@ impl Connection for PgConnection {
                     column,
                     foreign_table,
                     foreign_column,
+                    ..Default::default()
                 })
             })
             .collect()
@@ -1062,6 +1102,61 @@ fn validate_savepoint_name(name: &str) -> Result<(), OxiSqlError> {
     Ok(())
 }
 
+// ── PostgresCancelToken ───────────────────────────────────────────────────────
+
+/// A token that can be used to cancel a running query on a [`PgConnection`].
+///
+/// Obtained via [`PgConnection::cancel_token`].  Cancellation is a
+/// **best-effort** signal: the server may have already finished processing the
+/// query by the time the cancel request arrives, and the cancel request itself
+/// is sent over a separate TCP connection with no acknowledgement.
+///
+/// This type is `Send + Sync` and can be passed to other tasks.
+pub struct PostgresCancelToken {
+    inner: tokio_postgres::CancelToken,
+}
+
+impl PostgresCancelToken {
+    /// Send a cancel request to the PostgreSQL server.
+    ///
+    /// Uses `tls` to open the temporary cancel connection.  Pass
+    /// [`tokio_postgres::NoTls`] for unencrypted connections, or the same TLS
+    /// connector used when establishing the main connection for encrypted ones.
+    ///
+    /// Returns `Ok(())` when the cancel request was sent (not when it was
+    /// acted upon — there is no acknowledgement in the PostgreSQL wire
+    /// protocol for cancel requests).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PgError::Connection`] if the cancel connection could not be
+    /// established or the cancel packet could not be sent.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use oxisql_postgres::{PgConnection, TlsMode};
+    ///
+    /// let conn = PgConnection::connect("host=localhost user=postgres", TlsMode::Disabled).await?;
+    /// let token = conn.cancel_token();
+    /// // In another task:
+    /// token.cancel_query(tokio_postgres::NoTls).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn cancel_query<T>(&self, tls: T) -> Result<(), PgError>
+    where
+        T: tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket> + Clone,
+    {
+        self.inner
+            .cancel_query(tls)
+            .await
+            .map_err(|e| PgError::Connection(e.to_string()))
+    }
+}
+
 // ── PgConnParts / parse_pg_conn_str ───────────────────────────────────────────
 
 /// Parsed fields extracted from a PostgreSQL connection string.
@@ -1242,4 +1337,19 @@ fn parse_pg_uri(uri: &str) -> Result<PgConnParts, OxiSqlError> {
         dbname,
         user,
     })
+}
+
+// ── Cancel token tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod cancel_token_tests {
+    use crate::PostgresCancelToken;
+
+    fn _assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn cancel_token_is_send_sync() {
+        // PostgresCancelToken must be Send + Sync for async cancellation across tasks.
+        _assert_send_sync::<PostgresCancelToken>();
+    }
 }

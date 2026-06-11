@@ -1,53 +1,64 @@
-# oxidb-pool TODO
+# oxisql-pool — TODO
 
-## Status
-Pure Rust core, `forbid(unsafe_code)`. Three pool backends behind opt-in features: `postgres` (deadpool-postgres wrapper), `mysql` (custom `deadpool::managed::Manager` over `mysql_async::Conn`), and `embedded` (Arc<Mutex<Glue<MemoryStorage>>> no-op pool). Unified `OxidbPool` enum spans all enabled backends with `health_check()` and `metrics()` dispatch. `PoolError` covers Postgres pool/create errors and MySQL pool/URL errors. Integration tests exercise embedded pool DDL/DML and Postgres/MySQL connection (when services are available).
+## Status: Stable (0.1.2)
 
-## Core Implementation
-- [x] Implement `lock_sync()` on `EmbeddedPool` properly using `std::sync::Mutex` as a secondary wrapper or `tokio::sync::Mutex::blocking_lock()` instead of panicking (~20 SLOC refactor) — resolved: pool design uses tokio::sync::Mutex directly, no sync wrapper needed
-- [x] Add pool health-check method: `OxidbPool::health_check() -> Result<(), PoolError>` dispatching to backend-specific ping (SELECT 1 for PG/MySQL, no-op for embedded) (~40 SLOC)
-- [x] Add pool metrics: `OxidbPool::metrics() -> PoolMetrics` struct with `max_size`, `active`, `idle`, `wait_count` fields, populated from deadpool Status (~50 SLOC)
-- [x] Add SQLite pool backend via `deadpool` + `rusqlite` (feature-gated `sqlite`): `SqliteManager` implementing `deadpool::managed::Manager` for file-backed SQLite connections (~90 SLOC)
-- [x] Add pool configuration builder: `PoolConfig` / `PoolConfigBuilder` with `max_size`, `min_idle`, `connect_timeout_ms`, `idle_timeout_ms` settings (~80 SLOC)
-- [x] Add connection lifecycle hooks: `on_create`, `on_checkout`, `on_checkin` callback registration for observability and setup (e.g. SET search_path) (~60 SLOC)
-- [x] Add `EmbeddedPool::execute(&self, sql: &str) -> Result<u64, PoolError>` convenience method that checks out a connection, runs the query, and returns it (~40 SLOC)
-- [x] Add pool shutdown: `EmbeddedPool::close()` (AtomicBool guard) + no-op `close()` on postgres/mysql wrappers that prevents new checkouts (~20 SLOC)
+Pure Rust core, `#![forbid(unsafe_code)]`. Four pool backends behind opt-in
+features: `postgres` (`deadpool-postgres` wrapper), `mysql` (custom
+`deadpool::managed::Manager` over `mysql_async::Conn`), `embedded`
+(`Arc<Mutex<Glue<MemoryStorage>>>`), and `sqlite` (Pure-Rust `oxisqlite` engine via
+`oxisql-sqlite-compat`). The unified `OxidbPool` enum spans every enabled backend
+with `health_check()` and `metrics()` dispatch; each concrete pool also exposes
+`backend_name()`. `PoolError` covers Postgres pool/create errors, MySQL pool/URL
+errors, and SQLite pool errors. The default feature set is empty.
 
-## API Improvements
-- [x] Implement `Display` and proper `Error` source chaining for `PoolError` using `thiserror` instead of manual impls (~-10 SLOC net, better diagnostics)
-- [x] Add `backend_name() -> &'static str` on each pool type returning "postgres"/"mysql"/"embedded" (~15 SLOC)
-- [x] Add `From<Config>` impl for `OxidbPgPool` to simplify construction from deadpool-postgres Config without requiring explicit Runtime (~10 SLOC) — added `TryFrom<Config>` and `try_from_url(url: &str)` methods
-- [x] Fix `new_mysql_pool` error mapping: introduce `PoolError::Build(String)` variant, map `BuildError` cleanly without synthetic `mysql_async::Error::Other` (~20 SLOC)
-- [x] Add `Clone` derive for `OxidbPgPool` (wrap inner pool in Arc) to match `EmbeddedPool::Clone` (~10 SLOC)
+**Tests: 57 pass with `--all-features` (48 integration + 9 doc); 4 ignored** (the
+ignored tests are live-server-gated MySQL/Postgres pool tests). Zero clippy warnings.
 
-## Testing
-- [x] Add `embedded_pool_close_prevents_checkout`: close pool, verify get() returns Err; clones share flag
-- [x] Add `embedded_pool_backend_name`: assert "embedded"
-- [x] Add `pool_config_builder_defaults` / `pool_config_builder_custom` / `pool_config_builder_idle_timeout`
-- [x] Add `embedded_pool_execute_convenience` / `embedded_pool_execute_after_close_fails`
-- [x] Add embedded pool concurrent access test: spawn 8 tokio tasks, each acquiring the lock and running DDL/DML, verify serialization (~50 SLOC)
-- [x] Add embedded pool migration integration test: run `oxidb-migrate` through an `EmbeddedPool` handle (~40 SLOC)
-- [x] Add `pool_hooks_debug_format` / `embedded_pool_checkout_hook_fires` hook tests (~30 SLOC)
-- [x] Add pool exhaustion test: `embedded_pool_exhaustion_simulation` — hold single lock, verify second checkout blocks, then succeeds after release (~35 SLOC, embedded backend)
-- [x] Add pool sequential access test: `embedded_pool_sequential_access` — verify data written in first checkout is visible to second checkout (~25 SLOC)
-- [x] Add MySQL URL parsing edge cases: `test_mysql_url_empty_returns_err` / `test_mysql_url_missing_scheme_returns_err` — empty URL and missing scheme return Err without panicking (~20 SLOC)
-- [x] Add health-check test for embedded backend: `embedded_pool_health_check_open` / `embedded_pool_health_check_closed` — Ok on fresh pool, Err on closed pool
-- [x] Add metrics accuracy test: `embedded_pool_metrics_open` / `embedded_pool_metrics_closed` — max_size=1, idle=1/0 depending on open/closed state
+## Done
 
-## Performance
-- [x] Add criterion benchmark: embedded pool lock contention — `pool_benchmarks.rs` covers get/release, clone, and health_check for the embedded pool backend (~35 SLOC)
-- [x] Add criterion benchmark: embedded pool lock contention under 1/4/16 concurrent tasks — `bench_embedded_pool_concurrent` in `pool_benchmarks.rs` uses `BenchmarkId` and spawns N tokio tasks to measure mutex serialisation overhead (~40 SLOC)
-- [x] Add criterion benchmark: deadpool-postgres checkout latency (requires local PG, gated) (~50 SLOC) — `bench_pg_pool_checkout` in `benches/pool_benchmarks.rs`; skips gracefully when `POSTGRES_URL` is unset; `#[cfg(not(feature = "postgres"))]` no-op stub ensures bench compiles under `embedded`-only feature set
-- [x] Evaluate replacing `Arc<Mutex<Glue<MemoryStorage>>>` with `tokio::sync::RwLock` for read-heavy embedded workloads where GlueSQL queries are read-only (~30 SLOC refactor + benchmark) — evaluated — not feasible: GlueSQL Glue::execute requires &mut self for all operations including SELECT; RwLock cannot provide concurrent reads
+### Core implementation
+- [x] `OxidbPool::health_check() -> Result<(), PoolError>` dispatching to a backend-specific ping (`SELECT 1` for PG/MySQL, liveness check for embedded/sqlite)
+- [x] `OxidbPool::metrics() -> PoolMetrics` with `max_size`, `active`, `idle`, `wait_count`, `acquired_total`, `released_total`, `timeout_count`, populated from the deadpool `Status`
+- [x] `PoolConfig` / `PoolConfigBuilder` with `max_size`, `min_idle`, `connect_timeout_ms`, `idle_timeout_ms`
+- [x] Connection lifecycle hooks: `on_create`, `on_checkout`, `on_checkin` (`PoolHooks`)
+- [x] `EmbeddedPool::execute(&self, sql)` convenience method
+- [x] Pool shutdown: `EmbeddedPool::close()` (AtomicBool guard) + no-op `close()` on PG/MySQL wrappers
+- [x] Pure-Rust SQLite pool: `sqlite` feature backed by `oxisql-sqlite-compat` (the `oxisqlite` engine); `sqlite-compat` is a transitional alias
 
-## Integration
-- [x] Wire into `oxidb` facade: re-export `OxidbPool`, `OxidbPgPool`, `MysqlPool`, `EmbeddedPool` under `oxidb::pool::*` behind respective features (~20 SLOC) — `oxisql::pool` now re-exports all pool types; `connect_pool()` function dispatches by URI
-- [x] Add `oxidb-migrate` integration: accept `&OxidbPool` in `MigrationRunner` to run migrations against pooled connections — `run_with_pool(&OxidbPool)` in `oxisql-migrate` behind `pool` feature (~30 SLOC bridge)
-- [x] Add `oxidb-query` integration: `EmbeddedPool::execute_query_builder(qb: &QueryBuilder)` (feature `query-builder`) for running `QueryBuilder` queries through the embedded pool (~40 SLOC)
-- [x] Add `oxistore` integration: implement `KvStore` trait backed by `OxidbPool` (PG or MySQL) for SQL-backed key-value storage (~100 SLOC) — `EmbeddedKvStore` (backed by `EmbeddedPool`) and `OxidbKvStore` (wraps `Arc<OxidbPool>`, dispatches per variant) in `kv_store.rs`; 11 tests, all green
-- [x] Migrate `sqlite` feature to Pure-Rust backend: `sqlite` feature now uses `oxisql-sqlite-compat` (Limbo engine) instead of `rusqlite` (C-FFI). The `sqlite-compat` feature is a transitional alias for `sqlite`. The old C-backend is preserved under `sqlite-rusqlite` for explicit opt-in. Zero C deps when `sqlite` feature is enabled. All 8 sqlite pool tests updated to async constructor and verified green.
+### API improvements
+- [x] `Display` + `Error` source chaining for `PoolError` via `thiserror`
+- [x] `backend_name() -> &'static str` on each pool type (`"postgres"`/`"mysql"`/`"embedded"`/`"sqlite"`)
+- [x] `TryFrom<Config>` and `try_from_url(url)` on `OxidbPgPool`
+- [x] `PoolError::Build(String)` variant; clean `new_mysql_pool` error mapping
+- [x] `Clone` for `OxidbPgPool` (inner pool wrapped in `Arc`) to match `EmbeddedPool`
+- [x] `impl ConnectionPool` for `OxidbPgPool` (+ `PgPooledConn`/`PgPooledTxn`/`PgPooledPrepared`)
+- [x] `impl ConnectionPool` for `MysqlPool` (+ `MysqlPooledConn`/`MysqlPooledTxn`)
 
-## Future improvements
-- [x] Delete orphaned sqlite.rs (ungated rusqlite dead code — `mod sqlite;` was never declared; 13 C-FFI references removed)
-- [x] impl ConnectionPool for OxidbPgPool + PgPooledConn/PgPooledTxn/PgPooledPrepared (postgres.rs, ~430 SLOC added)
-- [x] impl ConnectionPool for MysqlPool + MysqlPooledConn/MysqlPooledTxn (mysql.rs, ~390 SLOC added)
+### Integration
+- [x] Re-exported under `oxisql::pool::*`; `connect_pool()` dispatches by URI
+- [x] `oxisql-migrate` bridge: `MigrationRunner::run_with_pool(&OxidbPool)` (behind `pool`)
+- [x] `oxisql-query` bridge: `EmbeddedPool::execute_query_builder(&QueryBuilder)` (behind `query-builder`)
+- [x] `kv_store`: `EmbeddedKvStore` + `OxidbKvStore` (SQL-backed key-value store), 11 tests green
+- [x] Removed the legacy C-FFI SQLite path: deleted the orphaned `sqlite.rs` (ungated `rusqlite` dead code); the SQLite pool is now 100% Pure Rust
+
+### Testing & performance
+- [x] Embedded pool: close-prevents-checkout, concurrent access (8 tasks), exhaustion simulation, sequential visibility, health-check, metrics accuracy
+- [x] MySQL URL parsing edge cases (empty / missing scheme return `Err` without panic)
+- [x] `PoolConfigBuilder` defaults/custom/idle-timeout tests; `PoolHooks` debug/checkout-fires tests
+- [x] Criterion benches: embedded pool get/release, clone, health-check, and 1/4/16-task contention; gated PG checkout latency bench
+
+## Roadmap / next
+- [x] Optional `min_idle` pre-warming for the embedded and SQLite pools (eagerly open connections up to `min_idle` at construction) (done 2026-06-10)
+  - `new_sqlite_compat_pool_with_config(path, config)` in `sqlite_compat.rs`: holds `min_idle` connections simultaneously post-build to force deadpool to create distinct slots, then releases them all back to the idle pool. Cap at `max_size` to avoid pool exhaustion.
+  - `EmbeddedPool::with_config(config)` in `embedded.rs`: stores `config.min_idle` in a `min_idle: usize` field; pre-warming is documented as a no-op (single shared `Arc<Mutex<Glue>>` — no discrete slots to warm).
+  - Tests: `test_sqlite_pool_with_config_min_idle`, `test_sqlite_pool_with_config_no_min_idle`, `embedded_pool_with_config_no_op` — all green.
+- [x] Surface `acquired_total` / `released_total` / `timeout_count` for the embedded backend (done 2026-06-10)
+  - Verified `acquired_total`/`released_total`/`timeout_count` already implemented in `embedded.rs` (atomic counters). `timeout_count` is always 0 (Mutex never times out).
+  - Added `embedded_pool_metrics_acquired_and_timeout` test: 3 × `pool.get().await` → assert `acquired_total ≥ 3` and `timeout_count == 0`. Green.
+- [x] Add a pooled-SQLite criterion bench (checkout latency on the `oxisqlite` engine) (done 2026-06-10)
+  - `bench_sqlite_pool_checkout` added to `benches/pool_benchmarks.rs` with `#[cfg(feature = "sqlite")]` / `#[cfg(not(feature = "sqlite"))]` no-op stub. Registered in `criterion_group!`. Mirrors the embedded bench pattern (`b.to_async(&rt).iter`). Compiles with and without `sqlite` feature.
+- [ ] Investigate a read-shared embedded pool once GlueSQL exposes a `&self` read path (today `Glue::execute` requires `&mut self`, so `RwLock` cannot give concurrent reads)
+
+## Known limitations
+- The embedded pool serialises all access through a single `tokio::sync::Mutex` — GlueSQL's `Glue::execute` requires `&mut self` even for `SELECT`, so concurrent reads are not possible; this is by design for the in-memory backend.
+- MySQL/Postgres integration tests need a live server and are `#[ignore]`d (4 tests) when none is configured.

@@ -17,7 +17,9 @@ use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
+use datafusion::logical_expr::{
+    Between, BinaryExpr, Expr, Like, Operator, TableProviderFilterPushDown,
+};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -72,12 +74,24 @@ impl fmt::Display for SortOrder {
 ///
 /// An optional `ORDER BY` clause can be injected into the generated SQL via
 /// [`Self::with_sort`].  Each entry is a `(column_name, SortOrder)` pair.
+///
+/// # Automatic partitioning
+///
+/// [`Self::with_auto_partition`] splits the scan into multiple parallel
+/// partitions using `LIMIT` / `OFFSET` pagination, each fetching at most
+/// `target_batch_size` rows.  At most `n_parallel` partitions are created.
 pub struct OxiSqlStreamProvider {
     schema: SchemaRef,
     table_name: String,
     conn: Arc<dyn Connection>,
     /// Optional sort order to push to the backend as an `ORDER BY` clause.
     sort_order: Option<Vec<(String, SortOrder)>>,
+    /// Optional auto-partition configuration `(n_parallel, target_batch_size)`.
+    ///
+    /// When set, `scan()` spawns up to `n_parallel` partition slots, each
+    /// issuing `LIMIT target_batch_size OFFSET i * target_batch_size` to the
+    /// backend for parallel execution.
+    auto_partition_config: Option<(usize, usize)>,
 }
 
 impl OxiSqlStreamProvider {
@@ -96,6 +110,7 @@ impl OxiSqlStreamProvider {
             table_name: table_name.into(),
             conn,
             sort_order: None,
+            auto_partition_config: None,
         }
     }
 
@@ -129,6 +144,36 @@ impl OxiSqlStreamProvider {
     /// Returns `None` if no sort has been attached via [`Self::with_sort`].
     pub fn sort_order(&self) -> Option<&[(String, SortOrder)]> {
         self.sort_order.as_deref()
+    }
+
+    /// Configure automatic partitioning for parallel scan execution.
+    ///
+    /// When set, `scan()` creates up to `n_parallel` partition slots, each
+    /// issuing `LIMIT target_batch_size OFFSET i * target_batch_size` to the
+    /// backend.  This allows DataFusion to execute multiple partitions in
+    /// parallel without knowing the total row count ahead of time.
+    ///
+    /// Partitions beyond the actual data silently return empty batches, so
+    /// setting `n_parallel` generously is safe.
+    ///
+    /// - `n_parallel`: maximum number of parallel partitions (e.g. CPU thread count).
+    /// - `target_batch_size`: rows fetched per partition page (e.g. `8192`).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let provider = OxiSqlStreamProvider::new(conn, "users", schema)
+    ///     .with_auto_partition(4, 8192);
+    /// ```
+    #[must_use]
+    pub fn with_auto_partition(mut self, n_parallel: usize, target_batch_size: usize) -> Self {
+        self.auto_partition_config = Some((n_parallel, target_batch_size));
+        self
+    }
+
+    /// Return the auto-partition configuration `(n_parallel, target_batch_size)`, if any.
+    pub fn auto_partition_config(&self) -> Option<(usize, usize)> {
+        self.auto_partition_config
     }
 
     /// Construct from a live [`oxisql_mysql::MyConnection`] for streaming MySQL
@@ -330,35 +375,67 @@ impl TableProvider for OxiSqlStreamProvider {
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let col_clause = self.project_clause(projection);
-        let mut sql = format!("SELECT {} FROM {}", col_clause, self.table_name);
+        let output_schema = self.projected_schema(projection);
+
+        // Build the base SQL (LIMIT/OFFSET appended per-partition below).
+        let mut base_sql = format!("SELECT {} FROM {}", col_clause, self.table_name);
 
         // Build WHERE clause from pushed-down filters.
         let where_parts: Vec<String> = filters.iter().filter_map(expr_to_sql).collect();
         if !where_parts.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_parts.join(" AND "));
+            base_sql.push_str(" WHERE ");
+            base_sql.push_str(&where_parts.join(" AND "));
         }
 
         // Append ORDER BY clause if sort pushdown has been configured.
         if let Some(ref order) = self.sort_order {
             if !order.is_empty() {
-                sql.push_str(" ORDER BY ");
+                base_sql.push_str(" ORDER BY ");
                 let order_clause = order
                     .iter()
                     .map(|(col, dir)| format!("{col} {dir}"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                sql.push_str(&order_clause);
+                base_sql.push_str(&order_clause);
             }
         }
 
-        // Append LIMIT.
+        // When DataFusion pushes a LIMIT down, use a single partition regardless
+        // of auto_partition_config — a LIMIT scan is already cheap and splitting
+        // it would interfere with the fetch count semantics.
         if let Some(n) = limit {
+            let mut sql = base_sql;
             sql.push_str(&format!(" LIMIT {n}"));
+            let exec = OxiSqlExecPlan::new(Arc::clone(&self.conn), sql, Arc::clone(&output_schema));
+            return Ok(Arc::new(exec) as Arc<dyn ExecutionPlan>);
         }
 
-        let output_schema = self.projected_schema(projection);
-        let exec = OxiSqlExecPlan::new(Arc::clone(&self.conn), sql, Arc::clone(&output_schema));
+        // Auto-partition: split the scan into N page-based partition slots using
+        // LIMIT/OFFSET pagination so DataFusion can execute them in parallel.
+        if let Some((n_parallel, target_batch_size)) = self.auto_partition_config {
+            if n_parallel > 1 && target_batch_size > 0 {
+                let sqls: Vec<String> = (0..n_parallel)
+                    .map(|i| {
+                        format!(
+                            "{} LIMIT {} OFFSET {}",
+                            base_sql,
+                            target_batch_size,
+                            i * target_batch_size
+                        )
+                    })
+                    .collect();
+                let exec = OxiSqlMultiPartExecPlan::new(
+                    Arc::clone(&self.conn),
+                    sqls,
+                    Arc::clone(&output_schema),
+                );
+                return Ok(Arc::new(exec) as Arc<dyn ExecutionPlan>);
+            }
+        }
+
+        // Default single-partition path.
+        let exec =
+            OxiSqlExecPlan::new(Arc::clone(&self.conn), base_sql, Arc::clone(&output_schema));
         Ok(Arc::new(exec) as Arc<dyn ExecutionPlan>)
     }
 
@@ -404,6 +481,16 @@ pub fn can_push_filter(expr: &Expr) -> bool {
         }
         Expr::IsNull(inner) | Expr::IsNotNull(inner) => can_push_atom(inner),
         Expr::Not(inner) => can_push_filter(inner),
+        // `x IN (a, b, c)` / `x NOT IN (...)`
+        Expr::InList(inlist) => {
+            can_push_atom(&inlist.expr) && inlist.list.iter().all(can_push_atom)
+        }
+        // `x BETWEEN low AND high` / `x NOT BETWEEN …`
+        Expr::Between(Between {
+            expr, low, high, ..
+        }) => can_push_atom(expr) && can_push_atom(low) && can_push_atom(high),
+        // `x LIKE 'pat'` / `x ILIKE 'pat'` / negated variants
+        Expr::Like(Like { expr, pattern, .. }) => can_push_atom(expr) && can_push_atom(pattern),
         _ => false,
     }
 }
@@ -444,6 +531,45 @@ pub fn expr_to_sql(expr: &Expr) -> Option<String> {
         Expr::IsNull(inner) => Some(format!("({} IS NULL)", atom_to_sql(inner)?)),
         Expr::IsNotNull(inner) => Some(format!("({} IS NOT NULL)", atom_to_sql(inner)?)),
         Expr::Not(inner) => Some(format!("(NOT {})", expr_to_sql(inner)?)),
+        // `x IN (a, b, c)` / `x NOT IN (...)`
+        Expr::InList(inlist) => {
+            let e = atom_to_sql(&inlist.expr)?;
+            let items: Option<Vec<String>> = inlist.list.iter().map(atom_to_sql).collect();
+            let items = items?;
+            let not_kw = if inlist.negated { "NOT " } else { "" };
+            Some(format!("({e} {not_kw}IN ({}))", items.join(", ")))
+        }
+        // `x BETWEEN low AND high` / `x NOT BETWEEN …`
+        Expr::Between(Between {
+            expr,
+            low,
+            high,
+            negated,
+        }) => {
+            let e = atom_to_sql(expr)?;
+            let lo = atom_to_sql(low)?;
+            let hi = atom_to_sql(high)?;
+            let not_kw = if *negated { "NOT " } else { "" };
+            Some(format!("({e} {not_kw}BETWEEN {lo} AND {hi})"))
+        }
+        // `x LIKE 'pat'` / `x ILIKE 'pat'` and their negations
+        Expr::Like(Like {
+            expr,
+            pattern,
+            negated,
+            case_insensitive,
+            escape_char,
+        }) => {
+            let e = atom_to_sql(expr)?;
+            let p = atom_to_sql(pattern)?;
+            let not_kw = if *negated { "NOT " } else { "" };
+            let like_kw = if *case_insensitive { "ILIKE" } else { "LIKE" };
+            let escape_clause = match escape_char {
+                Some(c) => format!(" ESCAPE '{c}'"),
+                None => String::new(),
+            };
+            Some(format!("({e} {not_kw}{like_kw} {p}{escape_clause})"))
+        }
         _ => None,
     }
 }
@@ -573,6 +699,117 @@ impl ExecutionPlan for OxiSqlExecPlan {
         _context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
         let sql = self.sql.clone();
+        let conn = Arc::clone(&self.conn);
+        let schema = Arc::clone(&self.schema);
+
+        let stream = futures::stream::once(async move {
+            let rows = conn
+                .query(&sql, &[])
+                .await
+                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+            crate::types::rows_to_record_batch(rows, schema)
+                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.schema),
+            stream,
+        )))
+    }
+}
+
+// ── OxiSqlMultiPartExecPlan ───────────────────────────────────────────────────
+
+/// A DataFusion [`ExecutionPlan`] that exposes multiple parallel partitions,
+/// each executing a distinct pre-built SQL query (typically with `LIMIT`/`OFFSET`
+/// pagination) against the same OxiSQL connection.
+///
+/// Used by [`OxiSqlStreamProvider::with_auto_partition`] to split a full-table
+/// scan into `N` independently-executable page queries so DataFusion's thread
+/// pool can run them concurrently.
+struct OxiSqlMultiPartExecPlan {
+    schema: SchemaRef,
+    /// One SQL string per partition.
+    sqls: Vec<String>,
+    conn: Arc<dyn Connection>,
+    cache: Arc<PlanProperties>,
+}
+
+impl fmt::Debug for OxiSqlMultiPartExecPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OxiSqlMultiPartExecPlan")
+            .field("partitions", &self.sqls.len())
+            .field("schema", &self.schema)
+            .finish()
+    }
+}
+
+impl OxiSqlMultiPartExecPlan {
+    fn new(conn: Arc<dyn Connection>, sqls: Vec<String>, schema: SchemaRef) -> Self {
+        let n = sqls.len().max(1);
+        let eq = EquivalenceProperties::new(Arc::clone(&schema));
+        let properties = PlanProperties::new(
+            eq,
+            Partitioning::UnknownPartitioning(n),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+        Self {
+            schema,
+            sqls,
+            conn,
+            cache: Arc::new(properties),
+        }
+    }
+}
+
+impl DisplayAs for OxiSqlMultiPartExecPlan {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "OxiSqlMultiPartExecPlan partitions={}", self.sqls.len())
+    }
+}
+
+impl ExecutionPlan for OxiSqlMultiPartExecPlan {
+    fn name(&self) -> &'static str {
+        "OxiSqlMultiPartExecPlan"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.cache
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        if children.is_empty() {
+            Ok(self)
+        } else {
+            Err(datafusion::error::DataFusionError::Internal(
+                "OxiSqlMultiPartExecPlan has no children".into(),
+            ))
+        }
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> datafusion::error::Result<SendableRecordBatchStream> {
+        let sql = self.sqls.get(partition).cloned().ok_or_else(|| {
+            datafusion::error::DataFusionError::Internal(format!(
+                "OxiSqlMultiPartExecPlan: partition index {partition} out of range ({})",
+                self.sqls.len()
+            ))
+        })?;
         let conn = Arc::clone(&self.conn);
         let schema = Arc::clone(&self.schema);
 

@@ -1,27 +1,34 @@
-# oxisql-embedded — GlueSQL-backed embedded SQL engine for OxiSQL
+# oxisql-embedded
+
+> In-memory SQL via GlueSQL with optional persistent backends (fjall LSM-tree, redb B-tree, sled key-value); full schema introspection and CSV/SQL import/export — all Pure Rust.
 
 [![Crates.io](https://img.shields.io/crates/v/oxisql-embedded.svg)](https://crates.io/crates/oxisql-embedded)
+[![Docs.rs](https://docs.rs/oxisql-embedded/badge.svg)](https://docs.rs/oxisql-embedded)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.89-blue.svg)](https://www.rust-lang.org)
 
-`oxisql-embedded` provides `EmbeddedConnection`, which implements `oxisql_core::Connection` over a GlueSQL `MemoryStorage` instance. It is a zero-external-service, pure-Rust SQL engine suitable for testing, embedded applications, and in-process analytics.
+## What it is
+
+`oxisql-embedded` is the zero-external-service, **Pure Rust** backend of the [OxiSQL](https://github.com/cool-japan/oxisql) workspace. It wraps a [GlueSQL](https://github.com/gluesql/gluesql) engine behind `oxisql_core::Connection`, giving you an embeddable SQL database that needs no server, no driver, and no C/C++/Fortran dependency.
+
+By default it runs entirely in memory (`MemoryStorage`, reset on drop). Three optional, feature-gated persistent backends — **fjall** (LSM-tree), **redb** (B-tree), and **sled** (key-value) — let the same API write to disk durably. On top of the SQL engine the crate adds full schema introspection, RFC 4180 CSV import/export, SQL dump import/export, host-side scalar/aggregate UDFs, virtual tables, full-text search, B-tree secondary indexes, and safe client-side parameter binding.
+
+- **Status:** Stable.
+- **Edition:** 2021 · **MSRV:** 1.89 · **License:** Apache-2.0.
 
 ## Installation
 
 ```toml
 [dependencies]
-oxisql-embedded = "0.1.1"
+oxisql-embedded = "0.1.2"
 
-# Optional persistent backends:
-# oxisql-embedded = { version = "0.1.1", features = ["fjall-storage"] }
-# oxisql-embedded = { version = "0.1.1", features = ["redb-storage"] }
-# oxisql-embedded = { version = "0.1.1", features = ["sled-storage"] }
+# Optional persistent backends (pick any subset):
+# oxisql-embedded = { version = "0.1.2", features = ["fjall-storage"] }
+# oxisql-embedded = { version = "0.1.2", features = ["redb-storage"] }
+# oxisql-embedded = { version = "0.1.2", features = ["sled-storage"] }
 ```
 
-## Status
-
-244 tests passing. Schema introspection (`tables()`, `columns()`, `indexes()`, `foreign_keys()`) is fully operational via the GlueSQL catalog.
-
-## Quick Start
+## Quick start
 
 ```rust
 use oxisql_embedded::EmbeddedConnection;
@@ -29,170 +36,129 @@ use oxisql_core::Connection;
 
 #[tokio::main]
 async fn main() -> Result<(), oxisql_core::OxiSqlError> {
+    // Volatile in-memory database (reset on drop).
     let conn = EmbeddedConnection::open_memory()?;
 
-    conn.execute(
-        "CREATE TABLE users (id INTEGER, name TEXT)",
-        &[],
-    ).await?;
+    conn.execute("CREATE TABLE users (id INTEGER, name TEXT)", &[]).await?;
 
+    // Positional parameters ($1, $2) are bound safely client-side.
     conn.execute(
         "INSERT INTO users VALUES ($1, $2)",
         &[&1i64, &"Alice"],
     ).await?;
 
-    let rows = conn.query("SELECT id, name FROM users", &[]).await?;
-    assert_eq!(rows.len(), 1);
+    // Named parameters (:name / $name / @name) work on every backend
+    // via the oxisql_core default methods.
+    conn.execute_named(
+        "INSERT INTO users VALUES (:id, :name)",
+        &[(":id", &2i64), (":name", &"Bob")],
+    ).await?;
+
+    let rows = conn.query("SELECT id, name FROM users ORDER BY id", &[]).await?;
+    assert_eq!(rows.len(), 2);
 
     let id: i64 = rows[0].try_get("id")?;
     let name: String = rows[0].try_get("name")?;
     println!("{id}: {name}");
+
+    // Schema introspection straight from the GlueSQL catalog.
+    for table in conn.tables().await? {
+        println!("table: {}", table.name);
+    }
     Ok(())
 }
 ```
 
-## API Overview
-
-### Constructors
-
-| Method | Description |
-|--------|-------------|
-| `EmbeddedConnection::open_memory()` | Create a new in-memory database (destroyed on drop) |
-| `EmbeddedConnection::open_file(path)` | Open a file-backed database (requires `sled-storage` or `fjall-storage` feature; returns `UnsupportedUri` otherwise) |
-| `EmbeddedConnection::from_glue(glue)` | Wrap an existing `Glue<MemoryStorage>` instance |
-
-All constructors return `Result<EmbeddedConnection, OxiSqlError>` (synchronous, not async).
-
-### SQL import / export
+### Persistent backend in one line
 
 ```rust
-// Export all tables as a SQL dump string
-let dump: String = conn.export_as_sql().await?;
+use oxisql_embedded::RedbEmbeddedConnection; // requires `redb-storage`
+use oxisql_core::Connection;
 
-// Import a SQL dump string (executes all statements via execute_batch)
-conn.import_from_sql(&dump).await?;
+# async fn demo() -> Result<(), oxisql_core::OxiSqlError> {
+let path = std::env::temp_dir().join("oxisql_demo.redb");
+let conn = RedbEmbeddedConnection::open(&path)?;
+conn.execute("CREATE TABLE kv (k TEXT, v TEXT)", &[]).await?;
+// Data survives drop + reopen — ACID, order-preserving keys.
+# Ok(())
+# }
 ```
 
-### User-defined functions (UDFs)
+`FjallEmbeddedConnection::open(path)` and `SledEmbeddedConnection::open(path)` follow the same pattern behind their respective feature flags.
 
-Scalar UDFs are host-side functions callable through the Rust API (not SQL-level):
+### Via the `oxisql` facade
 
-```rust
-// Register a scalar UDF
-conn.register_udf("double", |args| {
-    if let Some(oxisql_core::Value::I64(n)) = args.first() {
-        oxisql_core::Value::I64(n * 2)
-    } else {
-        oxisql_core::Value::Null
-    }
-});
+The facade resolves a URI to the right backend, so application code stays backend-agnostic:
 
-// Call a registered UDF
-let result = conn.call_udf("double", vec![oxisql_core::Value::I64(21)])?;
-// result == Value::I64(42)
+| URI | Backend |
+|-----|---------|
+| `memory://` | In-memory `MemoryStorage` (default) |
+| `redb://path/to/file.db` | redb persistent (feature `redb`) |
+| `fjall://path/to/dir` | fjall persistent (feature `fjall`) |
+| `sled://path/to/dir` | sled persistent (feature `sled`) |
+
+```rust,ignore
+let conn = oxisql::connect("memory://").await?;
 ```
 
-### Aggregate UDFs
+## Key API
 
-Aggregate UDFs follow the `init → step* → finalize` pattern and are applied programmatically:
+| Item | Description |
+|------|-------------|
+| `EmbeddedConnection::open_memory()` | New volatile in-memory database (default backend). |
+| `EmbeddedConnection::open_file(path)` | File-backed database when a persistent feature is enabled; returns `UnsupportedUri` otherwise. |
+| `EmbeddedConnection::from_glue(glue)` | Wrap an existing GlueSQL `Glue` instance. |
+| `RedbEmbeddedConnection::open(path)` | redb B-tree backend (feature `redb-storage`). |
+| `FjallEmbeddedConnection::open(path)` | fjall LSM-tree backend (feature `fjall-storage`). |
+| `SledEmbeddedConnection::open(path)` | sled key-value backend (feature `sled-storage`). |
+| `EmbeddedTransaction` / `EmbeddedPrepared` | Transaction guard and prepared-statement handle. |
+| `Connection` impl | `execute`, `query`, `transaction`, `execute_batch`, `ping`, `prepare`, `tables`, `columns`, `indexes`, `foreign_keys`, `query_stream` (plus `execute_named` / `query_named` defaults). |
+| `import_csv(table, csv)` / `export_table_to_csv(table)` | Pure-Rust RFC 4180 CSV round-trip (`csv.rs`). |
+| `import_from_sql(sql)` / `export_as_sql()` | SQL-dump import (via `execute_batch`) and export (via `fetch_all_schemas()` + `Schema::to_ddl()`). |
+| `explain(sql)` | Pattern-based query plan string. |
+| `UdfRegistry` — `register_udf` / `call_udf` | Host-side scalar functions (Rust API, not SQL level). |
+| `AggregateUdf` — `register_aggregate` / `apply_aggregate` | `init → step* → finalize` aggregates. |
+| `VirtualTableRegistry` | Register in-process virtual tables scanned at query time. |
+| `FtsIndex` | Inverted-index full-text search (`MATCH` interception). |
+| `BTreeIndex` / `IndexKey` / `IndexRegistry` | Host-side ordered secondary indexes. |
+| `bind_params` / `bind_params_string` / `escape_sql_value` | Parameter-binding helpers exposed for direct use. |
 
-```rust
-use oxisql_embedded::AggregateUdf;
-use oxisql_core::Value;
+### Parameter binding
 
-conn.register_aggregate("sum_ints", AggregateUdf {
-    init: Box::new(|| Value::I64(0)),
-    step: Box::new(|acc, val| {
-        if let (Value::I64(a), Value::I64(b)) = (acc, val) { Value::I64(a + b) }
-        else { Value::Null }
-    }),
-    finalize: Box::new(|acc| acc),
-});
+GlueSQL has no native positional placeholders, so this crate binds them safely on the client:
 
-let rows = conn.query("SELECT n FROM nums", &[]).await?;
-let values: Vec<Value> = rows.into_iter()
-    .flat_map(|r| r.into_values())
-    .collect();
-let total = conn.apply_aggregate("sum_ints", values)?;
-```
+- **AST-level substitution (primary):** the SQL is parsed with `sqlparser` (`params.rs`), `Placeholder("$N")` nodes are replaced with typed literal expressions, and the statement is re-serialised. Placeholders inside string literals are never touched.
+- **String-scan fallback:** used when GlueSQL-specific syntax fails the generic parser; handles `$10` vs `$1` boundaries and `$$` escapes.
+- **BLOB** values are emitted as `X'..'` hex literals.
 
-### Connection pool via `EmbeddedPool`
+Named placeholders (`:name`, `$name`, `@name`) are provided by `oxisql_core` default methods and therefore work identically across **all** OxiSQL backends.
 
-Use `oxisql_pool::embedded::EmbeddedPool` for pooled access to an `EmbeddedConnection`. See [oxisql-pool](../oxisql-pool/README.md).
+## Feature flags
 
-### Schema Introspection
-
-`EmbeddedConnection` fully implements the `Connection` trait's introspection methods via the GlueSQL catalog:
-
-| Method | Description |
-|--------|-------------|
-| `conn.tables().await` | Returns all table names via `storage.fetch_all_schemas()` |
-| `conn.columns(table).await` | Returns `ColumnInfo` for each column; maps all GlueSQL types to `OxiSqlType` |
-| `conn.indexes(table).await` | Merges GlueSQL catalog indexes (`SchemaIndex`) with `IndexRegistry` entries created by host-intercepted `CREATE INDEX` statements |
-| `conn.foreign_keys(table).await` | Returns `ForeignKeyInfo` mapped from GlueSQL's `ForeignKey` struct |
-
-`indexes()` combines two sources because GlueSQL `MemoryStorage` handles `CREATE INDEX` internally but the crate also maintains an `IndexRegistry` for B-tree indexes created via the host API. Both sources are merged and deduplicated by index name.
-
-## Parameter Binding
-
-GlueSQL does not natively support `$1`-style positional parameters. This crate implements safe client-side binding:
-
-- **AST-level substitution** (primary path): parses SQL into a sqlparser AST, replaces `Expr::Value(Placeholder("$N"))` nodes with proper literal expressions, then re-serialises. Parameters inside string literals are never substituted.
-- **String-scan fallback**: used when AST parsing fails (GlueSQL-specific syntax). Handles `$10` vs `$1` boundaries and `$$` escape sequences correctly.
-
-Helper functions are exported for direct use:
-
-```rust
-use oxisql_embedded::{bind_params, bind_params_string, escape_sql_value};
-use oxisql_core::Value;
-
-let sql = bind_params(
-    "INSERT INTO t VALUES ($1, $2)",
-    &[Value::I64(1), Value::Text("hello".into())],
-)?;
-```
-
-## Persistent Backends (feature-gated)
-
-| Feature | Type | Storage |
-|---------|------|---------|
-| `fjall-storage` | `FjallGlueStorage` | fjall LSM-tree, Pure Rust |
-| `redb-storage` | `RedbGlueStorage` | redb B-tree, Pure Rust |
-| `sled-storage` | (sled) | sled embedded DB |
-
-These implement GlueSQL's `Store` trait and can be passed to `EmbeddedConnection::from_glue(Glue::new(storage))`. File-backed connections can also be opened via `EmbeddedConnection::open_file(path)` when the appropriate feature is enabled.
-
-## Full-Text Search (FTS)
-
-An `FtsIndex` is embedded in every `EmbeddedConnection` for programmatic full-text indexing and querying at the host layer. Access via `conn.fts_index()`.
-
-## Virtual Tables
-
-```rust
-use oxisql_embedded::VirtualTableRegistry;
-```
-
-`VirtualTableFn` and `VirtualTableRegistry` allow registering in-process virtual tables that are scanned at query time.
-
-## B-Tree Index
-
-`BTreeIndex`, `IndexKey`, and `IndexRegistry` are available for host-side ordered-index access outside GlueSQL's query engine.
-
-## Savepoints
-
-`savepoint()`, `rollback_to_savepoint()`, and `release_savepoint()` are accepted but are **no-ops** — GlueSQL `MemoryStorage` does not support nested transactions.
-
-## GlueSQL SQL Dialect Notes
-
-| Feature | Status |
+| Feature | Effect |
 |---------|--------|
-| `ALTER TABLE ADD/DROP COLUMN` | Not supported; recreate the table |
-| Multi-row `VALUES` in INSERT | Use individual INSERT statements |
-| Window functions | Not supported in MemoryStorage |
-| `INFORMATION_SCHEMA` | Not available |
-| `BEGIN` / `COMMIT` / `ROLLBACK` | Syntactically accepted; no MVCC |
-| `$1`-style parameters | Supported via host-side binding |
+| *(default)* | In-memory `MemoryStorage` only — 100% Pure Rust, no extra deps. |
+| `fjall-storage` | Enables `FjallEmbeddedConnection` / `FjallGlueStorage` (fjall LSM-tree). |
+| `redb-storage` | Enables `RedbEmbeddedConnection` / `RedbGlueStorage` (redb B-tree). |
+| `sled-storage` | Enables `SledEmbeddedConnection` / `SledGlueStorage` (sled key-value). |
+
+## Storage backends
+
+| Backend | Persistence | Notes | Feature |
+|---------|-------------|-------|---------|
+| `MemoryStorage` | Volatile — reset on drop | Default; no extra dependency | *(built in)* |
+| fjall LSM-tree | Persistent | Journal/WAL crash safety, Pure Rust | `fjall-storage` |
+| redb B-tree | Persistent | ACID, order-preserving keys, Pure Rust | `redb-storage` |
+| sled key-value | Persistent | Embedded key-value store, Pure Rust | `sled-storage` |
+
+## Test coverage
+
+**278 tests pass** with `--all-features` (unit + integration; CSV, schema introspection, persistence round-trips, parameter binding, UDFs, FTS, virtual tables, and more). The crate is part of a workspace where **1,720 tests pass** in total.
+
+## Part of the OxiSQL workspace
+
+`oxisql-embedded` is one of 17 Pure-Rust crates in the OxiSQL project. See the [workspace README](../../README.md) for the facade, connection pooling, the DataFusion OLAP bridge, and the wire-protocol backends.
 
 ## License
 
-Apache-2.0 — COOLJAPAN OU (Team Kitasan)
+Apache-2.0 © 2024–2026 COOLJAPAN OU (Team Kitasan).

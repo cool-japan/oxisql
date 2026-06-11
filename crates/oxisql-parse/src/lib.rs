@@ -21,10 +21,26 @@
 
 // ── Optimizer module ─────────────────────────────────────────────────────────
 pub mod optimizer;
-pub use optimizer::{
-    ConstantFolding, JoinAlgoHint, JoinAlgorithmPass, LimitPushThrough, OptPass, Optimizer,
-    PredicatePushdown, ProjectionPruning,
+pub use optimizer::expr_util::{
+    canonical_hash, collect_colrefs, equi_key, find_common_subexprs, join_conjuncts, parse_expr,
+    parse_predicate, render, split_conjuncts, ColRef,
 };
+pub use optimizer::{
+    CommonSubexprElimination, ConstantFolding, JoinAlgoHint, JoinAlgorithmPass, LimitPushThrough,
+    OptPass, Optimizer, PredicatePushdown, PredicateSimplification, ProjectionPruning,
+};
+
+// ── Decorrelation ─────────────────────────────────────────────────────────────
+pub mod decorrelate;
+pub use decorrelate::PlannerOptions;
+
+// ── Parameterization ──────────────────────────────────────────────────────────
+pub mod parameterize;
+pub use parameterize::{parameterize, ParameterizedSql};
+
+// ── Plan cache ────────────────────────────────────────────────────────────────
+pub mod plan_cache;
+pub use plan_cache::PlanCache;
 // ── Aggregate helpers ─────────────────────────────────────────────────────────
 pub mod agg;
 pub use agg::{extract_aggregates, is_aggregate_expr, AggFunc, AggregateExpr};
@@ -34,7 +50,7 @@ pub use dml::{plan_dml, DmlPlan};
 pub mod validate;
 pub use validate::{SchemaValidator, ValidationError};
 pub mod cost;
-pub use cost::{CostEstimate, CostModel, TableStats};
+pub use cost::{ColumnStats, CostEstimate, CostModel, NodeCost, TableStats};
 pub mod builder;
 mod columns;
 mod setops;
@@ -47,11 +63,11 @@ pub use plan::{JoinType, LogicalPlan, SetOpType, SortExpr, WindowFunctionDef};
 
 // ── Planner ──────────────────────────────────────────────────────────────────
 pub mod planner;
-pub use planner::{plan_query, plan_statement};
+pub use planner::{plan_query, plan_statement, plan_statement_with_opts};
 
 // ── Plan explanation ─────────────────────────────────────────────────────────
 pub mod explain;
-pub use explain::explain;
+pub use explain::{explain, explain_json, explain_verbose};
 
 // ── Analysis utilities ────────────────────────────────────────────────────────
 pub mod analysis;
@@ -194,6 +210,21 @@ pub fn parse_one_with_dialect(sql: &str, dialect: SqlDialect) -> Result<Statemen
 /// Uses sqlparser's `Display` implementation for round-trip formatting.
 pub fn format(stmt: &Statement) -> String {
     stmt.to_string()
+}
+
+// ── plan_query_with convenience wrapper ──────────────────────────────────────
+
+/// Parse `sql`, then plan it using the given [`PlannerOptions`].
+///
+/// This is the top-level entry point for callers that want to control
+/// decorrelation behaviour without going through a [`PlanCache`].
+///
+/// # Errors
+///
+/// Returns [`OxiSqlError::Parse`] if parsing or planning fails.
+pub fn plan_query_with(sql: &str, opts: &PlannerOptions) -> Result<LogicalPlan, OxiSqlError> {
+    let stmt = parse_one(sql)?;
+    plan_statement_with_opts(&stmt, opts)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

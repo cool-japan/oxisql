@@ -307,7 +307,7 @@ fn tls_mode_skip_verify_constructs() {
 
 #[cfg(feature = "integration-postgres")]
 mod pg_array_interval_integration {
-    use oxisql_core::{Connection, Value};
+    use oxisql_core::{ArrayElementType, Connection, Value};
     use oxisql_postgres::{PgConnection, TlsMode};
 
     const CONN_STR: &str = "host=localhost port=5432 user=postgres password=test dbname=postgres";
@@ -318,7 +318,7 @@ mod pg_array_interval_integration {
             .expect("connect")
     }
 
-    /// `SELECT ARRAY[1, 2, 3]::int[]` → `Value::Array([I64(1), I64(2), I64(3)])`
+    /// `SELECT ARRAY[1, 2, 3]::int[]` → `Value::TypedArray { element_type: Int4, values: [I64(1), I64(2), I64(3)] }`
     #[tokio::test]
     #[ignore]
     async fn test_int_array() {
@@ -331,11 +331,14 @@ mod pg_array_interval_integration {
         let v = rows[0].get("arr").expect("column arr");
         assert_eq!(
             *v,
-            Value::Array(vec![Value::I64(1), Value::I64(2), Value::I64(3)])
+            Value::TypedArray {
+                element_type: ArrayElementType::Int4,
+                values: vec![Value::I64(1), Value::I64(2), Value::I64(3)],
+            }
         );
     }
 
-    /// `SELECT ARRAY['a', 'b']::text[]` → `Value::Array([Text("a"), Text("b")])`
+    /// `SELECT ARRAY['a', 'b']::text[]` → `Value::TypedArray { element_type: Text, values: [Text("a"), Text("b")] }`
     #[tokio::test]
     #[ignore]
     async fn test_text_array() {
@@ -348,14 +351,14 @@ mod pg_array_interval_integration {
         let v = rows[0].get("arr").expect("column arr");
         assert_eq!(
             *v,
-            Value::Array(vec![
-                Value::Text("a".to_string()),
-                Value::Text("b".to_string())
-            ])
+            Value::TypedArray {
+                element_type: ArrayElementType::Text,
+                values: vec![Value::Text("a".to_string()), Value::Text("b".to_string()),],
+            }
         );
     }
 
-    /// `SELECT ARRAY[1.5, 2.5]::float8[]` → `Value::Array([F64(1.5), F64(2.5)])`
+    /// `SELECT ARRAY[1.5, 2.5]::float8[]` → `Value::TypedArray { element_type: Float8, values: [F64(1.5), F64(2.5)] }`
     #[tokio::test]
     #[ignore]
     async fn test_float_array() {
@@ -366,7 +369,13 @@ mod pg_array_interval_integration {
             .expect("query");
         assert_eq!(rows.len(), 1);
         let v = rows[0].get("arr").expect("column arr");
-        assert_eq!(*v, Value::Array(vec![Value::F64(1.5), Value::F64(2.5)]));
+        assert_eq!(
+            *v,
+            Value::TypedArray {
+                element_type: ArrayElementType::Float8,
+                values: vec![Value::F64(1.5), Value::F64(2.5)],
+            }
+        );
     }
 
     /// `SELECT INTERVAL '1 hour 30 minutes'` → some `Value::Text` containing "01:30:00"
@@ -405,7 +414,7 @@ mod pg_array_interval_integration {
         assert_eq!(*v, Value::Null);
     }
 
-    /// `SELECT ARRAY[1, NULL, 3]::int[]` → `Value::Array([I64(1), Null, I64(3)])`
+    /// `SELECT ARRAY[1, NULL, 3]::int[]` → `Value::TypedArray { element_type: Int4, values: [I64(1), Null, I64(3)] }`
     #[tokio::test]
     #[ignore]
     async fn test_array_with_null_element() {
@@ -418,7 +427,10 @@ mod pg_array_interval_integration {
         let v = rows[0].get("arr").expect("column arr");
         assert_eq!(
             *v,
-            Value::Array(vec![Value::I64(1), Value::Null, Value::I64(3)])
+            Value::TypedArray {
+                element_type: ArrayElementType::Int4,
+                values: vec![Value::I64(1), Value::Null, Value::I64(3)],
+            }
         );
     }
 }

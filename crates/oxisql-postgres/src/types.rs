@@ -18,7 +18,8 @@
 //! | UUID | `Value::Uuid` (u128 big-endian) |
 //! | JSON, JSONB | `Value::Json` |
 //! | NUMERIC | `Value::Decimal` (exact decimal string) |
-//! | BOOL[] / INT2[] / INT4[] / INT8[] / FLOAT4[] / FLOAT8[] / TEXT[] / VARCHAR[] | `Value::Array(Vec<Value>)` |
+//! | BOOL[] / INT2[] / INT4[] / INT8[] / FLOAT4[] / FLOAT8[] / TEXT[] / VARCHAR[] | `Value::TypedArray` |
+//! | TIMESTAMPTZ[] / TIMESTAMP[] / DATE[] / TIME[] / UUID[] / BYTEA[] / JSON[] / JSONB[] | `Value::TypedArray` |
 //! | INTERVAL | `Value::Text` (HH:MM:SS or "N months N days HH:MM:SS") |
 //! | NULL (any) | `Value::Null` |
 //! | everything else | `Value::Text` via type-name marker |
@@ -27,7 +28,7 @@ use bytes::{Buf, BytesMut};
 use tokio_postgres::types::{FromSql, IsNull, ToSql, Type};
 use tokio_postgres::Row as PgRow;
 
-use oxisql_core::{Row, Value};
+use oxisql_core::{ArrayElementType, Row, Value};
 
 use crate::error::PgError;
 
@@ -348,6 +349,11 @@ pub fn value_to_param(v: &Value) -> OwnedParam {
             let items: Vec<String> = vals.iter().map(|v| format!("{v}")).collect();
             OwnedParam::Text(format!("{{{}}}", items.join(",")))
         }
+        Value::TypedArray { values, .. } => {
+            // Render as Postgres array literal: {val1,val2,...}
+            let items: Vec<String> = values.iter().map(|v| format!("{v}")).collect();
+            OwnedParam::Text(format!("{{{}}}", items.join(",")))
+        }
     }
 }
 
@@ -513,18 +519,18 @@ fn extract_value(row: &PgRow, idx: usize, ty: &Type) -> Result<Value, PgError> {
                 }
             }
         }
-        // ARRAY types: each maps to Value::Array(Vec<Value>).
+        // ARRAY types: each maps to Value::TypedArray { element_type, values }.
+        // NULL elements inside the array become Value::Null; a NULL column → Value::Null.
         Type::BOOL_ARRAY => {
             let v: Option<Vec<Option<bool>>> = row
                 .try_get(idx)
                 .map_err(|e| PgError::TypeConversion(e.to_string()))?;
-            Ok(v.map(|items| {
-                Value::Array(
-                    items
-                        .into_iter()
-                        .map(|opt| opt.map(Value::Bool).unwrap_or(Value::Null))
-                        .collect(),
-                )
+            Ok(v.map(|items| Value::TypedArray {
+                element_type: ArrayElementType::Bool,
+                values: items
+                    .into_iter()
+                    .map(|opt| opt.map(Value::Bool).unwrap_or(Value::Null))
+                    .collect(),
             })
             .unwrap_or(Value::Null))
         }
@@ -532,13 +538,12 @@ fn extract_value(row: &PgRow, idx: usize, ty: &Type) -> Result<Value, PgError> {
             let v: Option<Vec<Option<i16>>> = row
                 .try_get(idx)
                 .map_err(|e| PgError::TypeConversion(e.to_string()))?;
-            Ok(v.map(|items| {
-                Value::Array(
-                    items
-                        .into_iter()
-                        .map(|opt| opt.map(|n| Value::I64(i64::from(n))).unwrap_or(Value::Null))
-                        .collect(),
-                )
+            Ok(v.map(|items| Value::TypedArray {
+                element_type: ArrayElementType::Int2,
+                values: items
+                    .into_iter()
+                    .map(|opt| opt.map(|n| Value::I64(i64::from(n))).unwrap_or(Value::Null))
+                    .collect(),
             })
             .unwrap_or(Value::Null))
         }
@@ -546,13 +551,12 @@ fn extract_value(row: &PgRow, idx: usize, ty: &Type) -> Result<Value, PgError> {
             let v: Option<Vec<Option<i32>>> = row
                 .try_get(idx)
                 .map_err(|e| PgError::TypeConversion(e.to_string()))?;
-            Ok(v.map(|items| {
-                Value::Array(
-                    items
-                        .into_iter()
-                        .map(|opt| opt.map(|n| Value::I64(i64::from(n))).unwrap_or(Value::Null))
-                        .collect(),
-                )
+            Ok(v.map(|items| Value::TypedArray {
+                element_type: ArrayElementType::Int4,
+                values: items
+                    .into_iter()
+                    .map(|opt| opt.map(|n| Value::I64(i64::from(n))).unwrap_or(Value::Null))
+                    .collect(),
             })
             .unwrap_or(Value::Null))
         }
@@ -560,13 +564,12 @@ fn extract_value(row: &PgRow, idx: usize, ty: &Type) -> Result<Value, PgError> {
             let v: Option<Vec<Option<i64>>> = row
                 .try_get(idx)
                 .map_err(|e| PgError::TypeConversion(e.to_string()))?;
-            Ok(v.map(|items| {
-                Value::Array(
-                    items
-                        .into_iter()
-                        .map(|opt| opt.map(Value::I64).unwrap_or(Value::Null))
-                        .collect(),
-                )
+            Ok(v.map(|items| Value::TypedArray {
+                element_type: ArrayElementType::Int8,
+                values: items
+                    .into_iter()
+                    .map(|opt| opt.map(Value::I64).unwrap_or(Value::Null))
+                    .collect(),
             })
             .unwrap_or(Value::Null))
         }
@@ -574,13 +577,12 @@ fn extract_value(row: &PgRow, idx: usize, ty: &Type) -> Result<Value, PgError> {
             let v: Option<Vec<Option<f32>>> = row
                 .try_get(idx)
                 .map_err(|e| PgError::TypeConversion(e.to_string()))?;
-            Ok(v.map(|items| {
-                Value::Array(
-                    items
-                        .into_iter()
-                        .map(|opt| opt.map(|f| Value::F64(f64::from(f))).unwrap_or(Value::Null))
-                        .collect(),
-                )
+            Ok(v.map(|items| Value::TypedArray {
+                element_type: ArrayElementType::Float4,
+                values: items
+                    .into_iter()
+                    .map(|opt| opt.map(|f| Value::F64(f64::from(f))).unwrap_or(Value::Null))
+                    .collect(),
             })
             .unwrap_or(Value::Null))
         }
@@ -588,13 +590,12 @@ fn extract_value(row: &PgRow, idx: usize, ty: &Type) -> Result<Value, PgError> {
             let v: Option<Vec<Option<f64>>> = row
                 .try_get(idx)
                 .map_err(|e| PgError::TypeConversion(e.to_string()))?;
-            Ok(v.map(|items| {
-                Value::Array(
-                    items
-                        .into_iter()
-                        .map(|opt| opt.map(Value::F64).unwrap_or(Value::Null))
-                        .collect(),
-                )
+            Ok(v.map(|items| Value::TypedArray {
+                element_type: ArrayElementType::Float8,
+                values: items
+                    .into_iter()
+                    .map(|opt| opt.map(Value::F64).unwrap_or(Value::Null))
+                    .collect(),
             })
             .unwrap_or(Value::Null))
         }
@@ -602,13 +603,154 @@ fn extract_value(row: &PgRow, idx: usize, ty: &Type) -> Result<Value, PgError> {
             let v: Option<Vec<Option<String>>> = row
                 .try_get(idx)
                 .map_err(|e| PgError::TypeConversion(e.to_string()))?;
-            Ok(v.map(|items| {
-                Value::Array(
-                    items
-                        .into_iter()
-                        .map(|opt| opt.map(Value::Text).unwrap_or(Value::Null))
-                        .collect(),
-                )
+            Ok(v.map(|items| Value::TypedArray {
+                element_type: ArrayElementType::Text,
+                values: items
+                    .into_iter()
+                    .map(|opt| opt.map(Value::Text).unwrap_or(Value::Null))
+                    .collect(),
+            })
+            .unwrap_or(Value::Null))
+        }
+        // TIMESTAMPTZ[]: OffsetDateTime array → Value::Timestamp (microseconds since Unix epoch).
+        Type::TIMESTAMPTZ_ARRAY => {
+            let v: Option<Vec<Option<time::OffsetDateTime>>> = row
+                .try_get(idx)
+                .map_err(|e| PgError::TypeConversion(e.to_string()))?;
+            Ok(v.map(|items| Value::TypedArray {
+                element_type: ArrayElementType::TimestampTz,
+                values: items
+                    .into_iter()
+                    .map(|opt| {
+                        opt.map(|dt| {
+                            let us = dt.unix_timestamp_nanos() / 1_000;
+                            #[allow(clippy::cast_possible_truncation)]
+                            Value::Timestamp(us as i64)
+                        })
+                        .unwrap_or(Value::Null)
+                    })
+                    .collect(),
+            })
+            .unwrap_or(Value::Null))
+        }
+        // TIMESTAMP[]: PrimitiveDateTime array → Value::Timestamp (microseconds since Unix epoch).
+        Type::TIMESTAMP_ARRAY => {
+            let v: Option<Vec<Option<time::PrimitiveDateTime>>> = row
+                .try_get(idx)
+                .map_err(|e| PgError::TypeConversion(e.to_string()))?;
+            Ok(v.map(|items| Value::TypedArray {
+                element_type: ArrayElementType::Timestamp,
+                values: items
+                    .into_iter()
+                    .map(|opt| {
+                        opt.map(|dt| {
+                            let us = dt.assume_utc().unix_timestamp_nanos() / 1_000;
+                            #[allow(clippy::cast_possible_truncation)]
+                            Value::Timestamp(us as i64)
+                        })
+                        .unwrap_or(Value::Null)
+                    })
+                    .collect(),
+            })
+            .unwrap_or(Value::Null))
+        }
+        // DATE[]: time::Date array → Value::Date (days since Unix epoch 1970-01-01).
+        Type::DATE_ARRAY => {
+            let v: Option<Vec<Option<time::Date>>> = row
+                .try_get(idx)
+                .map_err(|e| PgError::TypeConversion(e.to_string()))?;
+            Ok(v.map(|items| Value::TypedArray {
+                element_type: ArrayElementType::Date,
+                values: items
+                    .into_iter()
+                    .map(|opt| {
+                        opt.map(|d| {
+                            const UNIX_EPOCH_JDN: i32 = 2_440_588;
+                            Value::Date(d.to_julian_day() - UNIX_EPOCH_JDN)
+                        })
+                        .unwrap_or(Value::Null)
+                    })
+                    .collect(),
+            })
+            .unwrap_or(Value::Null))
+        }
+        // TIME[]: time::Time array → Value::Time (microseconds since midnight).
+        Type::TIME_ARRAY => {
+            let v: Option<Vec<Option<time::Time>>> = row
+                .try_get(idx)
+                .map_err(|e| PgError::TypeConversion(e.to_string()))?;
+            Ok(v.map(|items| Value::TypedArray {
+                element_type: ArrayElementType::Time,
+                values: items
+                    .into_iter()
+                    .map(|opt| {
+                        opt.map(|t| {
+                            let (h, m, s, ns) = t.as_hms_nano();
+                            let us = i64::from(h) * 3_600_000_000
+                                + i64::from(m) * 60_000_000
+                                + i64::from(s) * 1_000_000
+                                + i64::from(ns) / 1_000;
+                            Value::Time(us)
+                        })
+                        .unwrap_or(Value::Null)
+                    })
+                    .collect(),
+            })
+            .unwrap_or(Value::Null))
+        }
+        // UUID[]: uuid::Uuid array → Value::Uuid (u128 big-endian).
+        Type::UUID_ARRAY => {
+            let v: Option<Vec<Option<uuid::Uuid>>> = row
+                .try_get(idx)
+                .map_err(|e| PgError::TypeConversion(e.to_string()))?;
+            Ok(v.map(|items| Value::TypedArray {
+                element_type: ArrayElementType::Uuid,
+                values: items
+                    .into_iter()
+                    .map(|opt| opt.map(|u| Value::Uuid(u.as_u128())).unwrap_or(Value::Null))
+                    .collect(),
+            })
+            .unwrap_or(Value::Null))
+        }
+        // BYTEA[]: Vec<u8> array → Value::Blob.
+        Type::BYTEA_ARRAY => {
+            let v: Option<Vec<Option<Vec<u8>>>> = row
+                .try_get(idx)
+                .map_err(|e| PgError::TypeConversion(e.to_string()))?;
+            Ok(v.map(|items| Value::TypedArray {
+                element_type: ArrayElementType::Bytea,
+                values: items
+                    .into_iter()
+                    .map(|opt| opt.map(Value::Blob).unwrap_or(Value::Null))
+                    .collect(),
+            })
+            .unwrap_or(Value::Null))
+        }
+        // JSON[]: String array → Value::Json.
+        // JSONB[]: String array → Value::Json (with Jsonb element type tag).
+        Type::JSON_ARRAY => {
+            let v: Option<Vec<Option<String>>> = row
+                .try_get(idx)
+                .map_err(|e| PgError::TypeConversion(e.to_string()))?;
+            Ok(v.map(|items| Value::TypedArray {
+                element_type: ArrayElementType::Json,
+                values: items
+                    .into_iter()
+                    .map(|opt| opt.map(Value::Json).unwrap_or(Value::Null))
+                    .collect(),
+            })
+            .unwrap_or(Value::Null))
+        }
+        Type::JSONB_ARRAY => {
+            let v: Option<Vec<Option<String>>> = row
+                .try_get(idx)
+                .map_err(|e| PgError::TypeConversion(e.to_string()))?;
+            Ok(v.map(|items| Value::TypedArray {
+                element_type: ArrayElementType::Jsonb,
+                values: items
+                    .into_iter()
+                    .map(|opt| opt.map(Value::Json).unwrap_or(Value::Null))
+                    .collect(),
             })
             .unwrap_or(Value::Null))
         }

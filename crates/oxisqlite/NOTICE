@@ -1,0 +1,7 @@
+oxisqlite is a Pure-Rust (C-free) fork of limbo 0.0.22 (https://github.com/tursodatabase/limbo)
+@ commit e59c5185ddc2b6451307324042efd81115376df1.
+
+Removed: mimalloc C allocator, lemon.c build-time parser generator (parser pre-generated),
+built/git2 build-info.
+
+License: MIT (sqlite3-parser portions: MIT OR Apache-2.0).

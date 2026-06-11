@@ -86,7 +86,8 @@ fn can_push_limit_into(plan: &LogicalPlan) -> bool {
         | LogicalPlan::Window { .. }
         | LogicalPlan::Subquery { .. }
         | LogicalPlan::Exists { .. }
-        | LogicalPlan::InSubquery { .. } => false,
+        | LogicalPlan::InSubquery { .. }
+        | LogicalPlan::Compute { .. } => false,
     }
 }
 

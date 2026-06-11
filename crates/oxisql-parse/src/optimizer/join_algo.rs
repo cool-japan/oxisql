@@ -149,6 +149,10 @@ fn annotate_join(plan: LogicalPlan) -> LogicalPlan {
             subquery: Box::new(annotate_join(*subquery)),
             negated,
         },
+        LogicalPlan::Compute { input, bindings } => LogicalPlan::Compute {
+            input: Box::new(annotate_join(*input)),
+            bindings,
+        },
         // Leaf nodes — nothing to recurse into.
         leaf => leaf,
     }

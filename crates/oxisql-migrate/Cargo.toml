@@ -50,6 +50,18 @@ required-features = ["cli"]
 name = "migrate"
 required-features = ["migrate"]
 
+[[test]]
+name = "directives"
+required-features = ["migrate"]
+
+[[test]]
+name = "rechecksum"
+required-features = ["migrate"]
+
+[[test]]
+name = "lock"
+required-features = ["migrate"]
+
 [[bench]]
 name = "migrate_benchmarks"
 harness = false

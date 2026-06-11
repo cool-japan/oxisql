@@ -3,9 +3,10 @@
 
 //! `oxisql-sqlite-compat` — Pure-Rust SQLite-compatible backend for OxiSQL.
 //!
-//! Wraps the [Limbo](https://github.com/tursodatabase/limbo) pure-Rust SQLite
-//! engine and implements [`Connection`] so that any OxiSQL consumer can use
-//! SQLite without linking `libsqlite3` or any C/C++ dependency.
+//! Wraps [oxisqlite](https://github.com/cool-japan/oxisql) — a C-free fork of
+//! [Limbo](https://github.com/tursodatabase/limbo) 0.0.22 with all C/C++
+//! dependencies stripped — and implements [`Connection`] so that any OxiSQL
+//! consumer can use SQLite without linking `libsqlite3` or any C/C++ dependency.
 //!
 //! # Quick start
 //!
@@ -34,7 +35,8 @@
 //! # async fn main() -> Result<(), oxisql_core::OxiSqlError> {
 //! use oxisql_sqlite_compat::SqliteConnection;
 //!
-//! let conn = SqliteConnection::open("/tmp/mydb.sqlite3").await?;
+//! # let path = std::env::temp_dir().join("mydb.sqlite3");
+//! let conn = SqliteConnection::open(path.to_str().unwrap()).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -47,10 +49,10 @@
 //! - **Positional parameters**: Limbo only supports `?` placeholders.  OxiSQL
 //!   uses `$1`, `$2`, …  — this crate performs a quote-aware rewrite before each
 //!   statement is prepared.
-//! - **Named parameters**: Not supported (`todo!()` in Limbo).  Calling code
-//!   should use positional parameters only.
-//! - **Prepared-statement caching**: Limbo 0.0.22 does not cache compiled
-//!   bytecode.  The [`PreparedStatement`] wrapper re-prepares on every call.
+//! - **Named parameters**: Not supported (upstream limbo 0.0.22 limitation).
+//!   Calling code should use positional parameters only.
+//! - **Prepared-statement caching**: limbo 0.0.22 / oxisqlite does not cache
+//!   compiled bytecode.  The [`PreparedStatement`] wrapper re-prepares on every call.
 //! - **Savepoints**: Not supported.  Calling `savepoint` / `rollback_to_savepoint`
 //!   / `release_savepoint` returns `OxiSqlError::Other`.
 //!

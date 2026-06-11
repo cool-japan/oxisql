@@ -76,6 +76,9 @@ pub enum MigrationError {
     /// A pool checkout or connection error prevented the migration from running.
     #[error("connection error: {0}")]
     Connection(String),
+    /// The advisory lock could not be acquired within the timeout.
+    #[error("migration lock timeout: {0}")]
+    LockTimeout(String),
 }
 
 #[cfg(feature = "migrate")]
@@ -133,6 +136,10 @@ pub mod tracker_backend;
 
 #[cfg(feature = "migrate")]
 pub use tracker_backend::TrackerBackend;
+
+/// Advisory distributed locking for migration runs.
+#[cfg(feature = "migrate")]
+pub mod lock;
 
 /// Migration runner — orchestrates scan → filter → execute → track.
 #[cfg(feature = "migrate")]

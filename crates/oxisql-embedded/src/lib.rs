@@ -822,6 +822,22 @@ impl EmbeddedConnection {
         if sql.trim().is_empty() {
             return Err(OxiSqlError::Parse("empty SQL statement".into()));
         }
+
+        // ── Cost-based path for SELECT queries ───────────────────────────────
+        // Attempt: parse → plan → optimize → explain_verbose (rows/cost tree).
+        // Gated to Statement::Query only; any error falls through to the
+        // pattern-based fallback below so that explain() never hard-errors.
+        if let Ok(stmt) = oxisql_parse::parse_one(sql) {
+            if let sqlparser::ast::Statement::Query(_) = &stmt {
+                if let Ok(plan) = oxisql_parse::plan_statement(&stmt) {
+                    let optimized = oxisql_parse::optimize(plan);
+                    let cost_model = oxisql_parse::CostModel::new();
+                    return Ok(oxisql_parse::explain_verbose(&optimized, &cost_model));
+                }
+            }
+        }
+
+        // ── Pattern-based fallback (non-SELECT / parse/plan failure) ─────────
         let upper = sql.to_uppercase();
         let mut lines: Vec<String> = Vec::new();
 
@@ -1722,6 +1738,7 @@ impl Connection for EmbeddedConnection {
                 column: fk.referencing_column_name,
                 foreign_table: fk.referenced_table_name,
                 foreign_column: fk.referenced_column_name,
+                ..Default::default()
             })
             .collect())
     }

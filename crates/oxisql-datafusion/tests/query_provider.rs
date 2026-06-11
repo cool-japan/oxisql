@@ -460,3 +460,50 @@ async fn test_window_function_row_number() {
         "result should have name, salary, and rn columns"
     );
 }
+
+/// `with_auto_partition` splits a large snapshot into multiple partitions.
+///
+/// 1 000 rows with `n_parallel=4` and `target_batch_size=100` must yield
+/// `partition_count() > 1`.
+#[test]
+fn test_auto_partition_splits_large_snapshot() {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+    let col = vec!["id".to_string()];
+    let rows: Vec<Row> = (0i64..1000)
+        .map(|i| Row::new(col.clone(), vec![Value::I64(i)]))
+        .collect();
+
+    let provider = OxiSqlTableProvider::from_rows(rows, schema).with_auto_partition(4, 100);
+
+    assert!(
+        provider.partition_count() > 1,
+        "with_auto_partition(4, 100) on 1000 rows must create more than one partition; \
+         got partition_count() = {}",
+        provider.partition_count()
+    );
+}
+
+/// `with_auto_partition` leaves a small snapshot as a single partition.
+///
+/// 10 rows with `n_parallel=4` and `target_batch_size=100` must stay at
+/// `partition_count() == 1` because `row_count <= target_batch_size`.
+#[test]
+fn test_auto_partition_single_for_small_snapshot() {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+    let col = vec!["id".to_string()];
+    let rows: Vec<Row> = (0i64..10)
+        .map(|i| Row::new(col.clone(), vec![Value::I64(i)]))
+        .collect();
+
+    let provider = OxiSqlTableProvider::from_rows(rows, schema).with_auto_partition(4, 100);
+
+    assert_eq!(
+        provider.partition_count(),
+        1,
+        "with_auto_partition(4, 100) on 10 rows must remain a single partition; \
+         got partition_count() = {}",
+        provider.partition_count()
+    );
+}

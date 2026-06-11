@@ -141,7 +141,7 @@ pub fn escape_sql_value(v: &Value) -> String {
         }
         Value::Json(s) => format!("'{}'", s.replace('\'', "''")),
         Value::Decimal(s) => s.clone(),
-        Value::Array(_) => {
+        Value::Array(_) | Value::TypedArray { .. } => {
             // GlueSQL has no array literal syntax; fall back to NULL.
             "NULL".to_string()
         }
@@ -199,7 +199,8 @@ fn value_to_ast_expr(v: &Value) -> Expr {
         | Value::Date(_)
         | Value::Time(_)
         | Value::Uuid(_)
-        | Value::Array(_) => {
+        | Value::Array(_)
+        | Value::TypedArray { .. } => {
             // These types have no direct sqlparser Value variant.
             // Produce an `Expr::Value(SingleQuotedString)` containing the
             // pre-escaped SQL literal — when re-serialised this yields the

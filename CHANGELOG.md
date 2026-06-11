@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-06-10
+
+### Added
+
+#### C-free `oxisqlite-*` engine fork (Wave 1)
+- Replaced the C-pulling `limbo` dependency with a 7-crate pure-Rust fork of limbo 0.0.22
+  (`oxisqlite`, `oxisqlite-core`, `oxisqlite-ext`, `oxisqlite-macros`,
+  `oxisqlite-sqlite3-parser`, `oxisqlite-time`, `oxisqlite-uuid`).
+- Removed all 3 C touchpoints: `mimalloc` allocator, `lemon.c` parser generator,
+  and `built`/`git2` build-info crates.
+- `CC=/usr/bin/false cargo build --workspace` → exit 0 (C-free proven).
+- Inline pure-Rust Julian-day helper in `oxisqlite-core` (replaces GPL-licensed
+  `julian_day_converter`).
+
+#### Full-transaction ROLLBACK support (Wave 2, `oxisql-sqlite-compat`)
+- `BEGIN / INSERT / ROLLBACK` now correctly discards changes; `COMMIT` persists them.
+- WAL integrity preserved. Ported rollback machinery from `turso_core` 0.7.0-pre.5 (MIT).
+- New `oxisql-sqlite-compat/tests/rollback.rs` (5 tests), `savepoint.rs`,
+  `change_counts.rs`, `type_mapping.rs`, `rollback_error.rs` (updated).
+
+#### TLS security patch (Wave 3)
+- Vendored `rustls-rustcrypto-patched` crate fixes RUSTSEC-2026-0104 (CRL-parsing panic
+  in `rustls-webpki 0.102.x`) via `[patch.crates-io]`.
+- Root `NOTICE` file created recording full fork lineage.
+- `deny.toml` allowlist extended: Zlib, Unicode-3.0, MPL-2.0, CDLA-Permissive-2.0.
+
+#### Query cancellation (`oxisql-postgres`)
+- `PostgresCancelToken` — cancel a running query without closing the connection.
+- `PgConnection::cancel_token()` returns a token usable from any async context.
+- New `PgError::ConnectionError` variant for connection-level failures.
+- `TypedArray` replaces raw array handling in `Value` for richer type representation.
+
+#### Advisory migration locking (`oxisql-migrate`)
+- `MigrationLock` trait with `NoopMigrationLock` and `PostgresAdvisoryLock`
+  implementations — prevents concurrent schema migrations.
+- Migration `rechecksum` support and `--recheck-hash` CLI flag.
+- Migration directives: `-- oxi:no-tx`, `-- oxi:skip-if-exists`, `-- oxi:require-version`.
+- `lock.rs` module and `tracker_generic.rs` for backend-agnostic migration tracking.
+
+#### SQL optimizer enhancements (`oxisql-parse`)
+- `decorrelate.rs` — correlated-subquery decorrelation pass.
+- `explain.rs` — `EXPLAIN`-compatible query plan renderer.
+- `optimizer/cse.rs` — Common Sub-expression Elimination (CSE) pass.
+- `optimizer/join_reorder.rs` — cost-based join reordering (842 lines).
+- `optimizer/simplify.rs` — constant folding and predicate simplification (833 lines).
+- `parameterize.rs` — SQL literal parameterization for LRU plan cache.
+- `plan_cache.rs` — `PlanCache` struct with schema-invalidation for repeated queries.
+- `planner.rs` — extended logical planner with new plan node types.
+
+#### DataFusion bridge improvements (`oxisql-datafusion`)
+- `plan_bridge.rs` — structural lowering of `Filter` and `Project` nodes.
+- `stream.rs` — async streaming rowset adapter refactored and extended.
+- New tests: `plan_bridge_structural.rs` (503 lines), `pushdown_extra.rs` (335 lines),
+  `query_provider.rs` (47 lines).
+- TPC-H benchmark queries (Q3, Q5–Q9, Q19) added under `crates/perf/tpc-h/`.
+
+#### Connection options (`oxisql-core` / `oxisql-postgres`)
+- `ConnectOptions` now parses query-string parameters from connection URIs
+  (`application_name`, `sslmode`, extra KV pairs).
+- `BackendInfo` documents that server versions for PostgreSQL/MySQL are not known
+  until after the connection handshake; SQLite-compat backend reports a static version.
+- `Middleware` trait and `LoggingConnection`/`MetricsConnection`/`RetryConnection`
+  wrappers added to `oxisql-core`.
+- `Warning` type for server-side diagnostic messages (MySQL warning forwarding).
+
+#### SQLite-compat type mapping (`oxisql-sqlite-compat`)
+- Columns typed `DATE`, `TIMESTAMP`, `TIME`, `UUID` are now mapped to rich `Value`
+  variants; plain TEXT/INTEGER columns are not false-retyped.
+- `change_count()` on connection reflects `changes()` from the underlying engine.
+
+### Changed
+- `oxisql-sqlite-compat` dependency changed from `limbo` to in-tree `oxisqlite`
+  workspace path (`crates/oxisqlite`).
+- `oxisql-pool/sqlite_rusqlite.rs` removed; `sqlite_compat.rs` extended in its place.
+- `cfg_block` dependency dropped (unused).
+
+### Fixed
+- Removed `unsafe transmute` in `const_concat_slices` macro — replaced with safe
+  const-generic array construction.
+- `oxisql-embedded` `memory_complex.rs` integration test — added missing `NULL`
+  assertion edge cases.
+- LEMON parser template file (`lemon.c`-generated artefact) removed from tree.
+
 ## [0.1.1] - 2026-06-04
 
 ### Added
@@ -115,6 +198,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Statement cache infrastructure: 128-slot LRU cache keyed by rewritten SQL text is in
   place; activates once limbo fixes the `Statement::reset()` / `Program::n_change` bug.
 
-[Unreleased]: https://github.com/cool-japan/oxisql/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/cool-japan/oxisql/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/cool-japan/oxisql/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/cool-japan/oxisql/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/cool-japan/oxisql/releases/tag/v0.1.0

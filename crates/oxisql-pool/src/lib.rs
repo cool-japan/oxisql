@@ -294,13 +294,6 @@ pub mod sqlite_compat;
 #[cfg(feature = "sqlite")]
 pub use sqlite_compat as sqlite;
 
-/// C-backed SQLite pool via rusqlite (requires the `sqlite-rusqlite` feature).
-///
-/// This is a legacy escape-hatch for code that explicitly needs the C-backed
-/// SQLite driver.  Prefer the `sqlite` feature (Limbo, Pure Rust) instead.
-#[cfg(feature = "sqlite-rusqlite")]
-pub mod sqlite_rusqlite;
-
 /// SQL-backed key-value store (see `kv_store::EmbeddedKvStore` and
 /// `kv_store::OxidbKvStore`).
 pub mod kv_store;

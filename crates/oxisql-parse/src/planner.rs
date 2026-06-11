@@ -394,6 +394,258 @@ pub(crate) fn build_scan_from_twjs(twjs: &[sqlparser::ast::TableWithJoins]) -> L
     build_from_plan(twjs)
 }
 
+// ── Decorrelation-aware planning ──────────────────────────────────────────────
+
+/// Collect every table name and alias that is reachable from `plan` (used to
+/// determine the outer scope for decorrelation).
+pub(crate) fn collect_outer_scope(plan: &LogicalPlan) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_outer_scope_inner(plan, &mut out);
+    out
+}
+
+fn collect_outer_scope_inner(plan: &LogicalPlan, out: &mut Vec<String>) {
+    match plan {
+        LogicalPlan::Scan { table, alias, .. } => {
+            out.push(table.clone());
+            if let Some(a) = alias {
+                out.push(a.clone());
+            }
+        }
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Window { input, .. }
+        | LogicalPlan::Compute { input, .. } => collect_outer_scope_inner(input, out),
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+            collect_outer_scope_inner(left, out);
+            collect_outer_scope_inner(right, out);
+        }
+        _ => {}
+    }
+}
+
+/// Plan a `Statement` with the given [`crate::PlannerOptions`].
+///
+/// For `Query` statements, this uses the decorrelation-aware planning path when
+/// `opts.decorrelate` is `true`.  All other statement kinds fall through to the
+/// standard [`plan_statement`].
+pub fn plan_statement_with_opts(
+    stmt: &sqlparser::ast::Statement,
+    opts: &crate::decorrelate::PlannerOptions,
+) -> Result<LogicalPlan, OxiSqlError> {
+    match stmt {
+        sqlparser::ast::Statement::Query(query) => plan_query_with_opts(query, opts),
+        other => plan_statement(other),
+    }
+}
+
+/// Plan a `Query` AST node with `PlannerOptions`.
+pub(crate) fn plan_query_with_opts(
+    query: &sqlparser::ast::Query,
+    opts: &crate::decorrelate::PlannerOptions,
+) -> Result<LogicalPlan, OxiSqlError> {
+    let mut plan = plan_set_expr_with_opts(&query.body, opts)?;
+
+    // ORDER BY
+    if let Some(ref order_by) = query.order_by {
+        if let sqlparser::ast::OrderByKind::Expressions(ref exprs) = order_by.kind {
+            if !exprs.is_empty() {
+                let sort_keys: Vec<SortExpr> = exprs
+                    .iter()
+                    .map(|e| SortExpr {
+                        column: e.expr.to_string(),
+                        ascending: e.options.asc.unwrap_or(true),
+                    })
+                    .collect();
+                plan = LogicalPlan::Sort {
+                    input: Box::new(plan),
+                    order_by: sort_keys,
+                };
+            }
+        }
+    }
+
+    // LIMIT / OFFSET
+    if let Some(ref limit_clause) = query.limit_clause {
+        let (count, offset) = extract_limit_offset(limit_clause);
+        if count.is_some() || offset.is_some() {
+            plan = LogicalPlan::Limit {
+                input: Box::new(plan),
+                count,
+                offset,
+            };
+        }
+    }
+
+    // WITH / CTE
+    if let Some(ref with) = query.with {
+        let recursive = with.recursive;
+        for cte in with.cte_tables.iter().rev() {
+            let cte_name = cte.alias.name.value.clone();
+            let inner_plan = plan_query_with_opts(&cte.query, opts)?;
+            plan = LogicalPlan::Cte {
+                name: cte_name,
+                query: Box::new(inner_plan),
+                recursive,
+            };
+        }
+    }
+
+    Ok(plan)
+}
+
+fn plan_set_expr_with_opts(
+    body: &sqlparser::ast::SetExpr,
+    opts: &crate::decorrelate::PlannerOptions,
+) -> Result<LogicalPlan, OxiSqlError> {
+    match body {
+        sqlparser::ast::SetExpr::Select(sel) => plan_select_with_opts(sel, opts),
+        sqlparser::ast::SetExpr::Query(inner) => plan_query_with_opts(inner, opts),
+        sqlparser::ast::SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => setops::plan_set_operation(op, set_quantifier, left, right, &|b| {
+            plan_set_expr_with_opts(b, opts)
+        }),
+        _ => Ok(LogicalPlan::Empty),
+    }
+}
+
+/// Plan a `SELECT` with optional decorrelation of correlated subqueries.
+fn plan_select_with_opts(
+    sel: &sqlparser::ast::Select,
+    opts: &crate::decorrelate::PlannerOptions,
+) -> Result<LogicalPlan, OxiSqlError> {
+    // 1 + 2. FROM + JOINs
+    let mut plan = build_from_plan(&sel.from);
+
+    // 3. WHERE
+    if let Some(ref pred) = sel.selection {
+        if opts.decorrelate {
+            let outer_scope = collect_outer_scope(&plan);
+            plan = crate::decorrelate::apply_decorrelated_where(plan, pred, &outer_scope)?;
+        } else {
+            match pred {
+                Expr::Exists { subquery, negated } => {
+                    let inner = plan_query_with_opts(subquery, opts)?;
+                    plan = LogicalPlan::Exists {
+                        subquery: Box::new(inner),
+                        negated: *negated,
+                    };
+                }
+                Expr::InSubquery {
+                    expr,
+                    subquery,
+                    negated,
+                } => {
+                    let inner = plan_query_with_opts(subquery, opts)?;
+                    plan = LogicalPlan::InSubquery {
+                        expr: expr.to_string(),
+                        subquery: Box::new(inner),
+                        negated: *negated,
+                    };
+                }
+                other => {
+                    plan = LogicalPlan::Filter {
+                        input: Box::new(plan),
+                        predicate: other.to_string(),
+                    };
+                }
+            }
+        }
+    }
+
+    // 4. GROUP BY / aggregates
+    let group_by_exprs: Vec<String> = match &sel.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => {
+            exprs.iter().map(|e| e.to_string()).collect()
+        }
+        sqlparser::ast::GroupByExpr::All(_) => vec!["*".to_string()],
+    };
+    let aggregates: Vec<String> = sel
+        .projection
+        .iter()
+        .filter(|item| agg::projection_item_is_aggregate(item))
+        .map(|item| item.to_string())
+        .collect();
+    if !group_by_exprs.is_empty() || !aggregates.is_empty() {
+        plan = LogicalPlan::Aggregate {
+            input: Box::new(plan),
+            group_by: group_by_exprs,
+            aggregates,
+        };
+        if let Some(ref having_expr) = sel.having {
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate: having_expr.to_string(),
+            };
+        }
+    }
+
+    // 5. Projection
+    let all_wildcard = sel.projection.iter().all(|item| {
+        matches!(
+            item,
+            sqlparser::ast::SelectItem::Wildcard(_)
+                | sqlparser::ast::SelectItem::QualifiedWildcard(_, _)
+        )
+    });
+    if !all_wildcard
+        && !matches!(plan, LogicalPlan::Aggregate { .. })
+        && !matches!(plan, LogicalPlan::Filter {
+            input: ref i, ..
+        } if matches!(i.as_ref(), LogicalPlan::Aggregate { .. }))
+    {
+        let subquery_plans: Vec<LogicalPlan> = sel
+            .projection
+            .iter()
+            .filter_map(|item| extract_subquery_from_select_item(item).ok().flatten())
+            .collect();
+        if !subquery_plans.is_empty() {
+            for sub_plan in subquery_plans {
+                let alias = sel.projection.iter().find_map(|it| match it {
+                    sqlparser::ast::SelectItem::ExprWithAlias {
+                        expr: Expr::Subquery(_),
+                        alias,
+                    } => Some(alias.value.clone()),
+                    _ => None,
+                });
+                plan = LogicalPlan::Subquery {
+                    query: Box::new(sub_plan),
+                    alias,
+                };
+            }
+        } else {
+            let columns: Vec<String> = sel.projection.iter().map(|item| item.to_string()).collect();
+            plan = LogicalPlan::Project {
+                input: Box::new(plan),
+                columns,
+            };
+        }
+    }
+
+    // 6. Window functions
+    let window_defs: Vec<WindowFunctionDef> = sel
+        .projection
+        .iter()
+        .filter(|item| window::select_item_is_windowed(item))
+        .filter_map(window::extract_window_def)
+        .collect();
+    if !window_defs.is_empty() {
+        plan = LogicalPlan::Window {
+            input: Box::new(plan),
+            functions: window_defs,
+        };
+    }
+
+    Ok(plan)
+}
+
 /// Extract `(count, offset)` from a [`sqlparser::ast::LimitClause`].
 fn extract_limit_offset(clause: &sqlparser::ast::LimitClause) -> (Option<u64>, Option<u64>) {
     match clause {

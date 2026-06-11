@@ -14,10 +14,11 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::{
+    lock::MigrationLock,
     scanner::{scan_migrations, MigrationFile},
     tracker::{
         applied_versions, compute_checksum, get_checksum, initialize_tracker, mark_applied,
-        mark_reverted,
+        mark_reverted, update_checksum,
     },
     tracker_generic::GenericTracker,
     MigrateOptions, MigrationError,
@@ -68,6 +69,12 @@ pub struct MigrationRunner {
     /// Populated on the first [`status`] call and reused by subsequent calls
     /// without re-scanning the directory.
     cached_migrations: Option<Vec<MigrationFile>>,
+    /// Optional advisory lock acquired around the migration run.
+    ///
+    /// When `Some`, [`run_with_conn`](MigrationRunner::run_with_conn) will
+    /// call `lock.acquire(30)` before running migrations and `lock.release()`
+    /// once finished (whether or not an error occurred).
+    lock: Option<Box<dyn MigrationLock>>,
 }
 
 impl MigrationRunner {
@@ -80,6 +87,7 @@ impl MigrationRunner {
             dir: dir.as_ref().to_path_buf(),
             opts: MigrateOptions::default(),
             cached_migrations: None,
+            lock: None,
         }
     }
 
@@ -92,7 +100,31 @@ impl MigrationRunner {
             dir: dir.into(),
             opts,
             cached_migrations: None,
+            lock: None,
         }
+    }
+
+    /// Attach an advisory lock to this runner.
+    ///
+    /// When a lock is attached, [`run_with_conn`](MigrationRunner::run_with_conn)
+    /// will acquire it (with a 30-second timeout) before running any migrations
+    /// and release it when done — even if the migration run fails.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "migrate")]
+    /// # {
+    /// use oxisql_migrate::lock::NoopMigrationLock;
+    /// use oxisql_migrate::runner::MigrationRunner;
+    ///
+    /// let runner = MigrationRunner::new("migrations/")
+    ///     .with_lock(NoopMigrationLock::new());
+    /// # }
+    /// ```
+    pub fn with_lock(mut self, lock: impl MigrationLock + 'static) -> Self {
+        self.lock = Some(Box::new(lock));
+        self
     }
 
     /// Return the list of migration files, using the in-memory cache when available.
@@ -139,7 +171,7 @@ impl MigrationRunner {
     /// - [`MigrationError::ChecksumMismatch`] — an already-applied file was modified.
     #[cfg(feature = "pool")]
     pub async fn run_pooled(
-        &self,
+        &mut self,
         pool: &oxisql_pool::embedded::EmbeddedPool,
     ) -> Result<usize, MigrationError> {
         // Use UFCS to call the `ConnectionPool` trait's `get()` (which returns
@@ -268,9 +300,17 @@ impl MigrationRunner {
             // Compute checksum for tracking.
             let checksum = compute_checksum(&sql);
 
-            // Begin a transaction; if the storage backend does not support
-            // transactions, BEGIN may fail — in that case we proceed without one.
-            let in_txn = glue.execute("BEGIN").await.is_ok();
+            // Check whether this migration opts out of transaction wrapping.
+            let skip_txn = has_no_transaction_directive(&sql);
+
+            // Begin a transaction unless the migration requests no-transaction
+            // mode.  If the storage backend does not support transactions, BEGIN
+            // may fail — in that case we proceed without one.
+            let in_txn = if skip_txn {
+                false
+            } else {
+                glue.execute("BEGIN").await.is_ok()
+            };
 
             // Execute the migration SQL.
             let exec_result = glue.execute(&sql).await;
@@ -529,7 +569,30 @@ impl MigrationRunner {
     /// - [`MigrationError::Parse`] — SQL syntax error in a migration file.
     /// - [`MigrationError::Execution`] — SQL execution or tracker failure.
     /// - [`MigrationError::ChecksumMismatch`] — an already-applied file was modified.
-    pub async fn run_with_conn(&self, conn: &dyn Connection) -> Result<usize, MigrationError> {
+    pub async fn run_with_conn(&mut self, conn: &dyn Connection) -> Result<usize, MigrationError> {
+        // Acquire the advisory lock if one was configured (30-second timeout).
+        if let Some(ref mut lock) = self.lock {
+            lock.acquire(30).await?;
+        }
+
+        let result = self.run_with_conn_inner(conn).await;
+
+        // Always release the lock, regardless of whether the run succeeded.
+        if let Some(ref mut lock) = self.lock {
+            // Swallow the release error if the run already failed so the
+            // original error is surfaced to the caller.
+            let release_result = lock.release().await;
+            if result.is_ok() {
+                return release_result.map(|_| result.unwrap());
+            }
+        }
+
+        result
+    }
+
+    /// Inner implementation of [`run_with_conn`](MigrationRunner::run_with_conn),
+    /// separated so the lock acquire/release wrapper above stays clean.
+    async fn run_with_conn_inner(&self, conn: &dyn Connection) -> Result<usize, MigrationError> {
         let tracker = GenericTracker::new(conn);
         tracker.initialize().await?;
 
@@ -574,6 +637,43 @@ impl MigrationRunner {
         }
 
         Ok(count)
+    }
+
+    /// Update the stored checksum for `version` to match the current on-disk
+    /// content of the migration file.
+    ///
+    /// Use this when a migration file has been intentionally edited after it was
+    /// applied and you want to suppress the [`MigrationState::Modified`] warning
+    /// without reverting and re-applying the migration.
+    ///
+    /// # Errors
+    ///
+    /// - [`MigrationError::Io`] — migration file could not be read or the
+    ///   version does not correspond to any file in `self.dir`.
+    /// - [`MigrationError::Execution`] — the tracker UPDATE failed.
+    pub async fn force_rechecksum(
+        &self,
+        glue: &mut Glue<MemoryStorage>,
+        version: u64,
+    ) -> Result<(), MigrationError> {
+        // Locate the migration file for this version.
+        let all_files = scan_migrations(&self.dir)?;
+        let mf = all_files
+            .into_iter()
+            .find(|f| f.version == version)
+            .ok_or_else(|| {
+                MigrationError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no migration file found for version {version}"),
+                ))
+            })?;
+
+        // Compute the checksum of the current on-disk content.
+        let sql = std::fs::read_to_string(&mf.path)?;
+        let new_checksum = compute_checksum(&sql);
+
+        // Update the tracker row.
+        update_checksum(glue, version, &new_checksum).await
     }
 
     /// Roll back applied migrations down to (but not including) `target_version`,
@@ -635,6 +735,28 @@ impl MigrationRunner {
 
         Ok(count)
     }
+}
+
+/// Return `true` if the SQL text contains an `-- oxisql:no-transaction`
+/// directive in the leading comment block.
+///
+/// The scan stops at the first non-comment, non-blank line so that the
+/// directive is only effective when placed before any SQL statements.
+/// This prevents a comment inside a string literal or later in the file from
+/// accidentally disabling transaction wrapping.
+fn has_no_transaction_directive(sql: &str) -> bool {
+    for line in sql.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("--") {
+            if trimmed.contains("oxisql:no-transaction") {
+                return true;
+            }
+        } else if !trimmed.is_empty() {
+            // First non-comment, non-empty line — stop scanning.
+            break;
+        }
+    }
+    false
 }
 
 /// Parse `sql` with `sqlparser`'s generic dialect to catch syntax errors before

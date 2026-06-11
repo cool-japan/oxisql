@@ -17,7 +17,9 @@ use datafusion::common::Statistics;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
+use datafusion::logical_expr::{
+    Between, BinaryExpr, Expr, Like, Operator, TableProviderFilterPushDown,
+};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::scalar::ScalarValue;
 use oxisql_core::{Row, Value};
@@ -114,6 +116,16 @@ impl OxiSqlTableProvider {
         self.rows.is_empty()
     }
 
+    /// Return the number of explicit partitions stored, or `1` when no
+    /// partitioning has been applied (all rows treated as one partition).
+    pub fn partition_count(&self) -> usize {
+        if self.partitions.is_empty() {
+            1
+        } else {
+            self.partitions.len()
+        }
+    }
+
     /// Partition rows by a range key column value for parallel DataFusion scans.
     ///
     /// Rows are sorted by `key_column`'s value (using [`Value`]'s [`PartialOrd`])
@@ -167,6 +179,87 @@ impl OxiSqlTableProvider {
         self.partitions = parts;
         self
     }
+
+    /// Automatically partition the snapshot data for parallel execution.
+    ///
+    /// Chooses the partition key (first column) and number of partitions based
+    /// on the row count.  The formula is
+    /// `max(1, min(n_parallel, row_count / target_batch_size))`.
+    ///
+    /// - `n_parallel`: maximum number of partitions (typically the number of CPU
+    ///   threads available to the DataFusion session).
+    /// - `target_batch_size`: target rows per partition.  A value of `8192` is a
+    ///   reasonable default for most workloads.
+    ///
+    /// Uses range partitioning on the first schema column when
+    /// `row_count > target_batch_size` and `n_parallel > 1`, leaving the data
+    /// as a single partition otherwise.
+    ///
+    /// Returns the provider unchanged (no-op) when the schema has no columns or
+    /// when partitioning would not help (too few rows or `n_parallel <= 1`).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let provider = OxiSqlTableProvider::from_rows(rows, schema)
+    ///     .with_auto_partition(num_cpus::get(), 8192);
+    /// ```
+    #[must_use]
+    pub fn with_auto_partition(self, n_parallel: usize, target_batch_size: usize) -> Self {
+        let total = self.rows.len();
+        if total <= target_batch_size || n_parallel <= 1 {
+            return self;
+        }
+        let n = (total / target_batch_size).min(n_parallel).max(1);
+        let first_col = self.schema.fields().first().map(|f| f.name().clone());
+        match first_col {
+            Some(col) => self.with_range_partition(&col, n),
+            None => self,
+        }
+    }
+
+    /// Partition rows into `n` buckets by hashing the value of `key_column`.
+    ///
+    /// Each row is placed into bucket `hash(row[key_column]) % n`.  Buckets
+    /// become separate DataFusion partitions, enabling parallel execution.
+    /// Unlike [`Self::with_range_partition`], rows within each bucket have no
+    /// guaranteed ordering.
+    ///
+    /// Returns an error if `n == 0` or `key_column` is not found in the schema.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let provider = OxiSqlTableProvider::from_rows(rows, schema)
+    ///     .with_hash_partition("user_id", 8)?;
+    /// ```
+    pub fn with_hash_partition(
+        mut self,
+        key_column: &str,
+        n: usize,
+    ) -> Result<Self, OxiSqlFusionError> {
+        if n == 0 {
+            return Err(OxiSqlFusionError::OxiSql(
+                "with_hash_partition: n must be greater than 0".into(),
+            ));
+        }
+        let col_idx = self.schema.index_of(key_column).map_err(|_| {
+            OxiSqlFusionError::OxiSql(format!(
+                "with_hash_partition: column '{key_column}' not found in schema"
+            ))
+        })?;
+
+        let mut buckets: Vec<Vec<Row>> = (0..n).map(|_| Vec::new()).collect();
+        for row in self.rows.as_ref() {
+            let val = row.get_by_index(col_idx);
+            let h = hash_value(val.unwrap_or(&Value::Null));
+            let bucket = (h % (n as u64)) as usize;
+            buckets[bucket].push(row.clone());
+        }
+
+        self.partitions = buckets.into_iter().map(Arc::new).collect();
+        Ok(self)
+    }
 }
 
 // ── Filter helpers ────────────────────────────────────────────────────────────
@@ -181,19 +274,30 @@ impl OxiSqlTableProvider {
 /// DataFusion must still apply it post-scan as a safety net.
 fn is_simple_filter(expr: &Expr) -> bool {
     match expr {
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-            matches!(
-                op,
-                Operator::Eq
-                    | Operator::NotEq
-                    | Operator::Lt
-                    | Operator::LtEq
-                    | Operator::Gt
-                    | Operator::GtEq
-            ) && is_col_or_literal(left)
-                && is_col_or_literal(right)
-        }
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
+            Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq => is_col_or_literal(left) && is_col_or_literal(right),
+            Operator::And | Operator::Or => is_simple_filter(left) && is_simple_filter(right),
+            _ => false,
+        },
         Expr::IsNull(inner) | Expr::IsNotNull(inner) => is_col_or_literal(inner),
+        Expr::Not(inner) => is_simple_filter(inner),
+        // `col IN (lit, lit, …)` / `col NOT IN (…)`
+        Expr::InList(inlist) => {
+            is_col_or_literal(&inlist.expr) && inlist.list.iter().all(is_col_or_literal)
+        }
+        // `col BETWEEN low AND high`
+        Expr::Between(Between {
+            expr, low, high, ..
+        }) => is_col_or_literal(expr) && is_col_or_literal(low) && is_col_or_literal(high),
+        // `col LIKE 'pat'` / `col ILIKE 'pat'` and negations
+        Expr::Like(Like { expr, pattern, .. }) => {
+            is_col_or_literal(expr) && is_col_or_literal(pattern)
+        }
         _ => false,
     }
 }
@@ -201,6 +305,89 @@ fn is_simple_filter(expr: &Expr) -> bool {
 /// Return `true` when `expr` is a column reference or a scalar literal.
 fn is_col_or_literal(expr: &Expr) -> bool {
     matches!(expr, Expr::Column(_) | Expr::Literal(_, _))
+}
+
+/// Convert a DataFusion [`ScalarValue`] to an OxiSQL [`Value`].
+///
+/// Returns `None` for scalar types that have no straightforward OxiSQL mapping
+/// (e.g. Decimal128, Date32, complex types).  Typed NULLs of any integer /
+/// float / bool / text type are mapped to [`Value::Null`].
+fn scalar_to_value(scalar: &ScalarValue) -> Option<Value> {
+    match scalar {
+        ScalarValue::Int8(Some(v)) => Some(Value::I64(i64::from(*v))),
+        ScalarValue::Int16(Some(v)) => Some(Value::I64(i64::from(*v))),
+        ScalarValue::Int32(Some(v)) => Some(Value::I64(i64::from(*v))),
+        ScalarValue::Int64(Some(v)) => Some(Value::I64(*v)),
+        ScalarValue::Float32(Some(v)) => Some(Value::F64(f64::from(*v))),
+        ScalarValue::Float64(Some(v)) => Some(Value::F64(*v)),
+        ScalarValue::Boolean(Some(v)) => Some(Value::Bool(*v)),
+        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
+            Some(Value::Text(s.clone()))
+        }
+        // Any typed NULL → Value::Null.
+        ScalarValue::Null
+        | ScalarValue::Int8(None)
+        | ScalarValue::Int16(None)
+        | ScalarValue::Int32(None)
+        | ScalarValue::Int64(None)
+        | ScalarValue::Float32(None)
+        | ScalarValue::Float64(None)
+        | ScalarValue::Boolean(None)
+        | ScalarValue::Utf8(None)
+        | ScalarValue::LargeUtf8(None) => Some(Value::Null),
+        _ => None,
+    }
+}
+
+/// Evaluate a leaf [`Expr`] (column reference or literal) against `row` to
+/// produce an OxiSQL [`Value`].  Returns `None` for compound or unsupported
+/// expressions.
+fn eval_expr_to_value(expr: &Expr, row: &Row, schema: &arrow::datatypes::Schema) -> Option<Value> {
+    match expr {
+        Expr::Column(col) => {
+            let idx = schema.index_of(col.name.as_str()).ok()?;
+            row.get_by_index(idx).cloned()
+        }
+        Expr::Literal(sv, _) => scalar_to_value(sv),
+        _ => None,
+    }
+}
+
+/// SQL LIKE pattern matching (`%` = any substring, `_` = any single char).
+///
+/// When `case_insensitive` is `true`, both sides are lower-cased before
+/// matching (implements ILIKE semantics).
+fn sql_like_match(text: &str, pattern: &str, case_insensitive: bool) -> bool {
+    let (t, p) = if case_insensitive {
+        (text.to_lowercase(), pattern.to_lowercase())
+    } else {
+        (text.to_owned(), pattern.to_owned())
+    };
+    let text_chars: Vec<char> = t.chars().collect();
+    let pat_chars: Vec<char> = p.chars().collect();
+    like_match(&text_chars, &pat_chars)
+}
+
+fn like_match(text: &[char], pattern: &[char]) -> bool {
+    match (text, pattern) {
+        // Pattern exhausted: match only if text is also exhausted.
+        (_, []) => text.is_empty(),
+        // `%` matches zero or more characters.
+        (_, ['%', rest @ ..]) => {
+            for i in 0..=text.len() {
+                if like_match(&text[i..], rest) {
+                    return true;
+                }
+            }
+            false
+        }
+        // No text left but pattern still has non-`%` characters.
+        ([], _) => false,
+        // `_` matches exactly one character.
+        ([_, tr @ ..], ['_', pr @ ..]) => like_match(tr, pr),
+        // Literal character match.
+        ([tc, tr @ ..], [pc, pr @ ..]) => tc == pc && like_match(tr, pr),
+    }
 }
 
 /// Evaluate `expr` against `row` in the context of `schema`.
@@ -212,6 +399,19 @@ fn is_col_or_literal(expr: &Expr) -> bool {
 fn eval_filter_on_row(expr: &Expr, row: &Row, schema: &arrow::datatypes::Schema) -> bool {
     match expr {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            // Short-circuit boolean connectives first.
+            match op {
+                Operator::And => {
+                    return eval_filter_on_row(left, row, schema)
+                        && eval_filter_on_row(right, row, schema);
+                }
+                Operator::Or => {
+                    return eval_filter_on_row(left, row, schema)
+                        || eval_filter_on_row(right, row, schema);
+                }
+                _ => {}
+            }
+
             // Extract (column_index, scalar) pairs.
             // We handle `col OP literal` and `literal OP col` forms.
             let (col_idx, scalar, flip) = if let (Expr::Column(col), Expr::Literal(sv, _)) =
@@ -276,6 +476,78 @@ fn eval_filter_on_row(expr: &Expr, row: &Row, schema: &arrow::datatypes::Schema)
                 true
             }
         }
+        Expr::Not(inner) => !eval_filter_on_row(inner, row, schema),
+        // `col IN (a, b, c)` / `col NOT IN (…)`
+        Expr::InList(inlist) => match eval_expr_to_value(&inlist.expr, row, schema) {
+            None => true,              // can't evaluate — keep row
+            Some(Value::Null) => true, // NULL IN (...) = NULL (unknown) — keep row
+            Some(v) => {
+                let in_list = inlist.list.iter().any(|item| {
+                    if let Some(item_val) = eval_expr_to_value(item, row, schema) {
+                        v.partial_cmp(&item_val) == Some(std::cmp::Ordering::Equal)
+                    } else {
+                        false
+                    }
+                });
+                if inlist.negated {
+                    !in_list
+                } else {
+                    in_list
+                }
+            }
+        },
+        // `col BETWEEN low AND high`
+        Expr::Between(Between {
+            expr,
+            low,
+            high,
+            negated,
+        }) => {
+            let val = eval_expr_to_value(expr, row, schema);
+            let lo = eval_expr_to_value(low, row, schema);
+            let hi = eval_expr_to_value(high, row, schema);
+            match (val, lo, hi) {
+                (Some(v), Some(l), Some(h)) => {
+                    let above_low = v
+                        .partial_cmp(&l)
+                        .map(|o| o != std::cmp::Ordering::Less)
+                        .unwrap_or(true);
+                    let below_high = v
+                        .partial_cmp(&h)
+                        .map(|o| o != std::cmp::Ordering::Greater)
+                        .unwrap_or(true);
+                    let in_range = above_low && below_high;
+                    if *negated {
+                        !in_range
+                    } else {
+                        in_range
+                    }
+                }
+                _ => true, // evaluation failure — keep row
+            }
+        }
+        // `col LIKE 'pat'` / `col ILIKE 'pat'` and negations
+        Expr::Like(Like {
+            expr,
+            pattern,
+            negated,
+            case_insensitive,
+            ..
+        }) => {
+            let text_val = eval_expr_to_value(expr, row, schema);
+            let pattern_val = eval_expr_to_value(pattern, row, schema);
+            match (text_val, pattern_val) {
+                (Some(Value::Text(text)), Some(Value::Text(pat))) => {
+                    let matched = sql_like_match(&text, &pat, *case_insensitive);
+                    if *negated {
+                        !matched
+                    } else {
+                        matched
+                    }
+                }
+                _ => true, // evaluation failure — keep row
+            }
+        }
         _ => true, // unsupported — keep row (over-inclusive)
     }
 }
@@ -314,6 +586,43 @@ fn compare_value_scalar(val: &Value, scalar: &ScalarValue) -> Option<std::cmp::O
         | (Value::Null, ScalarValue::LargeUtf8(None)) => Some(std::cmp::Ordering::Equal),
         _ => None,
     }
+}
+
+/// Hash an OxiSQL [`Value`] to a `u64` suitable for bucket assignment.
+///
+/// `Value::F64` NaN is canonicalised to `u64::MAX` so all NaN values land in
+/// the same bucket.  `Value::Null` always hashes to `0`.
+fn hash_value(val: &Value) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    match val {
+        Value::I64(i) => i.hash(&mut h),
+        Value::F64(f) => {
+            let bits = if f.is_nan() { u64::MAX } else { f.to_bits() };
+            bits.hash(&mut h);
+        }
+        Value::Text(s) => s.hash(&mut h),
+        Value::Blob(b) => b.hash(&mut h),
+        Value::Bool(b) => b.hash(&mut h),
+        Value::Null => 0u64.hash(&mut h),
+        Value::Timestamp(t) => t.hash(&mut h),
+        Value::Date(d) => d.hash(&mut h),
+        Value::Time(t) => t.hash(&mut h),
+        Value::Uuid(u) => u.hash(&mut h),
+        Value::Json(s) | Value::Decimal(s) => s.hash(&mut h),
+        Value::Array(arr) => {
+            for v in arr {
+                hash_value(v).hash(&mut h);
+            }
+        }
+        Value::TypedArray { values, .. } => {
+            for v in values {
+                hash_value(v).hash(&mut h);
+            }
+        }
+    }
+    h.finish()
 }
 
 // ── TableProvider impl ────────────────────────────────────────────────────────

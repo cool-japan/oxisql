@@ -108,6 +108,30 @@ impl<'a> GenericTracker<'a> {
             .map_err(|e| MigrationError::Execution(e.to_string()))
     }
 
+    /// Update the stored checksum for `version`.
+    ///
+    /// Called by [`MigrationRunner::force_rechecksum`](crate::runner::MigrationRunner::force_rechecksum)
+    /// when a migration file was intentionally edited and its tracker row must
+    /// be brought in sync with the new on-disk content.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MigrationError::Execution`] if the UPDATE fails.
+    pub async fn update_checksum(
+        &self,
+        version: u64,
+        new_checksum: &str,
+    ) -> Result<(), MigrationError> {
+        let escaped = new_checksum.replace('\'', "''");
+        let sql =
+            format!("UPDATE {TRACKER_TABLE} SET checksum = '{escaped}' WHERE version = {version}");
+        self.conn
+            .execute(&sql, &[])
+            .await
+            .map(|_| ())
+            .map_err(|e| MigrationError::Execution(e.to_string()))
+    }
+
     /// Compute a checksum for the given SQL content.
     pub fn compute_checksum(sql: &str) -> String {
         fnv1a_checksum(sql.as_bytes())

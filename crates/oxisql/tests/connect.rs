@@ -936,3 +936,128 @@ fn test_backend_info_fjall() {
     assert!(info.features.contains(&"persistent"));
     assert!(info.features.contains(&"lsm-tree"));
 }
+
+// ── Item A: Connection-string query-parameter parsing tests ──────────────────
+
+/// URI with two known query parameters auto-configures `ConnectOptions` fields.
+#[test]
+fn query_string_multi_param() {
+    let opts = oxisql::ConnectOptions::from_uri("sqlite://path.db?pool_max=8&connect_timeout=5");
+    assert_eq!(opts.pool_size, Some(8), "pool_max should map to pool_size");
+    assert_eq!(
+        opts.connect_timeout_ms,
+        Some(5_000),
+        "connect_timeout (secs) should be stored as milliseconds"
+    );
+}
+
+/// An unknown query key should land in `ConnectOptions::extra`.
+#[test]
+fn query_string_unknown_key() {
+    let opts = oxisql::ConnectOptions::from_uri("postgres://localhost/db?my_custom_key=hello");
+    assert_eq!(
+        opts.extra.get("my_custom_key").map(|s| s.as_str()),
+        Some("hello"),
+        "unknown key should be stored in ConnectOptions::extra"
+    );
+}
+
+/// No query string → no-op; all fields keep their defaults.
+#[test]
+fn query_string_empty() {
+    let opts = oxisql::ConnectOptions::from_uri("memory://");
+    assert!(opts.pool_size.is_none(), "pool_size should default to None");
+    assert!(
+        opts.connect_timeout_ms.is_none(),
+        "connect_timeout_ms should default to None"
+    );
+    assert!(!opts.require_tls, "require_tls should default to false");
+    assert!(opts.extra.is_empty(), "extra should be empty");
+}
+
+/// `sslmode=require` sets `require_tls = true` and populates `sslmode`.
+#[test]
+fn query_string_sslmode_require() {
+    let opts = oxisql::ConnectOptions::from_uri("postgres://host/db?sslmode=require");
+    assert_eq!(opts.sslmode.as_deref(), Some("require"));
+    assert!(opts.require_tls, "sslmode=require should set require_tls");
+}
+
+/// `application_name` is stored in the dedicated field.
+#[test]
+fn query_string_application_name() {
+    let opts = oxisql::ConnectOptions::from_uri("postgres://host/db?application_name=myapp");
+    assert_eq!(opts.application_name.as_deref(), Some("myapp"));
+}
+
+// ── Item B: BackendInfo version for local backends tests ─────────────────────
+
+/// Embedded backend should report a non-empty version string.
+#[test]
+fn backend_info_embedded_has_version() {
+    let info = oxisql::backend_info_for_uri("memory://").expect("should return info");
+    assert_eq!(info.name, "embedded");
+    let version = info.version.expect("embedded backend must have a version");
+    assert!(
+        !version.is_empty(),
+        "embedded backend version must not be empty"
+    );
+}
+
+/// PostgreSQL backend should have `None` version (not known until handshake).
+#[test]
+fn backend_info_postgres_version_is_none() {
+    let info = oxisql::backend_info_for_uri("postgres://localhost/db").expect("pg backend info");
+    assert!(
+        info.version.is_none(),
+        "postgres version should be None before connection handshake"
+    );
+}
+
+/// MySQL backend should have `None` version (not known until handshake).
+#[test]
+fn backend_info_mysql_version_is_none() {
+    let info = oxisql::backend_info_for_uri("mysql://localhost/db").expect("mysql backend info");
+    assert!(
+        info.version.is_none(),
+        "mysql version should be None before connection handshake"
+    );
+}
+
+/// redb backend should report a non-empty version string.
+#[test]
+fn backend_info_redb_has_version() {
+    let p = std::env::temp_dir().join("bi_redb_test.db");
+    let info = oxisql::backend_info_for_uri(&format!("redb://{}", p.display()))
+        .expect("redb backend info");
+    let version = info.version.expect("redb backend must have a version");
+    assert!(!version.is_empty(), "redb version string must not be empty");
+}
+
+/// fjall backend should report a non-empty version string.
+#[test]
+fn backend_info_fjall_has_version() {
+    let p = std::env::temp_dir().join("bi_fjall_test_dir");
+    let info = oxisql::backend_info_for_uri(&format!("fjall://{}", p.display()))
+        .expect("fjall backend info");
+    let version = info.version.expect("fjall backend must have a version");
+    assert!(
+        !version.is_empty(),
+        "fjall version string must not be empty"
+    );
+}
+
+/// sqlite-compat backend should report a non-empty version string when the
+/// feature is enabled.
+#[cfg(feature = "sqlite")]
+#[test]
+fn backend_info_sqlite_compat_has_version() {
+    let info = oxisql::backend_info_for_uri("sqlite://foo.db").expect("sqlite-compat backend info");
+    let version = info
+        .version
+        .expect("sqlite-compat backend must have a version");
+    assert!(
+        !version.is_empty(),
+        "sqlite-compat version string must not be empty"
+    );
+}

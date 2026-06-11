@@ -18,8 +18,13 @@
 //! `MigrationRunner` API directly in your application code.
 
 use clap::{Parser, Subcommand};
+use gluesql::prelude::{Glue, MemoryStorage};
 use oxisql_embedded::EmbeddedConnection;
-use oxisql_migrate::{runner::MigrationRunner, scanner::scan_migrations, MigrationError};
+use oxisql_migrate::{
+    runner::{MigrationRunner, MigrationState},
+    scanner::scan_migrations,
+    MigrationError,
+};
 
 /// OxiSQL migration runner CLI.
 ///
@@ -45,6 +50,13 @@ enum Commands {
         /// Directory containing migration `.sql` files.
         #[arg(short, long, default_value = "migrations")]
         dir: String,
+        /// Force-update checksums for any Modified migrations before running.
+        ///
+        /// When set, migrations whose on-disk content no longer matches the
+        /// stored checksum are re-checksummed rather than rejected, then the
+        /// normal apply step proceeds.
+        #[arg(long)]
+        force: bool,
     },
     /// Show the status (pending / applied) of all migrations.
     ///
@@ -70,6 +82,15 @@ enum Commands {
         #[arg(short, long)]
         version: u64,
     },
+    /// Preview pending migrations without applying them.
+    ///
+    /// Lists all migrations that would be applied against a fresh in-memory
+    /// database without executing any SQL or modifying tracker state.
+    DryRun {
+        /// Directory containing migration `.sql` files.
+        #[arg(short, long, default_value = "migrations")]
+        dir: String,
+    },
 }
 
 #[tokio::main]
@@ -77,27 +98,66 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { dir } => cmd_run(&dir).await,
+        Commands::Run { dir, force } => cmd_run(&dir, force).await,
         Commands::Status { dir } => cmd_status(&dir),
         Commands::Rollback { dir, version } => cmd_rollback(&dir, version).await,
+        Commands::DryRun { dir } => cmd_dry_run(&dir).await,
     }
 }
 
-/// Apply all pending migrations against a fresh embedded (in-memory) connection.
-async fn cmd_run(dir: &str) -> anyhow::Result<()> {
-    let conn = EmbeddedConnection::open_memory()
-        .map_err(|e| anyhow::anyhow!("failed to open in-memory database: {e}"))?;
+/// Apply all pending migrations against a fresh in-memory database.
+///
+/// When `force` is `true` the runner first detects any `Modified` migrations
+/// (whose on-disk content no longer matches the stored checksum) and
+/// re-checksums them before running.  This uses the embedded GlueSQL path so
+/// that both `status` and `run_embedded` share the same in-memory tracker.
+///
+/// When `force` is `false` the existing `EmbeddedConnection` / `run_with_conn`
+/// path is used (no tracker re-checksumming).
+async fn cmd_run(dir: &str, force: bool) -> anyhow::Result<()> {
+    if force {
+        let mut glue = Glue::new(MemoryStorage::default());
+        let mut runner = MigrationRunner::new(dir);
 
-    let runner = MigrationRunner::new(dir);
-    let applied = runner
-        .run_with_conn(&conn)
-        .await
-        .map_err(format_migration_error)?;
+        // Detect Modified migrations and bring their checksums up to date.
+        let statuses = runner
+            .status(&mut glue)
+            .await
+            .map_err(format_migration_error)?;
+        for (mf, state) in &statuses {
+            if *state == MigrationState::Modified {
+                runner
+                    .force_rechecksum(&mut glue, mf.version)
+                    .await
+                    .map_err(format_migration_error)?;
+            }
+        }
 
-    if applied == 0 {
-        println!("No pending migrations — all up to date.");
+        let applied = runner
+            .run_embedded(&mut glue)
+            .await
+            .map_err(format_migration_error)?;
+
+        if applied == 0 {
+            println!("No pending migrations — all up to date.");
+        } else {
+            println!("Applied {applied} migration(s) successfully.");
+        }
     } else {
-        println!("Applied {applied} migration(s) successfully.");
+        let conn = EmbeddedConnection::open_memory()
+            .map_err(|e| anyhow::anyhow!("failed to open in-memory database: {e}"))?;
+
+        let mut runner = MigrationRunner::new(dir);
+        let applied = runner
+            .run_with_conn(&conn)
+            .await
+            .map_err(format_migration_error)?;
+
+        if applied == 0 {
+            println!("No pending migrations — all up to date.");
+        } else {
+            println!("Applied {applied} migration(s) successfully.");
+        }
     }
     Ok(())
 }
@@ -135,6 +195,43 @@ fn cmd_status(dir: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// List all pending migrations that would be applied without executing them.
+///
+/// Uses a fresh in-memory GlueSQL instance as the tracker so the output
+/// reflects what `run` would apply against an empty database.
+async fn cmd_dry_run(dir: &str) -> anyhow::Result<()> {
+    let mut glue = Glue::new(MemoryStorage::default());
+    let runner = MigrationRunner::new(dir);
+
+    let pending = runner
+        .dry_run(&mut glue)
+        .await
+        .map_err(format_migration_error)?;
+
+    if pending.is_empty() {
+        println!("No pending migrations — all up to date.");
+        return Ok(());
+    }
+
+    println!("{:<20} {:<8} NAME", "VERSION", "STATUS");
+    println!("{:-<60}", "");
+
+    for mf in &pending {
+        let down = if mf.down_path.is_some() {
+            " (has .down.sql)"
+        } else {
+            ""
+        };
+        println!("{:<20} {:<8} {}{}", mf.version, "pending", mf.name, down);
+    }
+    println!();
+    println!(
+        "{} pending migration(s) would be applied (dry-run, no changes made).",
+        pending.len()
+    );
+    Ok(())
+}
+
 /// Roll back applied migrations to `target_version` against a fresh in-memory
 /// connection.
 ///
@@ -145,7 +242,7 @@ async fn cmd_rollback(dir: &str, target_version: u64) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to open in-memory database: {e}"))?;
 
     // First apply all migrations so there is something to roll back.
-    let runner = MigrationRunner::new(dir);
+    let mut runner = MigrationRunner::new(dir);
     let applied = runner
         .run_with_conn(&conn)
         .await

@@ -511,7 +511,7 @@ async fn run_with_conn_embedded() {
     .expect("write migration");
 
     let conn = EmbeddedConnection::open_memory().expect("open");
-    let runner = MigrationRunner::new(&dir);
+    let mut runner = MigrationRunner::new(&dir);
 
     let applied = runner.run_with_conn(&conn).await.expect("run_with_conn");
     assert_eq!(applied, 1);
@@ -545,7 +545,7 @@ async fn rollback_with_conn_embedded() {
     .expect("backward");
 
     let conn = EmbeddedConnection::open_memory().expect("open");
-    let runner = MigrationRunner::new(&dir);
+    let mut runner = MigrationRunner::new(&dir);
 
     runner.run_with_conn(&conn).await.expect("apply");
     let rolled = runner.rollback_with_conn(&conn, 0).await.expect("rollback");
@@ -838,7 +838,7 @@ async fn test_run_pooled_embedded() {
     .expect("write migration 2");
 
     let pool = EmbeddedPool::new();
-    let runner = MigrationRunner::new(&dir);
+    let mut runner = MigrationRunner::new(&dir);
 
     let applied = runner
         .run_pooled(&pool)
@@ -890,11 +890,11 @@ async fn test_concurrent_migration_runs() {
 
     let (r1, r2) = tokio::join!(
         async move {
-            let runner = MigrationRunner::new(&dir1);
+            let mut runner = MigrationRunner::new(&dir1);
             runner.run_with_conn(c1.as_ref()).await
         },
         async move {
-            let runner = MigrationRunner::new(&dir2);
+            let mut runner = MigrationRunner::new(&dir2);
             runner.run_with_conn(c2.as_ref()).await
         }
     );

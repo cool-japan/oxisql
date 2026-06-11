@@ -165,6 +165,283 @@ impl<C: Connection + Send + Sync> Connection for LoggingConnection<C> {
     }
 }
 
+// ── TracingConnection ─────────────────────────────────────────────────────────
+
+/// A [`Connection`] wrapper that emits [`tracing`](https://docs.rs/tracing) spans
+/// and events for every SQL operation.
+///
+/// Mirrors [`LoggingConnection`] exactly but uses `tracing::debug!` /
+/// `tracing::warn!` instead of `log::debug!` / `log::warn!`.
+///
+/// Available only when the `tracing` feature is enabled.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # #[cfg(feature = "tracing")]
+/// # async fn example() -> Result<(), oxisql_core::OxiSqlError> {
+/// // use oxisql_core::TracingConnection;
+/// // let conn = TracingConnection::new(backend_conn);
+/// // conn.execute("INSERT INTO t VALUES ($1)", &[&42i64]).await?;
+/// // Emits a tracing DEBUG event: [execute] 1 row(s) affected — …ms | …
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "tracing")]
+pub struct TracingConnection<C> {
+    inner: C,
+    prefix: String,
+}
+
+#[cfg(feature = "tracing")]
+impl<C: Connection> TracingConnection<C> {
+    /// Wrap `inner` with tracing.  Events have no prefix.
+    pub fn new(inner: C) -> Self {
+        Self {
+            inner,
+            prefix: String::new(),
+        }
+    }
+
+    /// Wrap `inner` with a label prepended to tracing event fields.
+    pub fn with_prefix(inner: C, prefix: impl Into<String>) -> Self {
+        Self {
+            inner,
+            prefix: prefix.into(),
+        }
+    }
+
+    /// Consume the wrapper and return the inner connection.
+    pub fn into_inner(self) -> C {
+        self.inner
+    }
+
+    /// Return a reference to the prefix string.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    fn fmt_prefix(&self) -> String {
+        if self.prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{} ", self.prefix)
+        }
+    }
+}
+
+#[cfg(feature = "tracing")]
+#[async_trait]
+impl<C: Connection + Send + Sync> Connection for TracingConnection<C> {
+    async fn execute(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<u64, OxiSqlError> {
+        let t = Instant::now();
+        let result = self.inner.execute(sql, params).await;
+        let elapsed = t.elapsed();
+        match &result {
+            Ok(n) => tracing::debug!(
+                "[{}execute] {} row(s) affected — {:.3}ms{}",
+                self.fmt_prefix(),
+                n,
+                elapsed.as_secs_f64() * 1000.0,
+                truncate_sql(sql),
+            ),
+            Err(e) => tracing::warn!(
+                "[{}execute] ERROR {} — {:.3}ms{}",
+                self.fmt_prefix(),
+                e,
+                elapsed.as_secs_f64() * 1000.0,
+                truncate_sql(sql),
+            ),
+        }
+        result
+    }
+
+    async fn query(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<Vec<Row>, OxiSqlError> {
+        let t = Instant::now();
+        let result = self.inner.query(sql, params).await;
+        let elapsed = t.elapsed();
+        match &result {
+            Ok(rows) => tracing::debug!(
+                "[{}query] {} row(s) — {:.3}ms{}",
+                self.fmt_prefix(),
+                rows.len(),
+                elapsed.as_secs_f64() * 1000.0,
+                truncate_sql(sql),
+            ),
+            Err(e) => tracing::warn!(
+                "[{}query] ERROR {} — {:.3}ms{}",
+                self.fmt_prefix(),
+                e,
+                elapsed.as_secs_f64() * 1000.0,
+                truncate_sql(sql),
+            ),
+        }
+        result
+    }
+
+    async fn transaction(&self) -> Result<Box<dyn Transaction + '_>, OxiSqlError> {
+        tracing::debug!("[{}transaction] BEGIN", self.fmt_prefix());
+        self.inner.transaction().await
+    }
+
+    async fn execute_batch(&self, sql: &str) -> Result<u64, OxiSqlError> {
+        let t = Instant::now();
+        let result = self.inner.execute_batch(sql).await;
+        tracing::debug!(
+            "[{}execute_batch] {:.3}ms{}",
+            self.fmt_prefix(),
+            t.elapsed().as_secs_f64() * 1000.0,
+            truncate_sql(sql),
+        );
+        result
+    }
+
+    async fn ping(&self) -> Result<(), OxiSqlError> {
+        tracing::debug!("[{}ping]", self.fmt_prefix());
+        self.inner.ping().await
+    }
+
+    async fn prepare(&self, sql: &str) -> Result<Box<dyn PreparedStatement + '_>, OxiSqlError> {
+        tracing::debug!("[{}prepare]{}", self.fmt_prefix(), truncate_sql(sql));
+        self.inner.prepare(sql).await
+    }
+
+    async fn tables(&self) -> Result<Vec<TableInfo>, OxiSqlError> {
+        self.inner.tables().await
+    }
+
+    async fn columns(&self, table: &str) -> Result<Vec<ColumnInfo>, OxiSqlError> {
+        self.inner.columns(table).await
+    }
+
+    async fn indexes(&self, table: &str) -> Result<Vec<IndexInfo>, OxiSqlError> {
+        self.inner.indexes(table).await
+    }
+
+    async fn foreign_keys(&self, table: &str) -> Result<Vec<ForeignKeyInfo>, OxiSqlError> {
+        self.inner.foreign_keys(table).await
+    }
+}
+
+#[cfg(all(test, feature = "tracing"))]
+mod tracing_tests {
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::fmt::MakeWriter;
+
+    use crate::{Connection, OxiSqlError, Row, ToSqlValue, Transaction, Value};
+
+    use super::TracingConnection;
+
+    // ── Minimal in-memory writer for tracing_subscriber ──────────────────────
+
+    #[derive(Clone, Default)]
+    struct MemWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl MemWriter {
+        fn contents(&self) -> String {
+            let data = self.0.lock().expect("lock");
+            String::from_utf8_lossy(&data).into_owned()
+        }
+    }
+
+    impl std::io::Write for MemWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for MemWriter {
+        type Writer = MemWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    // ── Mock Connection ───────────────────────────────────────────────────────
+
+    struct MockConn;
+
+    #[async_trait::async_trait]
+    impl Connection for MockConn {
+        async fn execute(
+            &self,
+            _sql: &str,
+            _params: &[&dyn ToSqlValue],
+        ) -> Result<u64, OxiSqlError> {
+            Ok(1)
+        }
+
+        async fn query(
+            &self,
+            _sql: &str,
+            _params: &[&dyn ToSqlValue],
+        ) -> Result<Vec<Row>, OxiSqlError> {
+            Ok(vec![Row::new(vec!["n".into()], vec![Value::I64(42)])])
+        }
+
+        async fn transaction(&self) -> Result<Box<dyn Transaction + '_>, OxiSqlError> {
+            Err(OxiSqlError::Other("no txn".into()))
+        }
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tracing_execute_emits_event() {
+        let writer = MemWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let conn = TracingConnection::new(MockConn);
+        let rows_affected = conn
+            .execute("INSERT INTO t VALUES ($1)", &[&42i64])
+            .await
+            .expect("execute ok");
+        assert_eq!(rows_affected, 1);
+
+        let output = writer.contents();
+        assert!(
+            output.contains("execute"),
+            "expected 'execute' in: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tracing_query_emits_event() {
+        let writer = MemWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let conn = TracingConnection::new(MockConn);
+        let rows = conn.query("SELECT n FROM t", &[]).await.expect("query ok");
+        assert_eq!(rows.len(), 1);
+
+        let output = writer.contents();
+        assert!(output.contains("query"), "expected 'query' in: {output}");
+    }
+
+    #[test]
+    fn tracing_conn_prefix_and_accessors() {
+        let conn = TracingConnection::with_prefix(MockConn, "mydb");
+        assert_eq!(conn.prefix(), "mydb");
+        // into_inner recovers the wrapped conn without panic
+        let _inner: MockConn = conn.into_inner();
+    }
+}
+
 // ── MetricsConnection ─────────────────────────────────────────────────────────
 
 /// Counters tracked by [`MetricsConnection`].

@@ -113,6 +113,12 @@ pub struct EmbeddedPool {
     acquired: Arc<AtomicU64>,
     /// Total connections returned (checkins) since pool creation.
     released: Arc<AtomicU64>,
+    /// Stored `min_idle` from the last [`with_config`](EmbeddedPool::with_config) call.
+    ///
+    /// Pre-warming is a no-op for the embedded pool (single shared instance),
+    /// so this value is retained for introspection only and has no effect on
+    /// pool behaviour.
+    min_idle: usize,
 }
 
 impl EmbeddedPool {
@@ -126,6 +132,7 @@ impl EmbeddedPool {
             hooks: Arc::new(PoolHooks::default()),
             acquired: Arc::new(AtomicU64::new(0)),
             released: Arc::new(AtomicU64::new(0)),
+            min_idle: 0,
         }
     }
 
@@ -146,6 +153,32 @@ impl EmbeddedPool {
     pub fn with_hooks(mut self, hooks: PoolHooks) -> Self {
         hooks.fire_create();
         self.hooks = Arc::new(hooks);
+        self
+    }
+
+    /// Configure the pool from a [`crate::PoolConfig`].
+    ///
+    /// The embedded pool uses a single shared `Arc<Mutex<Glue>>` rather than a
+    /// real slot pool, so pre-warming (`config.min_idle`) is a **no-op** here —
+    /// there are no discrete connection slots to initialise.  The `min_idle`
+    /// value is stored for introspection but has no effect on pool behaviour.
+    ///
+    /// This method returns `Self` so it can be chained after
+    /// [`EmbeddedPool::new`] and/or [`EmbeddedPool::with_hooks`]:
+    ///
+    /// ```rust
+    /// use oxisql_pool::{PoolConfigBuilder, embedded::EmbeddedPool};
+    ///
+    /// let config = PoolConfigBuilder::new().min_idle(2).build();
+    /// let pool = EmbeddedPool::new().with_config(config);
+    /// let _ = pool;
+    /// ```
+    pub fn with_config(mut self, config: crate::PoolConfig) -> Self {
+        // Pre-warming is a no-op: the embedded pool has only one shared Glue
+        // instance protected by a Mutex.  Warming N "connections" would just
+        // lock/unlock the same Mutex N times, providing no initialisation
+        // benefit over the lazy default.
+        self.min_idle = config.min_idle.unwrap_or(0);
         self
     }
 

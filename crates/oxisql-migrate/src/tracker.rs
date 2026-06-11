@@ -166,6 +166,29 @@ pub fn compute_checksum(sql: &str) -> String {
     fnv1a_checksum(sql.as_bytes())
 }
 
+/// Update the stored checksum for `version` in `_oxisql_migrations`.
+///
+/// Called by [`MigrationRunner::force_rechecksum`](crate::runner::MigrationRunner::force_rechecksum)
+/// when a migration file has been intentionally edited and the tracker row
+/// needs to reflect the new on-disk content.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Execution`] if the UPDATE fails.
+pub async fn update_checksum(
+    glue: &mut Glue<MemoryStorage>,
+    version: u64,
+    new_checksum: &str,
+) -> Result<(), MigrationError> {
+    let escaped = new_checksum.replace('\'', "''");
+    let sql =
+        format!("UPDATE {TRACKER_TABLE} SET checksum = '{escaped}' WHERE version = {version}");
+    glue.execute(&sql)
+        .await
+        .map_err(|e| MigrationError::Execution(e.to_string()))?;
+    Ok(())
+}
+
 /// Remove the tracking record for `version` from `_oxisql_migrations`.
 ///
 /// Called after a down-migration SQL has been executed successfully to mark

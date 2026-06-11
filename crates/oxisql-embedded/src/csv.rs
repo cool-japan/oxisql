@@ -320,6 +320,11 @@ pub fn value_to_csv_field(v: &Value) -> String {
             let inner: Vec<String> = arr.iter().map(value_to_csv_field).collect();
             format!("[{}]", inner.join(", "))
         }
+        Value::TypedArray { values: arr, .. } => {
+            // Represent typed arrays as JSON-ish string (element_type is decorative metadata)
+            let inner: Vec<String> = arr.iter().map(value_to_csv_field).collect();
+            format!("[{}]", inner.join(", "))
+        }
     }
 }
 

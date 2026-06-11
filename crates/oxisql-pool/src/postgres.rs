@@ -414,6 +414,7 @@ impl Connection for PgPooledConn {
                     column,
                     foreign_table,
                     foreign_column,
+                    ..Default::default()
                 })
             })
             .collect()

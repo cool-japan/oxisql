@@ -410,6 +410,7 @@ impl Connection for MysqlPooledConn {
                     column,
                     foreign_table,
                     foreign_column,
+                    ..Default::default()
                 })
             })
             .collect()

@@ -23,9 +23,10 @@
 //! ## Limitations
 //!
 //! * **Logical replication** (Streaming Replication Protocol) is not supported.
-//! * **Cancellation** via the `CancelRequest` flow is not exposed at the
-//!   `Connection` trait level; individual queries can be cancelled by dropping
-//!   the `Future`.
+//! * **Cancellation** via the `CancelRequest` flow is available through
+//!   [`PgConnection::cancel_token`] → [`PostgresCancelToken::cancel_query`].
+//!   It is not exposed at the `Connection` trait level; individual queries can
+//!   also be cancelled by dropping the `Future`.
 //! * Notification delivery via `LISTEN` is only available on connections
 //!   created through [`PgConnection::connect`] (not `from_client`), because
 //!   the background `Connection` driver that routes `NotificationResponse`
@@ -84,6 +85,7 @@ pub mod types;
 pub use builder::{PgConnectionBuilder, TlsMode};
 pub use connection::{
     parse_pg_conn_str, ColumnDescription, PgConnParts, PgConnection, PgTransaction,
+    PostgresCancelToken,
 };
 pub use error::PgError;
 pub use notify::{NotificationStream, PgNotification};

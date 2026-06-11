@@ -113,12 +113,46 @@ fn bench_pg_pool_checkout(c: &mut Criterion) {
 #[cfg(not(feature = "postgres"))]
 fn bench_pg_pool_checkout(_c: &mut Criterion) {}
 
+/// Benchmark Pure-Rust SQLite pool (Limbo/oxisqlite backend) checkout latency.
+///
+/// Uses an in-memory database (`:memory:`) to avoid filesystem I/O and focus
+/// purely on pool checkout overhead.  The pool is pre-built once outside the
+/// iteration loop so only the `get` + implicit `drop` (return to pool) path is
+/// measured.
+///
+/// Run with:
+/// ```sh
+/// cargo bench -p oxisql-pool --features sqlite,embedded -- sqlite_pool_checkout
+/// ```
+#[cfg(feature = "sqlite")]
+fn bench_sqlite_pool_checkout(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let pool = rt.block_on(async {
+        oxisql_pool::sqlite_compat::new_sqlite_compat_pool(":memory:", 4)
+            .await
+            .expect("sqlite pool")
+    });
+
+    c.bench_function("sqlite_pool_checkout", |b| {
+        b.to_async(&rt).iter(|| async {
+            let _conn = pool.get().await.expect("get conn");
+            // _conn dropped here — connection returned to the pool.
+        });
+    });
+}
+
+/// No-op stub compiled when the `sqlite` feature is disabled so that
+/// `criterion_group!` can always reference `bench_sqlite_pool_checkout`.
+#[cfg(not(feature = "sqlite"))]
+fn bench_sqlite_pool_checkout(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_embedded_pool_concurrent,
     bench_embedded_pool_get,
     bench_embedded_pool_clone,
     bench_pool_health_check,
-    bench_pg_pool_checkout
+    bench_pg_pool_checkout,
+    bench_sqlite_pool_checkout
 );
 criterion_main!(benches);

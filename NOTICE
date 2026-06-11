@@ -1,0 +1,46 @@
+OxiSQL
+Copyright 2024-2026 COOLJAPAN OU (Team Kitasan)
+
+This product includes software developed by COOLJAPAN OU (Team Kitasan)
+distributed under the Apache License, Version 2.0.
+
+================================================================================
+FORK LINEAGE
+================================================================================
+
+oxisqlite/* is based on limbo 0.0.22
+  Copyright (c) tursodatabase/limbo contributors
+  License: MIT
+  Source:  https://github.com/tursodatabase/limbo
+  Commit:  e59c5185ddc2b6451307324042efd81115376df1
+
+ROLLBACK implementation ported from turso_core 0.7.0-pre.5
+  Copyright (c) tursodatabase/turso contributors
+  License: MIT
+  Source:  https://github.com/tursodatabase/turso
+
+================================================================================
+THIRD-PARTY DEPENDENCIES
+================================================================================
+
+MPL-2.0 (Mozilla Public License 2.0)
+  Packages: im, bitmaps, sized-chunks (pulled in transitively via gluesql)
+  The MPL-2.0 is a file-level copyleft license that coexists with
+  Apache-2.0 distributions per MPL §3.3 (Larger Works).
+  Source code for MPL-2.0 files is available from the respective upstream
+  repositories listed in Cargo.lock.
+
+Unicode-3.0 (Unicode License v3)
+  Packages: ICU4X family crates (pulled in transitively via datafusion, idna,
+            url)
+  Source code is available from the ICU4X project:
+  https://github.com/unicode-org/icu4x
+
+Zlib
+  Packages: foldhash
+  Source code is available from the upstream repositories listed in Cargo.lock.
+
+CDLA-Permissive-2.0 (Community Data License Agreement Permissive 2.0)
+  Packages: webpki-roots (pulled in transitively via mysql_async / oxitls)
+  Source code is available from:
+  https://github.com/rustls/webpki-roots

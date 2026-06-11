@@ -6,19 +6,20 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Pure-Rust SQLite-compatible backend for OxiSQL via the Limbo engine"
+description = "Pure-Rust SQLite-compatible backend for OxiSQL via the oxisqlite Pure-Rust engine (C-free fork of limbo)"
 readme = "README.md"
-keywords = ["sqlite", "sql", "database", "limbo", "pure-rust"]
+keywords = ["sqlite", "sql", "database", "oxisqlite", "pure-rust"]
 categories = ["database"]
 
 [dependencies]
 oxisql-core = { workspace = true }
-limbo       = { workspace = true }
+limbo       = { package = "oxisqlite", path = "../oxisqlite", version = "0.1.0", features = ["index_experimental"] }
 async-trait = { workspace = true }
 thiserror   = { workspace = true }
 tokio       = { workspace = true }
 log         = { workspace = true }
 lru         = { workspace = true }
+chrono      = { workspace = true }
 
 [dev-dependencies]
 tokio.workspace = true

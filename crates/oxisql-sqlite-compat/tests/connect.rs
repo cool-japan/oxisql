@@ -181,10 +181,7 @@ async fn test_transaction_commit() {
     assert_eq!(rows[0].get_by_index(0), Some(&Value::I64(42)));
 }
 
-// NOTE: Limbo 0.0.22 does not support ROLLBACK ("ROLLBACK not supported yet").
-// This test is ignored until limbo implements transaction rollback.
 #[tokio::test]
-#[ignore = "limbo 0.0.22 does not implement ROLLBACK — enable when limbo adds support"]
 async fn test_transaction_rollback() {
     let conn = SqliteConnection::open_memory().await.unwrap();
     conn.execute("CREATE TABLE t (id INTEGER)", &[])
@@ -199,10 +196,7 @@ async fn test_transaction_rollback() {
     assert!(rows.is_empty(), "rollback should have removed the row");
 }
 
-// NOTE: Limbo 0.0.22 does not support ROLLBACK ("ROLLBACK not supported yet").
-// This test is ignored until limbo implements transaction rollback.
 #[tokio::test]
-#[ignore = "limbo 0.0.22 does not implement ROLLBACK — enable when limbo adds support"]
 async fn test_transaction_query() {
     let conn = SqliteConnection::open_memory().await.unwrap();
     conn.execute("CREATE TABLE t (id INTEGER, val TEXT)", &[])
@@ -376,7 +370,6 @@ async fn test_file_persistence() {
 // ── foreign keys ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore = "limbo 0.0.22 does not preserve FK DDL in sqlite_master"]
 async fn test_foreign_keys_basic() {
     let conn = SqliteConnection::open_memory().await.unwrap();
     conn.execute(
@@ -400,6 +393,106 @@ async fn test_foreign_keys_basic() {
     assert_eq!(fks[0].column, "customer_id");
     assert_eq!(fks[0].foreign_table, "customers");
     assert_eq!(fks[0].foreign_column, "id");
+}
+
+#[tokio::test]
+async fn test_foreign_keys_multi_column() {
+    // Multi-column FK: FOREIGN KEY (a, b) REFERENCES parent(x, y)
+    // Should produce 2 rows with the same id but seq=0 and seq=1.
+    let conn = SqliteConnection::open_memory().await.unwrap();
+    conn.execute(
+        "CREATE TABLE parent (x INTEGER, y INTEGER, PRIMARY KEY (x, y))",
+        &[],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE child (\
+            a INTEGER,\
+            b INTEGER,\
+            FOREIGN KEY (a, b) REFERENCES parent(x, y)\
+        )",
+        &[],
+    )
+    .await
+    .unwrap();
+
+    let fks = conn.foreign_keys("child").await.unwrap();
+    assert_eq!(
+        fks.len(),
+        2,
+        "expected 2 rows for composite FK, got {fks:?}"
+    );
+    // Both rows share the same id (same FK constraint).
+    assert_eq!(fks[0].constraint_name, fks[1].constraint_name);
+    let cols: Vec<&str> = fks.iter().map(|f| f.column.as_str()).collect();
+    assert!(cols.contains(&"a"), "missing column a");
+    assert!(cols.contains(&"b"), "missing column b");
+}
+
+#[tokio::test]
+async fn test_foreign_keys_on_delete_cascade() {
+    let conn = SqliteConnection::open_memory().await.unwrap();
+    conn.execute(
+        "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        &[],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE orders (\
+            id INTEGER PRIMARY KEY,\
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE\
+        )",
+        &[],
+    )
+    .await
+    .unwrap();
+
+    let fks = conn.foreign_keys("orders").await.unwrap();
+    assert_eq!(fks.len(), 1, "expected 1 FK, got {fks:?}");
+    assert_eq!(fks[0].column, "customer_id");
+    assert_eq!(fks[0].foreign_table, "customers");
+    assert_eq!(fks[0].foreign_column, "id");
+    assert_eq!(
+        fks[0].on_delete.as_deref(),
+        Some("CASCADE"),
+        "on_delete should be CASCADE"
+    );
+}
+
+#[tokio::test]
+async fn test_foreign_keys_multiple_fks() {
+    // Table with two separate FK constraints.
+    let conn = SqliteConnection::open_memory().await.unwrap();
+    conn.execute("CREATE TABLE categories (id INTEGER PRIMARY KEY)", &[])
+        .await
+        .unwrap();
+    conn.execute("CREATE TABLE suppliers (id INTEGER PRIMARY KEY)", &[])
+        .await
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE items (\
+            id INTEGER PRIMARY KEY,\
+            category_id INTEGER REFERENCES categories(id),\
+            supplier_id INTEGER REFERENCES suppliers(id)\
+        )",
+        &[],
+    )
+    .await
+    .unwrap();
+
+    let fks = conn.foreign_keys("items").await.unwrap();
+    assert_eq!(fks.len(), 2, "expected 2 FKs, got {fks:?}");
+    let col_names: Vec<&str> = fks.iter().map(|f| f.column.as_str()).collect();
+    assert!(col_names.contains(&"category_id"), "missing category_id FK");
+    assert!(col_names.contains(&"supplier_id"), "missing supplier_id FK");
+    // They should have different id values since they are different constraints.
+    let ids: Vec<&str> = fks.iter().map(|f| f.constraint_name.as_str()).collect();
+    assert_ne!(
+        ids[0], ids[1],
+        "distinct FKs must have different constraint names"
+    );
 }
 
 // ── prepared statements ───────────────────────────────────────────────────────

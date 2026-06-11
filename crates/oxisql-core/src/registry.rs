@@ -259,6 +259,7 @@ impl TypeRegistry {
                 | (Value::Uuid(_), SqlType::Uuid)
                 | (Value::Json(_), SqlType::Json)
                 | (Value::Array(_), SqlType::Array(_))
+                | (Value::TypedArray { .. }, SqlType::Array(_))
         )
     }
 }
