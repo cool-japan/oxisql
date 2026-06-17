@@ -16,7 +16,7 @@ use super::plan::{
     UpdatePlan,
 };
 use super::planner::bind_column_references;
-use super::planner::{parse_limit, parse_where};
+use super::planner::{parse_limit_full, parse_where, LimitValue};
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
 * clause. If it evaluates to true, we build the new record with the updated value and insert.
@@ -96,9 +96,6 @@ pub fn prepare_update_plan(
 ) -> crate::Result<Plan> {
     if body.with.is_some() {
         bail_parse_error!("WITH clause is not supported");
-    }
-    if body.or_conflict.is_some() {
-        bail_parse_error!("ON CONFLICT clause is not supported");
     }
     let table_name = &body.tbl_name.name;
     #[cfg(not(feature = "index_experimental"))]
@@ -207,11 +204,27 @@ pub fn prepare_update_plan(
     )?;
 
     // Parse the LIMIT/OFFSET clause
-    let (limit, offset) = body
+    let (limit_val, offset_val) = body
         .limit
         .as_ref()
-        .map(|l| parse_limit(l))
-        .unwrap_or(Ok((None, None)))?;
+        .map(|l| parse_limit_full(l))
+        .unwrap_or(Ok((LimitValue::None, LimitValue::None)))?;
+    let limit = match &limit_val {
+        LimitValue::Literal(n) => Some(*n),
+        _ => None,
+    };
+    let offset = match &offset_val {
+        LimitValue::Literal(n) => Some(*n),
+        _ => None,
+    };
+    let limit_expr = match limit_val {
+        LimitValue::Expr(e) => Some(e),
+        _ => None,
+    };
+    let offset_expr = match offset_val {
+        LimitValue::Expr(e) => Some(e),
+        _ => None,
+    };
 
     // Check what indexes will need to be updated by checking set_clauses and see
     // if a column is contained in an index.
@@ -236,7 +249,10 @@ pub fn prepare_update_plan(
         order_by,
         limit,
         offset,
+        limit_expr,
+        offset_expr,
         contains_constant_false_condition: false,
         indexes_to_update,
+        or_conflict: body.or_conflict.clone(),
     }))
 }

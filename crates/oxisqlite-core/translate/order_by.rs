@@ -10,7 +10,7 @@ use crate::{
         builder::{CursorType, ProgramBuilder},
         insn::Insn,
     },
-    Result,
+    LimboError, Result,
 };
 
 use super::{
@@ -54,7 +54,11 @@ pub fn init_order_by(
         .map(|(expr, _)| match expr {
             ast::Expr::Collate(_, collation_name) => CollationSeq::new(collation_name).map(Some),
             ast::Expr::Column { table, column, .. } => {
-                let table = referenced_tables.find_table_by_internal_id(*table).unwrap();
+                let table = referenced_tables
+                    .find_table_by_internal_id(*table)
+                    .ok_or_else(|| {
+                        LimboError::InternalError("table not found by internal id".to_string())
+                    })?;
 
                 let Some(table_column) = table.get_column_at(*column) else {
                     crate::bail_parse_error!("column index out of bounds");
@@ -82,7 +86,10 @@ pub fn emit_order_by(
     t_ctx: &mut TranslateCtx,
     plan: &SelectPlan,
 ) -> Result<()> {
-    let order_by = plan.order_by.as_ref().unwrap();
+    let order_by = plan
+        .order_by
+        .as_ref()
+        .ok_or_else(|| LimboError::InternalError("order_by missing in plan".to_string()))?;
     let result_columns = &plan.result_columns;
     let sort_loop_start_label = program.allocate_label();
     let sort_loop_next_label = program.allocate_label();
@@ -138,7 +145,10 @@ pub fn emit_order_by(
     let SortMetadata {
         sort_cursor,
         reg_sorter_data,
-    } = *t_ctx.meta_sort.as_mut().unwrap();
+    } = *t_ctx
+        .meta_sort
+        .as_mut()
+        .ok_or_else(|| LimboError::InternalError("meta_sort not initialized".to_string()))?;
 
     program.emit_insn(Insn::OpenPseudo {
         cursor_id: pseudo_cursor,
@@ -163,7 +173,9 @@ pub fn emit_order_by(
     // We emit the columns in SELECT order, not sorter order (sorter always has the sort keys first).
     // This is tracked in m.result_column_indexes_in_orderby_sorter.
     let cursor_id = pseudo_cursor;
-    let start_reg = t_ctx.reg_result_cols_start.unwrap();
+    let start_reg = t_ctx
+        .reg_result_cols_start
+        .ok_or_else(|| LimboError::InternalError("reg_result_cols_start not set".to_string()))?;
     for i in 0..result_columns.len() {
         let reg = start_reg + i;
         program.emit_column(
@@ -199,7 +211,10 @@ pub fn order_by_sorter_insert(
     res_col_indexes_in_orderby_sorter: &mut Vec<usize>,
     plan: &SelectPlan,
 ) -> Result<()> {
-    let order_by = plan.order_by.as_ref().unwrap();
+    let order_by = plan
+        .order_by
+        .as_ref()
+        .ok_or_else(|| LimboError::InternalError("order_by missing in plan".to_string()))?;
     let order_by_len = order_by.len();
     let result_columns = &plan.result_columns;
     // If any result columns can be skipped due to being an exact duplicate of a sort key, we need to know which ones and their new index in the ORDER BY sorter.

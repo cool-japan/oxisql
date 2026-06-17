@@ -35,6 +35,7 @@ impl TableRefIdCounter {
     }
 }
 
+use super::insn::Cookie;
 use super::{BranchOffset, CursorID, Insn, InsnFunction, InsnReference, JumpTarget, Program};
 
 /// A key that uniquely identifies a cursor.
@@ -83,6 +84,9 @@ impl CursorKey {
 #[allow(dead_code)]
 pub struct ProgramBuilder {
     pub table_reference_counter: TableRefIdCounter,
+    /// Schema cookie read from the database header at plan-time.
+    /// Used by `emit_schema_change()` to increment the cookie on every DDL.
+    pub schema_cookie: u32,
     next_free_register: usize,
     next_free_cursor_id: usize,
     /// Instruction, the function to execute it with, and its original index in the vector.
@@ -154,6 +158,7 @@ impl ProgramBuilder {
     pub fn new(opts: ProgramBuilderOpts) -> Self {
         Self {
             table_reference_counter: TableRefIdCounter::new(),
+            schema_cookie: 0,
             next_free_register: 1,
             next_free_cursor_id: 0,
             insns: Vec::with_capacity(opts.approx_num_insns),
@@ -299,6 +304,20 @@ impl ProgramBuilder {
         // This seemingly empty trace here is needed so that a function span is emmited with it
         tracing::trace!("");
         self.insns.push((insn, function, self.insns.len()));
+    }
+
+    /// Emit a `SetCookie` instruction that increments the schema version by 1.
+    ///
+    /// Must be called for every DDL operation (CREATE/DROP TABLE, CREATE/DROP INDEX,
+    /// ALTER TABLE) so that other connections detect the schema change and reload
+    /// their in-memory schema caches.
+    pub fn emit_schema_change(&mut self) {
+        self.emit_insn(Insn::SetCookie {
+            db: 0,
+            cookie: Cookie::SchemaVersion,
+            value: self.schema_cookie.wrapping_add(1) as i32,
+            p5: 0,
+        });
     }
 
     pub fn close_cursors(&mut self, cursors: &[CursorID]) {
@@ -751,8 +770,14 @@ impl ProgramBuilder {
             self.preassign_label_to_next_insn(self.init_label);
 
             match txn_mode {
-                TransactionMode::Read => self.emit_insn(Insn::Transaction { write: false }),
-                TransactionMode::Write => self.emit_insn(Insn::Transaction { write: true }),
+                TransactionMode::Read => self.emit_insn(Insn::Transaction {
+                    write: false,
+                    schema_cookie: self.schema_cookie,
+                }),
+                TransactionMode::Write => self.emit_insn(Insn::Transaction {
+                    write: true,
+                    schema_cookie: self.schema_cookie,
+                }),
                 TransactionMode::None => {}
             }
 

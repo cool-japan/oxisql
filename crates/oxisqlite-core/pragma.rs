@@ -81,10 +81,18 @@ fn pragma_for(pragma: PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["user_version"],
         ),
+        ApplicationId => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["application_id"],
+        ),
         WalCheckpoint => Pragma::new(PragmaFlags::NeedSchema, &["busy", "log", "checkpointed"]),
         AutoVacuum => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["auto_vacuum"],
+        ),
+        Synchronous => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["synchronous"],
         ),
         IntegrityCheck => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::ReadOnly | PragmaFlags::Result0,

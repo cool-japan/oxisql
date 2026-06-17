@@ -465,6 +465,8 @@ pub enum Insn {
     /// Start a transaction.
     Transaction {
         write: bool,
+        /// Schema cookie this statement was compiled against. Verified in `op_transaction`.
+        schema_cookie: u32,
     },
 
     /// Set database auto-commit mode and potentially rollback.
@@ -972,6 +974,21 @@ pub enum Insn {
         exact: bool,
     },
 
+    /// Walk cursor `cursor_id` and compute the `sqlite_stat1` `stat` string.
+    ///
+    /// `num_cols` is the number of leading key columns to consider: `0` means a
+    /// plain table cursor (the result is just `"N"`), while a positive value
+    /// denotes an index cursor (the result is `"N a1 a2 … ak"`).
+    ///
+    /// The computed text is written into register `dest`. If the table/index is
+    /// empty (`N == 0`) a `NULL` is written instead, so the caller can skip the
+    /// row.
+    IdxStat {
+        cursor_id: CursorID,
+        num_cols: usize,
+        dest: usize,
+    },
+
     /// Do an analysis of the currently open database. Store in register (P1+1) the text of an error message describing any problems.
     /// If no problems are found, store a NULL in register (P1+1).
     /// The register (P1) contains one less than the maximum number of allowed errors.
@@ -1117,6 +1134,7 @@ impl Insn {
             Insn::Affinity { .. } => execute::op_affinity,
             Insn::IdxDelete { .. } => execute::op_idx_delete,
             Insn::Count { .. } => execute::op_count,
+            Insn::IdxStat { .. } => execute::op_idx_stat,
             Insn::IntegrityCk { .. } => execute::op_integrity_check,
             Insn::Savepoint { .. } => execute::op_savepoint,
         }
@@ -1140,4 +1158,7 @@ pub enum Cookie {
     UserVersion = 6,
     /// The auto-vacuum mode setting.
     IncrementalVacuum = 7,
+    /// The "Application ID" as read and set by the application_id pragma.
+    /// Corresponds to SQLite's `BTREE_APPLICATION_ID` (header offset 68).
+    ApplicationId = 8,
 }

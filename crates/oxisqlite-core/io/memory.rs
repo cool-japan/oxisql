@@ -59,7 +59,7 @@ impl IO for MemoryIO {
 
     fn generate_random_number(&self) -> i64 {
         let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).unwrap();
+        getrandom::getrandom(&mut buf).expect("getrandom failed");
         i64::from_ne_bytes(buf)
     }
 
@@ -168,6 +168,16 @@ impl File for MemoryFile {
 
     fn size(&self) -> Result<u64> {
         Ok(self.size.get() as u64)
+    }
+
+    fn truncate(&self, len: usize, c: Arc<Completion>) -> Result<()> {
+        // Drop any pages beyond the new length and shrink size.
+        let pages = unsafe { &mut *self.pages.get() };
+        let keep_pages = len.div_ceil(PAGE_SIZE);
+        pages.retain(|&page_no, _| page_no < keep_pages);
+        self.size.set(len);
+        c.complete(0);
+        Ok(())
     }
 }
 

@@ -39,6 +39,11 @@ pub fn translate_create_index(
     // Check if the index is being created on a valid btree table and
     // the name is globally unique in the schema.
     if !schema.is_unique_idx_name(&idx_name) {
+        if unique_if_not_exists.1 {
+            // IF NOT EXISTS: silently succeed when the index already exists.
+            program.epilogue(crate::translate::emitter::TransactionMode::None);
+            return Ok(program);
+        }
         crate::bail_parse_error!("Error: index with name '{idx_name}' already exists.");
     }
     let Some(tbl) = schema.tables.get(&tbl_name) else {
@@ -49,20 +54,25 @@ pub fn translate_create_index(
     };
     let columns = resolve_sorted_columns(&tbl, columns)?;
 
+    let mut index_columns = Vec::with_capacity(columns.len());
+    for ((pos_in_table, col), order) in &columns {
+        index_columns.push(IndexColumn {
+            name: col
+                .name
+                .as_ref()
+                .ok_or_else(|| crate::LimboError::InternalError("column name is None".to_string()))?
+                .clone(),
+            order: *order,
+            pos_in_table: *pos_in_table,
+            collation: col.collation,
+            default: col.default.clone(),
+        });
+    }
     let idx = Arc::new(Index {
         name: idx_name.clone(),
         table_name: tbl.name.clone(),
         root_page: 0, //  we dont have access till its created, after we parse the schema table
-        columns: columns
-            .iter()
-            .map(|((pos_in_table, col), order)| IndexColumn {
-                name: col.name.as_ref().unwrap().clone(),
-                order: *order,
-                pos_in_table: *pos_in_table,
-                collation: col.collation,
-                default: col.default.clone(),
-            })
-            .collect(),
+        columns: index_columns,
         unique: unique_if_not_exists.0,
         ephemeral: false,
         has_rowid: tbl.has_rowid,
@@ -75,7 +85,9 @@ pub fn translate_create_index(
     // 3. table_cursor_id         - table we are creating the index on
     // 4. sorter_cursor_id        - sorter
     // 5. pseudo_cursor_id        - pseudo table to store the sorted index values
-    let sqlite_table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_table = schema.get_btree_table(SQLITE_TABLEID).ok_or_else(|| {
+        crate::LimboError::InternalError("sqlite_schema table not found".to_string())
+    })?;
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
     let btree_cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(idx.clone()));
@@ -98,7 +110,7 @@ pub fn translate_create_index(
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
         name: sqlite_table.name.clone(),
     });
-    let sql = create_idx_stmt_to_sql(&tbl_name, &idx_name, unique_if_not_exists, &columns);
+    let sql = create_idx_stmt_to_sql(&tbl_name, &idx_name, unique_if_not_exists, &columns)?;
     emit_schema_entry(
         &mut program,
         sqlite_schema_cursor_id,
@@ -218,8 +230,7 @@ pub fn translate_create_index(
     // Keep schema table open to emit ParseSchema, close the other cursors.
     program.close_cursors(&[sorter_cursor_id, table_cursor_id, btree_cursor_id]);
 
-    // TODO: SetCookie for schema change
-    //
+    program.emit_schema_change();
     // Parse the schema table to get the index root page and add new index to Schema
     let parse_schema_where_clause = format!("name = '{}' AND type = 'index'", idx_name);
     program.emit_insn(Insn::ParseSchema {
@@ -265,7 +276,7 @@ fn create_idx_stmt_to_sql(
     idx_name: &str,
     unique_if_not_exists: (bool, bool),
     cols: &[((usize, &Column), SortOrder)],
-) -> String {
+) -> crate::Result<String> {
     let mut sql = String::with_capacity(128);
     sql.push_str("CREATE ");
     if unique_if_not_exists.0 {
@@ -283,13 +294,15 @@ fn create_idx_stmt_to_sql(
         if i > 0 {
             sql.push_str(", ");
         }
-        sql.push_str(col.1.name.as_ref().unwrap());
+        sql.push_str(col.1.name.as_ref().ok_or_else(|| {
+            crate::LimboError::InternalError("index column name is None".to_string())
+        })?);
         if *order == SortOrder::Desc {
             sql.push_str(" DESC");
         }
     }
     sql.push(')');
-    sql
+    Ok(sql)
 }
 
 pub fn translate_drop_index(
@@ -353,7 +366,9 @@ pub fn translate_drop_index(
     let row_id_reg = program.alloc_register();
 
     // We're going to use this cursor to search through sqlite_schema
-    let sqlite_table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_table = schema.get_btree_table(SQLITE_TABLEID).ok_or_else(|| {
+        crate::LimboError::InternalError("sqlite_schema table not found".to_string())
+    })?;
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
 
@@ -422,21 +437,15 @@ pub fn translate_drop_index(
 
     program.resolve_label(loop_end_label, program.offset());
 
-    /* TODO do set cookie for real
-    program.emit_insn(Insn::SetCookie {
-        ...
-    });
-    */
+    program.emit_schema_change();
 
-    // Destroy index btree
-    program.emit_insn(Insn::Destroy {
-        root: maybe_index.unwrap().root_page,
-        former_root_reg: 0,
-        is_temp: 0,
-    });
-
-    // Remove from the Schema any mention of the index
+    // Destroy index btree and remove from the Schema any mention of the index
     if let Some(idx) = maybe_index {
+        program.emit_insn(Insn::Destroy {
+            root: idx.root_page,
+            former_root_reg: 0,
+            is_temp: 0,
+        });
         program.emit_insn(Insn::DropIndex {
             index: idx.clone(),
             db: 0,

@@ -68,7 +68,12 @@ trait/type surface from `oxisql-core`.
 
 ## Roadmap / next
 - [ ] `system` feature for opt-in libpq legacy parity (Pure Rust stays the default)
-- [ ] Auto-create for Postgres / MySQL in `connect_or_create` (issue `CREATE DATABASE` when missing)
+- [x] Auto-create for Postgres / MySQL in `connect_or_create` (issue `CREATE DATABASE` when missing) (planned 2026-06-15)
+  - **Goal:** `oxisql::connect_or_create("postgres://…/appdb")` (and `mysql://…/appdb`) creates `appdb` if absent, then connects — matching the create-if-absent semantics embedded backends already have.
+  - **Design:** In `crates/oxisql/src/lib.rs::connect_or_create` (currently a pass-through to `connect`), for `postgres`/`mysql` schemes: attempt `connect`; if it fails with "database does not exist" (PG SQLSTATE `3D000`; MySQL error 1049 `ER_BAD_DB_ERROR`), parse the target db name from the URI, build a maintenance URI (PG → dbname `postgres`; MySQL → no database), connect, run `CREATE DATABASE "<name>"` with proper identifier quoting (PG double-quote, MySQL backtick; reject/escape embedded quotes — no injection), then connect to the original target. `CREATE DATABASE` runs outside a transaction (PG) via a simple/autocommit query. Embedded/sqlite behavior unchanged. Add pure helpers (`split_db_name`, `maintenance_uri`, `create_database_stmt`) unit-testable without a server.
+  - **Files:** `crates/oxisql/src/lib.rs`; tests in `crates/oxisql/tests/` (new `auto_create.rs` or extend `connect.rs`).
+  - **Tests:** unit — `pg_maintenance_uri`, `mysql_maintenance_uri`, `create_database_stmt_quotes_identifier`, `create_database_stmt_rejects_bad_identifier`, `split_db_name_*`. Integration (live server, `#[ignore]`-gated like the crate's existing pattern): `auto_create_pg_creates_then_connects`, `auto_create_mysql_creates_then_connects`.
+  - **Risk:** portable "db missing" detection across driver error types; `CREATE DATABASE` privilege + no-transaction constraint. Match the specific SQLSTATE/error code; document the privilege requirement. Live tests stay `#[ignore]`d; unit tests cover all server-independent logic.
 - [x] Connection-string query-parameter parsing (e.g. `?sslmode=require&pool_max=8`) folded into `ConnectOptions` (done 2026-06-10)
   - **Goal:** A URI like `sqlite://path?pool_max=8&connect_timeout=5` auto-configures the matching `ConnectOptions` fields; unknown keys are collected into an `extra` map.
   - **Design:** In `src/lib.rs`, after parsing the scheme/host/path, split the query string (`?key=val&…`) and match recognized keys (`sslmode`, `pool_max`, `connect_timeout`, `application_name`, …) onto the `ConnectOptions` builder. Unknown keys go into `ConnectOptions::extra: HashMap<String,String>`. No new runtime deps — pure string splitting.
@@ -90,3 +95,25 @@ None at the facade level. The facade is a thin, stable dispatch layer; backend
 caveats (e.g. SQLite-compat ROLLBACK / savepoints, live-server-gated Postgres /
 MySQL tests) live in the respective backend crates and the workspace README,
 not here.
+
+## Planned — oxisqlite engine ANALYZE + splitrs (2026-06-16)
+
+- [x] **Slice 1: ANALYZE writes `sqlite_stat1`** (planned 2026-06-16)
+  - **Goal:** `ANALYZE`, `ANALYZE main`, `ANALYZE <table>`, `ANALYZE <index>` create `sqlite_stat1` (if absent), clear the relevant prior rows, and write `(tbl, idx, stat)` rows where `stat = "N a1 a2 … ak"`. A no-index table yields `(tbl, NULL, "N")`; an empty table yields no row. Re-ANALYZE replaces, never duplicates.
+  - **Files:** `crates/oxisqlite-core/vdbe/insn.rs`, `vdbe/explain.rs`, `vdbe/execute.rs`, `storage/btree.rs`, `translate/analyze.rs` (new), `translate/mod.rs`; new `tests/analyze.rs` + `[[test]]` in `Cargo.toml`
+
+- [x] **Slice 2: Load `sqlite_stat1` + feed real stats into the System-R cost model** (planned 2026-06-16)
+  - **Goal:** After ANALYZE, the optimizer uses real per-table row counts and index selectivity instead of `ESTIMATED_HARDCODED_ROWS_PER_TABLE = 1_000_000`. Un-analyzed DBs are bit-for-bit unchanged.
+  - **Files:** `crates/oxisqlite-core/statistics.rs` (new), `schema.rs`, `util.rs`, `lib.rs`, `vdbe/execute.rs`, `translate/optimizer/{mod,cost,access_method,constraints,join}.rs`
+
+- [x] **Slice 3: `splitrs` split `schema.rs` (2022 lines → under 2000)** (planned 2026-06-16)
+  - **Goal:** `schema.rs` and every product module < 2000 lines; public API unchanged; all tests + clippy green.
+  - **Files:** `crates/oxisqlite-core/schema.rs` → new `schema/` module tree
+
+- [x] **Slice 4: `splitrs` split `vdbe/execute.rs` (8467 lines → under 2000)** (planned 2026-06-16)
+  - **Goal:** `vdbe/execute.rs` and every product module < 2000 lines; op_* handler dispatch intact.
+  - **Files:** `crates/oxisqlite-core/vdbe/execute.rs` → new `vdbe/execute/` module tree
+
+- [~] **Slice 5: `splitrs` split `storage/btree.rs` (8715 lines → under 2000)** (planned 2026-06-16)
+  - **Goal:** `storage/btree.rs` and every product module < 2000 lines; BTreeCursor API intact.
+  - **Files:** `crates/oxisqlite-core/storage/btree.rs` → new `storage/btree/` module tree

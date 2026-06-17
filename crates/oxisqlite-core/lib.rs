@@ -94,6 +94,7 @@ mod pragma;
 mod pseudo;
 pub mod result;
 mod schema;
+mod statistics;
 mod storage;
 mod translate;
 pub mod types;
@@ -206,9 +207,14 @@ impl Database {
         enable_mvcc: bool,
     ) -> Result<Arc<Database>> {
         let file = io.open_file(path, flags, true)?;
-        maybe_init_database_file(&file, &io)?;
+        // `db_freshly_created` is true when the main database file did not exist
+        // (or was empty) and we just wrote its bootstrap page. In that case any
+        // `-wal` file found alongside it is an orphan from a previous database
+        // incarnation and must NOT be replayed (doing so resurrects stale
+        // committed data — see `WalFileShared::open_shared`).
+        let db_freshly_created = maybe_init_database_file(&file, &io)?;
         let db_file = Arc::new(DatabaseFile::new(file));
-        Self::open_with_flags(io, path, db_file, flags, enable_mvcc)
+        Self::open_with_flags_inner(io, path, db_file, flags, enable_mvcc, db_freshly_created)
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -229,13 +235,33 @@ impl Database {
         flags: OpenFlags,
         enable_mvcc: bool,
     ) -> Result<Arc<Database>> {
+        // Callers that supply their own `db_file` (custom storage backends,
+        // tests) take responsibility for WAL lifecycle, so we conservatively
+        // treat the database as pre-existing (never discard a WAL here).
+        Self::open_with_flags_inner(io, path, db_file, flags, enable_mvcc, false)
+    }
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn open_with_flags_inner(
+        io: Arc<dyn IO>,
+        path: &str,
+        db_file: Arc<dyn DatabaseStorage>,
+        flags: OpenFlags,
+        enable_mvcc: bool,
+        db_freshly_created: bool,
+    ) -> Result<Arc<Database>> {
         let db_header = Pager::begin_open(db_file.clone())?;
         // ensure db header is there
         io.run_once()?;
 
         let page_size = db_header.lock().get_page_size();
         let wal_path = format!("{}-wal", path);
-        let shared_wal = WalFileShared::open_shared(&io, wal_path.as_str(), page_size)?;
+        let shared_wal = WalFileShared::open_shared_inner(
+            &io,
+            wal_path.as_str(),
+            page_size,
+            db_freshly_created,
+        )?;
 
         DATABASE_VERSION.get_or_init(|| {
             let version = db_header.lock().version_number;
@@ -268,18 +294,30 @@ impl Database {
         {
             // parse schema
             let conn = db.connect()?;
-            let rows = conn.query("SELECT * FROM sqlite_schema")?;
-            let mut schema = schema
-                .try_write()
-                .expect("lock on schema should succeed first try");
-            let syms = conn.syms.borrow();
-            if let Err(LimboError::ExtensionError(e)) =
-                parse_schema_rows(rows, &mut schema, io, &syms, None)
+            // The header was read straight from the main database file above,
+            // bypassing the WAL. If a previous session committed a page-1 change
+            // (e.g. `PRAGMA application_id` / `PRAGMA user_version`) to the WAL
+            // without checkpointing it back into the main file, that change is
+            // durable in the WAL but absent from the freshly-read header. Resolve
+            // page 1 through the now-recovered WAL so the shared header reflects
+            // the latest committed cookie values before any query runs.
+            conn.pager.refresh_header_from_wal()?;
             {
-                // this means that a vtab exists and we no longer have the module loaded. we print
-                // a warning to the user to load the module
-                eprintln!("Warning: {}", e);
-            }
+                let rows = conn.query("SELECT * FROM sqlite_schema")?;
+                let mut schema = schema
+                    .try_write()
+                    .expect("lock on schema should succeed first try");
+                let syms = conn.syms.borrow();
+                if let Err(LimboError::ExtensionError(e)) =
+                    parse_schema_rows(rows, &mut schema, io, &syms, None)
+                {
+                    // this means that a vtab exists and we no longer have the module loaded. we print
+                    // a warning to the user to load the module
+                    eprintln!("Warning: {}", e);
+                }
+            } // schema write guard + syms dropped here
+              // Load persisted ANALYZE statistics (no-op for un-analyzed databases).
+            conn.load_persistent_stats()?;
         }
         Ok(db)
     }
@@ -316,6 +354,7 @@ impl Database {
             total_changes: Cell::new(0),
             _shared_cache: false,
             cache_size: Cell::new(self.header.lock().default_page_cache_size),
+            closed: Cell::new(false),
         });
         if let Err(e) = conn.register_builtins() {
             return Err(LimboError::ExtensionError(e));
@@ -349,7 +388,16 @@ impl Database {
     }
 }
 
-pub fn maybe_init_database_file(file: &Arc<dyn File>, io: &Arc<dyn IO>) -> Result<()> {
+/// Initialize a brand-new database file (write the bootstrap page 1) if the
+/// file is empty.
+///
+/// Returns `true` when the file was freshly created (its size was 0 before this
+/// call wrote the bootstrap header), and `false` when an existing, non-empty
+/// database file was opened. Callers use this to detect the
+/// "fresh main DB file + pre-existing `-wal`" situation, where the WAL is
+/// orphaned from a previous database incarnation and MUST NOT be replayed (see
+/// [`storage::wal::WalFileShared::open_shared`]).
+pub fn maybe_init_database_file(file: &Arc<dyn File>, io: &Arc<dyn IO>) -> Result<bool> {
     if file.size()? == 0 {
         // init db
         let db_header = DatabaseHeader::default();
@@ -402,8 +450,11 @@ pub fn maybe_init_database_file(file: &Arc<dyn File>, io: &Arc<dyn IO>) -> Resul
                 }
             }
         }
-    };
-    Ok(())
+        // The file was empty and has just been initialized: it is a brand-new
+        // database, so any pre-existing WAL belongs to a previous incarnation.
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 pub struct Connection {
@@ -420,6 +471,9 @@ pub struct Connection {
     syms: RefCell<SymbolTable>,
     _shared_cache: bool,
     cache_size: Cell<i32>,
+    /// Set once the connection has been checkpoint-closed (via `close()` or
+    /// `Drop`) so the work is not repeated.
+    closed: Cell<bool>,
 }
 
 impl Connection {
@@ -643,8 +697,17 @@ impl Connection {
         Ok(checkpoint_result)
     }
 
-    /// Close a connection and checkpoint.
+    /// Run a checkpoint in TRUNCATE mode (resets the WAL file to empty).
+    pub fn checkpoint_truncate(&self) -> Result<CheckpointResult> {
+        self.pager.wal_checkpoint_mode(CheckpointMode::Truncate)
+    }
+
+    /// Close a connection, checkpointing and truncating the WAL so the database
+    /// file is self-contained. Idempotent: a second call is a no-op.
     pub fn close(&self) -> Result<()> {
+        if self.closed.replace(true) {
+            return Ok(());
+        }
         self.pager.checkpoint_shutdown()
     }
 
@@ -710,11 +773,11 @@ impl Connection {
 
     pub fn parse_schema_rows(self: &Arc<Connection>) -> Result<()> {
         let rows = self.query("SELECT * FROM sqlite_schema")?;
-        let mut schema = self
-            .schema
-            .try_write()
-            .expect("lock on schema should succeed first try");
         {
+            let mut schema = self
+                .schema
+                .try_write()
+                .expect("lock on schema should succeed first try");
             let syms = self.syms.borrow();
             if let Err(LimboError::ExtensionError(e)) =
                 parse_schema_rows(rows, &mut schema, self.pager.io.clone(), &syms, None)
@@ -723,7 +786,25 @@ impl Connection {
                 // a warning to the user to load the module
                 eprintln!("Warning: {}", e);
             }
-        }
+        } // schema write guard dropped here
+        self.load_persistent_stats()?;
+        Ok(())
+    }
+
+    /// Load persisted `ANALYZE` statistics (`sqlite_stat1`) into the schema's
+    /// in-memory side-map. No-op (bit-for-bit unchanged) when `sqlite_stat1`
+    /// does not exist, i.e. for databases that have never been analyzed.
+    pub fn load_persistent_stats(self: &Arc<Connection>) -> Result<()> {
+        {
+            let schema = self.schema.read();
+            if schema.get_table("sqlite_stat1").is_none() {
+                return Ok(());
+            }
+        } // read lock dropped before preparing / write-locking (no deadlock)
+        let rows = self.query("SELECT tbl, idx, stat FROM sqlite_stat1")?;
+        let mut schema = self.schema.write();
+        schema.stats.clear();
+        crate::util::load_stat1(rows, &mut schema, self.pager.io.clone(), None)?;
         Ok(())
     }
 
@@ -830,6 +911,20 @@ impl Connection {
         }
 
         Ok(results)
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // Best-effort clean close: checkpoint + truncate the WAL so a clean
+        // process exit leaves the `.db` self-contained for a byte-level reader.
+        // This must never panic or propagate errors from a destructor.
+        if self.closed.replace(true) {
+            return;
+        }
+        if let Err(e) = self.pager.checkpoint_shutdown() {
+            tracing::warn!("Connection::drop best-effort checkpoint failed: {e}");
+        }
     }
 }
 

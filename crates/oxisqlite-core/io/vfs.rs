@@ -160,6 +160,14 @@ impl File for VfsFileImpl {
             Ok(result as u64)
         }
     }
+
+    fn truncate(&self, _len: usize, c: Arc<Completion>) -> Result<()> {
+        // External VFS plugins do not expose a truncate hook in the current ABI;
+        // completing without shrinking is safe because the WAL header rewrite
+        // already invalidates leftover frames via salt mismatch.
+        c.complete(0);
+        Ok(())
+    }
 }
 
 impl Drop for VfsMod {

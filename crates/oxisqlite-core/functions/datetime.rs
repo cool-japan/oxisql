@@ -48,7 +48,8 @@ enum DateTimeOutput {
 
 fn exec_datetime(values: &[Register], output_type: DateTimeOutput) -> Value {
     if values.is_empty() {
-        let now = parse_naive_date_time(&Value::build_text("now")).unwrap();
+        let now = parse_naive_date_time(&Value::build_text("now"))
+            .expect("'now' always parses successfully");
         return format_dt(now, output_type, false);
     }
     if let Some(mut dt) = parse_naive_date_time(values[0].get_owned_value()) {
@@ -178,18 +179,20 @@ fn apply_modifier(dt: &mut NaiveDateTime, modifier: &str) -> Result<bool> {
         Modifier::Floor => todo!(),
         Modifier::StartOfMonth => {
             *dt = NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1)
-                .unwrap()
+                .ok_or_else(|| InvalidModifier("Invalid start of month date".to_string()))?
                 .and_hms_opt(0, 0, 0)
-                .unwrap();
+                .ok_or_else(|| InvalidModifier("Invalid time 00:00:00".to_string()))?;
         }
         Modifier::StartOfYear => {
             *dt = NaiveDate::from_ymd_opt(dt.year(), 1, 1)
-                .unwrap()
+                .ok_or_else(|| InvalidModifier("Invalid start of year date".to_string()))?
                 .and_hms_opt(0, 0, 0)
-                .unwrap();
+                .ok_or_else(|| InvalidModifier("Invalid time 00:00:00".to_string()))?;
         }
         Modifier::StartOfDay => {
-            *dt = dt.date().and_hms_opt(0, 0, 0).unwrap();
+            *dt = dt.date().and_hms_opt(0, 0, 0).ok_or_else(|| {
+                InvalidModifier("Invalid time 00:00:00 for start of day".to_string())
+            })?;
         }
         Modifier::Weekday(day) => {
             let current_day = dt.weekday().num_days_from_sunday();
@@ -206,11 +209,20 @@ fn apply_modifier(dt: &mut NaiveDateTime, modifier: &str) -> Result<bool> {
         }
         Modifier::Utc => {
             // TODO: handle datetime('now', 'utc') no-op
-            let local_dt = chrono::Local.from_local_datetime(dt).unwrap();
+            let local_dt = chrono::Local
+                .from_local_datetime(dt)
+                .single()
+                .ok_or_else(|| {
+                    InvalidModifier(
+                        "Ambiguous or invalid local datetime for UTC conversion".to_string(),
+                    )
+                })?;
             *dt = local_dt.with_timezone(&Utc).naive_utc();
         }
         Modifier::Subsec => {
-            *dt = dt.with_nanosecond(dt.nanosecond()).unwrap();
+            *dt = dt.with_nanosecond(dt.nanosecond()).ok_or_else(|| {
+                InvalidModifier("Invalid nanosecond value for subsec".to_string())
+            })?;
             return Ok(true);
         }
     }
@@ -408,7 +420,11 @@ fn get_date_time_from_time_value_string(value: &str) -> Option<NaiveDateTime> {
 
     // First, try to parse as date-only format
     if let Ok(date) = NaiveDate::parse_from_str(value, date_only_format) {
-        return Some(date.and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap()));
+        return Some(
+            date.and_time(
+                NaiveTime::from_hms_opt(0, 0, 0).expect("00:00:00 is always a valid time"),
+            ),
+        );
     }
 
     for format in &datetime_formats {
@@ -477,8 +493,8 @@ fn is_leap_second(dt: &NaiveDateTime) -> bool {
 fn get_max_datetime_exclusive() -> NaiveDateTime {
     // The maximum date in SQLite is 9999-12-31
     NaiveDateTime::new(
-        NaiveDate::from_ymd_opt(10000, 1, 1).unwrap(),
-        NaiveTime::from_hms_milli_opt(00, 00, 00, 000).unwrap(),
+        NaiveDate::from_ymd_opt(10000, 1, 1).expect("10000-01-01 is a valid date"),
+        NaiveTime::from_hms_milli_opt(00, 00, 00, 000).expect("00:00:00.000 is a valid time"),
     )
 }
 

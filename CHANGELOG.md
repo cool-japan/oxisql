@@ -7,6 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-17
+
+### Added
+
+#### ANALYZE statement (`oxisqlite-core`)
+- Full `ANALYZE [target]` statement support that writes cardinality statistics to `sqlite_stat1` (`CREATE TABLE sqlite_stat1(tbl,idx,stat)`).
+- `translate_analyze` in `translate/analyze.rs` generates bytecode that: creates `sqlite_stat1` if absent, clears prior rows for the target, walks each table/index b-tree via the new `Insn::IdxStat` opcode, inserts fresh `(tbl, idx, stat)` rows, bumps the schema cookie, and re-parses the schema.
+- `ANALYZE` — bare, `ANALYZE main`, `ANALYZE <table>`, `ANALYZE <index>` — all forms supported with correct `ClearMode` semantics.
+- `Insn::IdxStat { cursor_id, num_cols, dest }` opcode in `vdbe/insn.rs`; `op_idx_stat` handler in `vdbe/execute/txn_schema.rs` walks the b-tree and writes `"N a1 … ak"` statistics strings (NULL for empty tables/indexes so inserts are skipped).
+- 6 integration tests in `crates/oxisqlite-core/tests/analyze.rs` covering: row-count write, empty-table skip, re-analyze replaces stale rows, named-table targeting, error on unknown table, and query-correctness check via the in-memory stats side-map.
+
+#### System-R optimizer with real ANALYZE statistics (`oxisqlite-core`)
+- `SchemaStats` side-map (`statistics.rs`) — in-memory mirror of `sqlite_stat1`, loaded after schema parsing; exposes `num_rows(table)` and `index_stats(table, index)`.
+- `parse_stat1_line` utility parses SQLite's `"N a1 … ak"` format (tolerates trailing non-integer tokens such as `unordered`); 8 unit tests inline.
+- `Schema` gains a `stats: SchemaStats` field; `load_persistent_stats()` on `Connection` populates it by scanning `sqlite_stat1` after the schema is loaded — completely backwards compatible (empty map preserves the old hardcoded-estimate code path).
+- `estimate_cost_for_scan_or_seek` in `translate/optimizer/cost.rs` updated to accept `base_row_count: f64` and `index_stats: Option<&[i64]>`; when stats are present the equality-prefix selectivity is derived from `avg_rows_per_distinct / base_row_count` instead of the per-column selectivity product, giving the System-R planner real cardinality estimates.
+- `optimize_table_access` passes `schema.stats` down through `constraints_from_where_clause` to the cost estimator; databases without an ANALYZE run are unaffected (stats are `None` → hardcoded estimates preserved bit-for-bit).
+- `db_tests` module in `statistics.rs` provides an end-to-end proof that `ANALYZE` populates `conn.schema.stats` with the correct row count.
+
+#### `application_id` and `synchronous` pragmas (`oxisqlite-core`)
+- `PRAGMA application_id [= N]` — read and set the 32-bit application-ID header field (cookie offset 68); new `Cookie::ApplicationId` variant in `vdbe/insn.rs`.
+- `PRAGMA synchronous [= N]` — read/set WAL synchronous-mode flag; now registered in the pragma table.
+
+#### Schema module split via splitrs (`oxisqlite-core`)
+- `schema.rs` (1 920 lines) replaced by a 7-module sub-tree: `schema/mod.rs`, `schema/bootstrap.rs`, `schema/column.rs`, `schema/container.rs`, `schema/index.rs`, `schema/table.rs`, `schema/tests.rs`. All public types re-exported from `schema/mod.rs`; no API breakage.
+
+#### VDBE execute module split via splitrs (`oxisqlite-core`)
+- `vdbe/execute.rs` (8 361 lines) replaced by a 10-module sub-tree: `execute/mod.rs`, `execute/aggregate.rs`, `execute/arith_logic.rs`, `execute/cursor.rs`, `execute/function.rs`, `execute/mutate.rs`, `execute/numeric.rs`, `execute/txn_schema.rs`, `execute/values.rs`, `execute/tests.rs`.
+- `values.rs` consolidates all `Value::exec_*` methods (`exec_lower`, `exec_upper`, `exec_length`, `exec_octet_length`, `exec_sign`, `exec_soundex`, regex operations, math functions, etc.) as inherent `Value` methods — previously scattered inline across `execute.rs`.
+- `txn_schema.rs` consolidates transaction, savepoint, cookie, checkpoint, `ParseSchema`, `IntegrityCheck`, and the new `op_idx_stat` opcode handlers.
+
+#### UPSERT `ON CONFLICT DO UPDATE` (`oxisqlite-core`)
+- `translate/upsert.rs` — `emit_upsert_do_update` helper extracted from `translate/insert.rs` to keep both files under the 2000-line workspace policy.
+- Integration tests in `crates/oxisqlite-core/tests/upsert.rs` and `crates/oxisql-sqlite-compat/tests/` for UPSERT and schema versioning scenarios.
+
+#### Conflict-clause handling (`oxisqlite-core`)
+- 5 integration tests in `crates/oxisqlite-core/tests/conflict.rs`: `INSERT OR FAIL`, `INSERT OR ABORT`, `INSERT OR ROLLBACK`, `INSERT OR IGNORE`, and the default-ABORT behaviour.
+
+#### Correlated sub-query tests (`oxisqlite-core`)
+- 19 integration tests in `crates/oxisqlite-core/tests/correlated.rs` covering scalar, `EXISTS`, `NOT EXISTS`, `IN`, `NOT IN`, nested, and multi-subquery patterns including an arithmetic-context regression.
+
+#### Durability & WAL tests (`oxisqlite-core`)
+- `crates/oxisqlite-core/tests/durability.rs` — file-backed durability tests exercising WAL commit/crash-recovery.
+
+#### Schema-cookie and LIMIT/params tests (`oxisqlite-core`)
+- `crates/oxisqlite-core/tests/schema_cookie.rs` — schema-cookie bump and reprepare lifecycle tests.
+- `crates/oxisqlite-core/tests/limit_params.rs` — LIMIT/OFFSET with bound parameters.
+
+#### `CREATE INDEX IF NOT EXISTS` (`oxisqlite-core`)
+- `translate_create_index` now respects the `IF NOT EXISTS` flag: silently succeeds when the index already exists rather than raising a parse error.
+
+#### Schema-change cookie emission (`oxisqlite-core`)
+- `program.emit_schema_change()` added after DDL operations in `translate/alter.rs` (ADD COLUMN, RENAME COLUMN, RENAME TABLE, DROP COLUMN), `translate/index.rs` (CREATE INDEX, DROP INDEX), and `translate/analyze.rs` — ensures the schema cookie is bumped and cached compiled statements are invalidated consistently.
+
+#### Transparent schema re-prepare in statement cache (`oxisql-sqlite-compat`)
+- `exec_rewritten` in `oxisql-sqlite-compat/src/connection.rs` now catches `SchemaChanged` errors from the engine, discards the stale compiled program, re-prepares against the refreshed schema, and retries exactly once — replacing the fragile `is_ddl` keyword-prefix heuristic that failed on comment-prefixed DDL and left DML statements stale after schema changes.
+- `schema_reprepare.rs` test suite (`crates/oxisql-sqlite-compat/tests/schema_reprepare.rs`) with tests for: comment-prefixed DDL replay, DML reuse after schema change, `CREATE INDEX` invalidation, and `ALTER TABLE` invalidation.
+
+#### `connect_or_create` — auto-create missing databases (`oxisql`)
+- New `connect_or_create(uri)` façade function connects to the target URI; when the database does not yet exist on a wire-protocol backend (PostgreSQL/MySQL) it issues `CREATE DATABASE <name>`, then connects to the freshly created database.
+- `split_db_name` helper parses any `scheme://authority/db?query` URI into `(authority, db_name)`.
+- `CreateScheme` enum classifies `postgres://` / `postgresql://` vs `mysql://` schemes.
+- Integration tests in `crates/oxisql/tests/auto_create.rs` (ignored by default; require a running server).
+
+#### Blocking connection API (`oxisql-sqlite-compat`)
+- `BlockingSqliteConnection` — synchronous (non-async) wrapper around `SqliteConnection` via a single-threaded `tokio` runtime; exposes `execute`, `query`, `begin`, `commit`, `rollback`.
+- `blocking.rs` test suite covering basic CRUD, transaction commit/rollback, and multi-row queries.
+
+#### Orphaned WAL protection (`oxisqlite-core`)
+- `maybe_init_database_file` now returns `bool` indicating whether the database file was freshly created; `Database::open_file` passes this flag to `WalFileShared::open_shared_inner`.
+- `WalFileShared::open_shared_inner` discards (truncates) any pre-existing WAL when the main database file was freshly created, preventing stale WAL frames from a previous database incarnation from being replayed.
+
+#### WAL header refresh on open (`oxisqlite-core`)
+- `conn.pager.refresh_header_from_wal()` called during `Database::open_*` after WAL recovery to ensure the in-memory header reflects the latest committed cookie values (e.g. `application_id`, `user_version`) that may have been committed to the WAL without a checkpoint.
+
+#### `checkpoint_truncate` API (`oxisqlite-core`)
+- `Connection::checkpoint_truncate()` exposes a TRUNCATE-mode WAL checkpoint, resetting the WAL file to empty.
+- `Connection::close()` is now idempotent (guarded by a `closed: Cell<bool>` flag).
+
+### Changed
+- **Version bump 0.1.2 → 0.2.0** across the entire workspace (`[workspace.package].version` in root `Cargo.toml`); all intra-workspace dependency version strings updated accordingly.
+- `Schema` struct gains a `stats: SchemaStats` field (default-constructed; zero-cost when ANALYZE has never run).
+- `optimize_table_access` signature changed from `available_indexes: &HashMap<…>` to `schema: &Schema` to pass statistics through to the cost estimator.
+- `estimate_cost_for_scan_or_seek` signature extended with `base_row_count: f64` and `index_stats: Option<&[i64]>` parameters; all callers updated.
+- `Transaction { write }` instruction now carries `schema_cookie` for correct cookie-mismatch detection in `BEGIN IMMEDIATE` / `EXCLUSIVE`.
+
+### Fixed
+- `CREATE INDEX … IF NOT EXISTS` no longer raises a parse error when the index already exists.
+- `ALTER TABLE` (ADD COLUMN, RENAME COLUMN, RENAME TABLE, DROP COLUMN) and `CREATE/DROP INDEX` now correctly bump the schema cookie, preventing stale cached statements from being reused across DDL boundaries.
+- Comment-prefixed DDL statements (e.g. `/* migration 0001 */ CREATE TABLE …`) no longer silently corrupt the statement cache — the new SchemaChanged-based re-prepare path handles them correctly.
+- Opening a new database file alongside an orphaned `-wal` file no longer replays stale WAL frames from a previous database; the orphaned WAL is discarded and a fresh WAL is started.
+- WAL-committed `PRAGMA application_id` / `PRAGMA user_version` changes are now visible immediately after open (previously required a checkpoint to become visible via `PRAGMA` reads).
+
+---
+
 ## [0.1.2] - 2026-06-10
 
 ### Added
@@ -198,7 +293,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Statement cache infrastructure: 128-slot LRU cache keyed by rewritten SQL text is in
   place; activates once limbo fixes the `Statement::reset()` / `Program::n_change` bug.
 
-[Unreleased]: https://github.com/cool-japan/oxisql/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/cool-japan/oxisql/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/cool-japan/oxisql/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/cool-japan/oxisql/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/cool-japan/oxisql/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/cool-japan/oxisql/releases/tag/v0.1.0

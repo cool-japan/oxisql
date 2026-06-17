@@ -36,9 +36,20 @@ impl<'a> AccessMethod<'a> {
         self.constraint_refs.is_empty()
     }
 
-    pub fn new_table_scan(input_cardinality: f64, iter_dir: IterationDirection) -> Self {
+    pub fn new_table_scan(
+        base_row_count: f64,
+        input_cardinality: f64,
+        iter_dir: IterationDirection,
+    ) -> Self {
         Self {
-            cost: estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality),
+            cost: estimate_cost_for_scan_or_seek(
+                None,
+                &[],
+                &[],
+                input_cardinality,
+                base_row_count,
+                None,
+            ),
             iter_dir,
             index: None,
             constraint_refs: &[],
@@ -55,8 +66,11 @@ pub fn find_best_access_method_for_join_order<'a>(
     input_cardinality: f64,
 ) -> Result<AccessMethod<'a>> {
     let table_no = join_order.last().unwrap().table_id;
-    let mut best_access_method =
-        AccessMethod::new_table_scan(input_cardinality, IterationDirection::Forwards);
+    let mut best_access_method = AccessMethod::new_table_scan(
+        rhs_constraints.base_row_count,
+        input_cardinality,
+        IterationDirection::Forwards,
+    );
     let rowid_column_idx = rhs_table.columns().iter().position(|c| c.is_rowid_alias);
 
     // Estimate cost for each candidate index (including the rowid index) and replace best_access_method if the cost is lower.
@@ -83,6 +97,8 @@ pub fn find_best_access_method_for_join_order<'a>(
             &rhs_constraints.constraints,
             &usable_constraint_refs,
             input_cardinality,
+            rhs_constraints.base_row_count,
+            candidate.index_stats.as_deref(),
         );
 
         // All other things being equal, prefer an access method that satisfies the order target.

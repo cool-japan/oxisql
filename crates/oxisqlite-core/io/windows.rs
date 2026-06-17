@@ -120,4 +120,11 @@ impl File for WindowsFile {
         let file = self.file.borrow();
         Ok(file.metadata().unwrap().len())
     }
+
+    fn truncate(&self, len: usize, c: Arc<Completion>) -> Result<()> {
+        let file = self.file.borrow_mut();
+        file.set_len(len as u64).map_err(LimboError::IOError)?;
+        c.complete(0);
+        Ok(())
+    }
 }

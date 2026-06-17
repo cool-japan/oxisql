@@ -13,13 +13,21 @@ categories = ["database"]
 
 [dependencies]
 oxisql-core = { workspace = true }
-limbo       = { package = "oxisqlite", path = "../oxisqlite", version = "0.1.0", features = ["index_experimental"] }
+limbo       = { package = "oxisqlite", path = "../oxisqlite", version = "0.2.0", features = ["index_experimental"] }
 async-trait = { workspace = true }
 thiserror   = { workspace = true }
 tokio       = { workspace = true }
 log         = { workspace = true }
 lru         = { workspace = true }
 chrono      = { workspace = true }
+
+[features]
+## Enable synchronous (blocking) wrappers around [`SqliteConnection`].
+##
+## Each blocking method drives the underlying async API to completion via a
+## freshly-built `current_thread` Tokio runtime.  Useful for integrating
+## OxiSQL into non-async code paths.
+blocking = []
 
 [dev-dependencies]
 tokio.workspace = true

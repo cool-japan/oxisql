@@ -17,7 +17,7 @@ path. OxiSQL collapses these into one facade, defaults to Pure Rust drivers
 and routes all TLS through OxiTLS with the rustcrypto provider (no `ring`, no
 `openssl-sys`).
 
-As of 0.1.2 the SQLite path is **genuinely C-free**. It is served by an in-tree
+As of 0.2.0 the SQLite path is **genuinely C-free**. It is served by an in-tree
 fork of the limbo engine (`oxisqlite-*`) from which every C touchpoint has been
 removed — no `libsqlite3`, no `mimalloc`, no `lemon` parser generator. The
 default build of the entire workspace compiles cleanly with the C compiler
@@ -28,13 +28,13 @@ CC=/usr/bin/false cargo build --workspace   # → exit 0
 cargo build --workspace                      # → 0 warnings
 ```
 
-**Version 0.1.2 — released 2026-06-10.**
-17 workspace crates · 1,851 tests passing · 0 failing · 0 clippy warnings.
-~118,234 lines of Rust across 323 source files.
+**Version 0.2.0 — 2026-06-17.**
+19 workspace crates · 1,997 tests passing · 0 failing · 0 clippy warnings.
+~132,777 lines of Rust across 371 source files.
 
 ---
 
-## What's new in 0.1.2
+## What's new in 0.2.0
 
 - **C-free oxisqlite engine fork.** The SQLite-compatible path no longer pulls in
   any C code. A vendored, de-C'd fork of limbo 0.0.22 (`oxisqlite`,
@@ -48,6 +48,30 @@ cargo build --workspace                      # → 0 warnings
   helper was replaced by an inline pure-Rust implementation, license auditing
   (`cargo deny`) passes, a root [`NOTICE`](NOTICE) records the full fork lineage,
   and the TLS stack is patched against RUSTSEC-2026-0104 (CRL-parsing panic).
+- **ANALYZE statement + System-R optimizer with real statistics.** `ANALYZE`,
+  `ANALYZE <table>`, and `ANALYZE <index>` write cardinality rows to
+  `sqlite_stat1`; the query optimizer consumes them via the new `SchemaStats`
+  side-map, replacing hardcoded estimates. Un-analyzed databases are unaffected
+  (backwards compatible). 6 ANALYZE integration tests + end-to-end stats test.
+- **UPSERT `ON CONFLICT DO UPDATE/DO NOTHING` fully implemented.** All forms of
+  `INSERT … ON CONFLICT (target) DO UPDATE SET … [WHERE …]` and `DO NOTHING`
+  work, including `excluded.*` reads, multi-row inserts, and the
+  `index_experimental` unique-index-target path.
+- **VDBE execute module split (8 361 → 10 sub-modules).** `vdbe/execute.rs` was
+  split via `splitrs` into a 10-file `vdbe/execute/` subtree; `values.rs`
+  consolidates all `Value::exec_*` methods.
+- **Schema module split (1 920 → 7 sub-modules).** `schema.rs` was split via
+  `splitrs` into `schema/mod.rs`, `schema/bootstrap.rs`, `schema/column.rs`,
+  `schema/container.rs`, `schema/index.rs`, `schema/table.rs`, `schema/tests.rs`.
+- **Schema-cookie invalidation + transparent re-prepare.** DDL now bumps the
+  schema cookie; stale cached statements raise `SchemaChanged`; the compat layer
+  re-prepares and retries transparently (replacing the fragile `is_ddl` heuristic).
+- **Blocking API + `connect_or_create`.** `BlockingSqliteConnection` provides a
+  synchronous wrapper; `connect_or_create(uri)` auto-creates missing PostgreSQL/MySQL
+  databases.
+- **Correlated subqueries, conflict-clause tests, durability tests.** 19 correlated
+  subquery tests, 5 conflict-clause tests, WAL durability tests, schema-cookie tests,
+  and LIMIT/OFFSET bound-parameter tests all added.
 
 ---
 
@@ -78,8 +102,8 @@ cargo build --workspace                      # → 0 warnings
 
 ## Crate Status
 
-OxiSQL ships as **17 workspace crates**: 10 facade/driver crates and a 7-crate,
-C-free `oxisqlite-*` engine.
+OxiSQL ships as **19 workspace crates**: 10 facade/driver crates, a 7-crate,
+C-free `oxisqlite-*` engine, plus a `perf` benchmark crate and a vendored `rustls-rustcrypto-patched` TLS patch.
 
 ### Facade & drivers (10)
 
@@ -94,7 +118,7 @@ C-free `oxisqlite-*` engine.
 | `oxisql-datafusion` | Alpha | 57 (+4) | Apache DataFusion `TableProvider` bridge |
 | `oxisql-pool` | Stable | 57 (+4 live-gated) | deadpool-based pooling for all backends |
 | `oxisql-migrate` | Stable | 37 | File-based SQL migrations, 14-digit timestamps |
-| `oxisql-sqlite-compat` | Alpha | 61 (+1 FK-DDL) | C-free SQLite engine on top of `oxisqlite-*`; **ROLLBACK now supported**; LRU stmt cache |
+| `oxisql-sqlite-compat` | Alpha | 85 | C-free SQLite engine on top of `oxisqlite-*`; ROLLBACK, UPSERT, transparent schema re-prepare |
 
 ### oxisqlite engine (7)
 
@@ -104,7 +128,7 @@ consumed by `oxisql-sqlite-compat` and not part of OxiSQL's public surface.
 | Crate | Status | Tests | Description |
 |-------|--------|-------|-------------|
 | `oxisqlite` | Internal | 5 | Top-level engine facade / connection entry point |
-| `oxisqlite-core` | Internal | 538 (+12 fuzz/stress) | Storage engine: B-tree, pager, WAL, VDBE, transactions, ROLLBACK |
+| `oxisqlite-core` | Internal | 636 (+13 skipped) | Storage engine: B-tree, pager, WAL, VDBE, transactions, ROLLBACK, ANALYZE, System-R optimizer |
 | `oxisqlite-ext` | Internal | — | Built-in extensions / virtual-table glue |
 | `oxisqlite-macros` | Internal | — | Procedural macros for the engine |
 | `oxisqlite-sqlite3-parser` | Internal | 208 (+6) | SQL parser (pre-generated, no `lemon` C generator) |
@@ -125,14 +149,14 @@ Add to your workspace's root `Cargo.toml`:
 ```toml
 # Workspace root Cargo.toml
 [workspace.dependencies]
-oxisql = { version = "0.1.2", features = ["embedded"] }
+oxisql = { version = "0.2.0", features = ["embedded"] }
 ```
 
 Or add to a single crate:
 
 ```toml
 [dependencies]
-oxisql = { version = "0.1.2", features = ["embedded", "postgres", "pool-embedded", "migrate"] }
+oxisql = { version = "0.2.0", features = ["embedded", "postgres", "pool-embedded", "migrate"] }
 ```
 
 ---
@@ -329,10 +353,9 @@ mapping (DECIMAL, DATETIME(6), JSON, ENUM).
 | Pure Rust | **Yes** — no `libsqlite3`, no `mimalloc`, no `lemon` |
 
 The SQLite-compatible backend sits on top of the in-tree `oxisqlite-*` engine.
-Full transactional rollback works (5 dedicated tests in
-`crates/oxisql-sqlite-compat/tests/rollback.rs`). `SAVEPOINT` is not yet wired
-up and returns a clear error rather than panicking — see
-[Known Limitations](#known-limitations).
+Full transactional rollback and UPSERT work. `SAVEPOINT` is fully implemented
+with WAL-based page-state restoration. See [Known Limitations](#known-limitations)
+for current open items.
 
 ### DataFusion OLAP (`datafusion://`)
 
@@ -372,26 +395,26 @@ cross-backend OLAP queries (filter / projection / limit pushdown).
 
 ```toml
 # In-memory only
-oxisql = { version = "0.1.2", features = ["embedded"] }
+oxisql = { version = "0.2.0", features = ["embedded"] }
 
 # PostgreSQL + pooling
-oxisql = { version = "0.1.2", features = ["postgres", "pool-postgres"] }
+oxisql = { version = "0.2.0", features = ["postgres", "pool-postgres"] }
 
 # MySQL + migrations
-oxisql = { version = "0.1.2", features = ["mysql", "pool-mysql", "migrate"] }
+oxisql = { version = "0.2.0", features = ["mysql", "pool-mysql", "migrate"] }
 
 # C-free SQLite + pooling
-oxisql = { version = "0.1.2", features = ["sqlite", "pool-sqlite-compat"] }
+oxisql = { version = "0.2.0", features = ["sqlite", "pool-sqlite-compat"] }
 
 # All OLTP backends + pooling + migrations
-oxisql = { version = "0.1.2", features = [
+oxisql = { version = "0.2.0", features = [
     "embedded", "postgres", "mysql", "sqlite",
     "pool-embedded", "pool-postgres", "pool-mysql", "pool-sqlite-compat",
     "migrate",
 ] }
 
 # Full stack including DataFusion OLAP and the REPL
-oxisql = { version = "0.1.2", features = [
+oxisql = { version = "0.2.0", features = [
     "embedded", "postgres", "mysql", "sqlite", "datafusion",
     "pool-embedded", "pool-postgres", "pool-mysql",
     "migrate", "repl",
@@ -428,7 +451,7 @@ oxisql (facade crate)
   |       |
   |       +-- oxisqlite                 engine facade / connection entry point
   |             |
-  |             +-- oxisqlite-core              B-tree, pager, WAL, VDBE, ROLLBACK
+  |             +-- oxisqlite-core              B-tree, pager, WAL, VDBE, ROLLBACK, ANALYZE, System-R optimizer
   |             +-- oxisqlite-sqlite3-parser    SQL parser (no lemon C generator)
   |             +-- oxisqlite-ext               extensions / vtab glue
   |             +-- oxisqlite-macros            engine procedural macros
@@ -583,13 +606,8 @@ advisory), and `rustls-pemfile` (unmaintained).
 
 These are OxiSQL's own roadmap items, not upstream blockers:
 
-- **SAVEPOINT** on the SQLite backend is not yet wired up. It returns a clear
-  `OxiSqlError` rather than panicking or producing a cryptic parse error.
-- **Foreign-key metadata** for the SQLite backend is reconstructed by parsing
-  `sqlite_master` DDL rather than via a dedicated pragma. One FK-DDL test is
-  `#[ignore]`d while this is finished.
-- **Prepared-statement cache** falls back to direct execution for statements it
-  cannot cache; this is transparent but not yet optimal.
+- **SAVEPOINT** is fully implemented in oxisqlite with WAL-based page-state restoration.
+- **Prepared-statement cache** is active; `Statement::reset()` correctly clears change counts; the compat layer re-prepares transparently on `SchemaChanged`.
 - **PostgreSQL / MySQL live-server tests** are `#[ignore]`-gated and require an
   accessible server. All non-live unit and compile-time tests pass without
   external services (≈35 ignored tests workspace-wide are almost all

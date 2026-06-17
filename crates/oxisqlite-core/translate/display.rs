@@ -35,6 +35,7 @@ impl Display for Plan {
                 limit,
                 offset,
                 order_by,
+                ..
             } => {
                 for (plan, operator) in left {
                     plan.fmt(f)?;
@@ -240,24 +241,30 @@ impl ToSqlContext for PlanContext<'_> {
                 (Some(table), _) | (_, Some(table)) => Some(table),
                 _ => None,
             })
-            .unwrap()
-            .unwrap();
+            .flatten();
+        let Some(table) = table else {
+            return "";
+        };
         let cols = table.columns();
-        cols.get(col_idx).unwrap().name.as_ref().unwrap()
+        cols.get(col_idx)
+            .and_then(|col| col.name.as_deref())
+            .unwrap_or("")
     }
 
     fn get_table_name(&self, id: TableInternalId) -> &str {
         let table_ref = self
             .0
             .iter()
-            .find(|table_ref| table_ref.find_table_by_internal_id(id).is_some())
-            .unwrap();
+            .find(|table_ref| table_ref.find_table_by_internal_id(id).is_some());
+        let Some(table_ref) = table_ref else {
+            return "";
+        };
         let joined_table = table_ref.find_joined_table_by_internal_id(id);
         let outer_query = table_ref.find_outer_query_ref_by_internal_id(id);
         match (joined_table, outer_query) {
             (Some(table), None) => &table.identifier,
             (None, Some(table)) => &table.identifier,
-            _ => unreachable!(),
+            _ => "",
         }
     }
 }
@@ -273,6 +280,7 @@ impl ToSqlString for Plan {
                 limit,
                 offset,
                 order_by,
+                ..
             } => {
                 let all_refs = left
                     .iter()
@@ -394,18 +402,23 @@ impl ToSqlString for SelectPlan {
             );
             ret.push("FROM".to_string());
 
-            ret.extend(self.join_order.iter().enumerate().map(|(idx, order)| {
-                let table_ref = self.joined_tables().get(order.original_idx).unwrap();
-                if idx == 0 {
-                    table_ref.to_sql_string(context)
-                } else {
-                    format!(
-                        "{}JOIN {}",
-                        if order.is_outer { "OUTER " } else { "" },
-                        table_ref.to_sql_string(context)
-                    )
-                }
-            }));
+            ret.extend(
+                self.join_order
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, order)| {
+                        let table_ref = self.joined_tables().get(order.original_idx)?;
+                        if idx == 0 {
+                            Some(table_ref.to_sql_string(context))
+                        } else {
+                            Some(format!(
+                                "{}JOIN {}",
+                                if order.is_outer { "OUTER " } else { "" },
+                                table_ref.to_sql_string(context)
+                            ))
+                        }
+                    }),
+            );
             if !self.where_clause.is_empty() {
                 ret.push("WHERE".to_string());
                 ret.push(
@@ -524,18 +537,13 @@ impl ToSqlString for UpdatePlan {
             self.set_clauses
                 .iter()
                 .map(|(col_idx, set_expr)| {
-                    format!(
-                        "{} = {}",
-                        table
-                            .table
-                            .get_column_at(*col_idx)
-                            .as_ref()
-                            .unwrap()
-                            .name
-                            .as_ref()
-                            .unwrap(),
-                        set_expr.to_sql_string(context)
-                    )
+                    let col_name = table
+                        .table
+                        .get_column_at(*col_idx)
+                        .as_ref()
+                        .and_then(|col| col.name.as_deref())
+                        .unwrap_or("");
+                    format!("{} = {}", col_name, set_expr.to_sql_string(context))
                 })
                 .collect::<Vec<_>>()
                 .join(", "),

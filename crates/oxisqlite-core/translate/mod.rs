@@ -9,6 +9,7 @@
 
 pub(crate) mod aggregation;
 pub(crate) mod alter;
+pub(crate) mod analyze;
 pub(crate) mod collate;
 mod compound_select;
 pub(crate) mod delete;
@@ -32,6 +33,7 @@ pub(crate) mod select;
 pub(crate) mod subquery;
 pub(crate) mod transaction;
 pub(crate) mod update;
+pub(crate) mod upsert;
 mod values;
 
 use crate::fast_lock::SpinLock;
@@ -83,6 +85,7 @@ pub fn translate(
     });
 
     program.prologue();
+    program.schema_cookie = database_header.lock().schema_cookie;
 
     program = match stmt {
         // There can be no nesting with pragma, so lift it up here
@@ -116,7 +119,7 @@ pub fn translate_inner(
 ) -> Result<ProgramBuilder> {
     let program = match stmt {
         ast::Stmt::AlterTable(alter) => translate_alter_table(*alter, syms, schema, program)?,
-        ast::Stmt::Analyze(_) => bail_parse_error!("ANALYZE not supported yet"),
+        ast::Stmt::Analyze(name) => analyze::translate_analyze(query_mode, schema, name, program)?,
         ast::Stmt::Attach { .. } => bail_parse_error!("ATTACH not supported yet"),
         ast::Stmt::Begin(tx_type, tx_name) => translate_tx_begin(tx_type, tx_name, program)?,
         ast::Stmt::Commit(tx_name) => translate_tx_commit(tx_name, program)?,

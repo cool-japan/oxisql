@@ -887,6 +887,53 @@ fn parse_join<'a>(
     Ok(())
 }
 
+/// Parsed LIMIT or OFFSET value — either a literal integer, a parameter expression, or absent.
+#[derive(Debug, Clone)]
+pub enum LimitValue {
+    Literal(isize),
+    Expr(Box<ast::Expr>),
+    None,
+}
+
+/// Like `parse_limit` but also accepts variable/parameter expressions (?, $1, :name, etc.)
+/// Returns `(limit_val, offset_val)`.
+pub fn parse_limit_full(limit: &Limit) -> Result<(LimitValue, LimitValue)> {
+    let offset_val = match &limit.offset {
+        Some(offset_expr) => match offset_expr {
+            Expr::Literal(ast::Literal::Numeric(n)) => {
+                LimitValue::Literal(n.parse().ok().unwrap_or(0))
+            }
+            Expr::Unary(UnaryOperator::Negative, inner) => {
+                if let Expr::Literal(ast::Literal::Numeric(ref n)) = **inner {
+                    LimitValue::Literal(n.parse::<isize>().ok().map(|v| -v).unwrap_or(0))
+                } else {
+                    crate::bail_parse_error!("Invalid OFFSET clause");
+                }
+            }
+            Expr::Variable(_) => LimitValue::Expr(Box::new(offset_expr.clone())),
+            _ => crate::bail_parse_error!("Invalid OFFSET clause"),
+        },
+        None => LimitValue::Literal(0),
+    };
+
+    let limit_val = match &limit.expr {
+        Expr::Literal(ast::Literal::Numeric(n)) => LimitValue::Literal(n.parse().ok().unwrap_or(0)),
+        Expr::Unary(UnaryOperator::Negative, inner) => {
+            if let Expr::Literal(ast::Literal::Numeric(n)) = &**inner {
+                LimitValue::Literal(n.parse::<isize>().ok().map(|v| -v).unwrap_or(0))
+            } else {
+                crate::bail_parse_error!("Invalid LIMIT clause");
+            }
+        }
+        Expr::Id(id) if id.0.eq_ignore_ascii_case("true") => LimitValue::Literal(1),
+        Expr::Id(id) if id.0.eq_ignore_ascii_case("false") => LimitValue::Literal(0),
+        Expr::Variable(_) => LimitValue::Expr(Box::new(limit.expr.clone())),
+        _ => crate::bail_parse_error!("Invalid LIMIT clause"),
+    };
+
+    Ok((limit_val, offset_val))
+}
+
 pub fn parse_limit(limit: &Limit) -> Result<(Option<isize>, Option<isize>)> {
     let offset_val = match &limit.offset {
         Some(offset_expr) => match offset_expr {

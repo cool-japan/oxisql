@@ -9,30 +9,49 @@ It contains:
 
 - the **VDBE** bytecode interpreter,
 - **B-tree** storage, the **pager**, and **WAL**,
-- **SQL → bytecode** translation,
-- **MVCC** transaction machinery,
+- **SQL → bytecode** translation with a System-R cost-based optimizer,
+- **ANALYZE** statement + `sqlite_stat1` cardinality statistics,
+- **MVCC** transaction machinery (full `ROLLBACK`, `SAVEPOINT`),
+- **UPSERT** `ON CONFLICT DO UPDATE/DO NOTHING` with `excluded.*`,
 - **JSON / JSONB** support, and
 - the SQL **built-in functions**.
 
 - **Role:** engine core (interpreter, storage, translation, functions).
-- **Approx LOC:** ~62,000.
+- **Version:** 0.2.0 (2026-06-17).
+- **Tests:** 636 passing (all-features), 640 with `index_experimental`, 13 skipped.
+- **Approx LOC:** ~82,000 (after execute/ + schema/ module splits).
 - **Pure Rust / no C:** 100% Rust. No C allocator, no C parser generator, no
   `cc` / `build.rs`. `CC=/usr/bin/false cargo build` succeeds.
 - **Internal:** private member of the OxiSQL workspace; not published separately.
 
-## COOLJAPAN changes vs upstream limbo
+## COOLJAPAN changes vs upstream limbo 0.0.22
 
-Two notable modifications were made on top of limbo 0.0.22:
+Notable additions on top of the original fork:
 
-1. **Full-transaction `ROLLBACK`.** Upstream lacked complete rollback of an open
-   write transaction; it was ported from `turso_core` 0.7.0-pre.5 (MIT). The
-   change spans `translate/rollback.rs`, `vdbe/execute.rs`, `storage/wal.rs`,
+1. **Full-transaction `ROLLBACK`.** Ported from `turso_core` 0.7.0-pre.5 (MIT).
+   Spans `translate/rollback.rs`, `vdbe/execute/txn_schema.rs`, `storage/wal.rs`,
    and `storage/pager.rs`.
 
-2. **Pure-Rust Julian-day conversion.** The GPL-licensed `julian_day_converter`
-   dependency was removed and replaced by an inline, `chrono`-based
-   `functions/julian_day.rs`, keeping the crate's date/time functions compatible
-   while preserving Apache-2.0 licensing.
+2. **`SAVEPOINT` / `RELEASE` / `ROLLBACK TO SAVEPOINT`.** Full nested savepoint
+   semantics with WAL-based page-state restoration; pager savepoint stack.
+
+3. **`ANALYZE` statement + System-R optimizer.** `translate/analyze.rs` generates
+   bytecode that writes `sqlite_stat1` rows; `statistics.rs` loads them into a
+   `SchemaStats` side-map; `translate/optimizer/cost.rs` uses real selectivity when
+   stats are present (backwards compatible — un-analyzed DBs unchanged).
+
+4. **UPSERT `ON CONFLICT DO UPDATE / DO NOTHING`.** `translate/upsert.rs` handles
+   all forms including `excluded.*`, per-target conflict routing, and the
+   `index_experimental` unique-index path.
+
+5. **Schema-cookie invalidation + `SchemaChanged`.** DDL bumps the schema cookie;
+   `op_transaction` verifies it; stale statements raise `LimboError::SchemaChanged`.
+
+6. **Module splits via `splitrs`.** `schema.rs` (1,920 lines) → `schema/` (7 files);
+   `vdbe/execute.rs` (8,361 lines) → `vdbe/execute/` (10 files).
+
+7. **Pure-Rust Julian-day conversion.** GPL `julian_day_converter` removed;
+   replaced by inline `functions/julian_day.rs`.
 
 ## Fork lineage & licensing
 

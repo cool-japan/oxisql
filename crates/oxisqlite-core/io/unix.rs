@@ -85,7 +85,9 @@ impl BorrowedPollHandler<'_> {
 
 impl PollHandler {
     fn new() -> Self {
-        Self(UnsafeCell::new(Poller::new().unwrap()))
+        Self(UnsafeCell::new(
+            Poller::new().expect("failed to create poller"),
+        ))
     }
     fn wait(&self, events: &mut Events, timeout: Option<std::time::Duration>) -> Result<()> {
         let poller = unsafe { &mut *self.0.get() };
@@ -265,7 +267,7 @@ impl IO for UnixIO {
 
     fn generate_random_number(&self) -> i64 {
         let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).unwrap();
+        getrandom::getrandom(&mut buf).expect("getrandom failed");
         i64::from_ne_bytes(buf)
     }
 
@@ -415,6 +417,13 @@ impl File for UnixFile<'_> {
     fn size(&self) -> Result<u64> {
         let file = self.file.borrow();
         Ok(file.metadata()?.len())
+    }
+
+    fn truncate(&self, len: usize, c: Arc<Completion>) -> Result<()> {
+        let file = self.file.borrow();
+        file.set_len(len as u64)?;
+        c.complete(0);
+        Ok(())
     }
 }
 

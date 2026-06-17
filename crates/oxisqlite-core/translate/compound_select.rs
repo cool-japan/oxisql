@@ -22,11 +22,20 @@ pub fn emit_program_for_compound_select(
         left: _left,
         right_most,
         limit,
+        limit_expr,
+        offset_expr,
         ..
     } = &plan
     else {
         crate::bail_parse_error!("expected compound select plan");
     };
+
+    // Parameterized LIMIT/OFFSET is not yet supported for compound SELECTs
+    if limit_expr.is_some() || offset_expr.is_some() {
+        crate::bail_parse_error!(
+            "parameterized LIMIT/OFFSET is not supported for compound SELECTs yet"
+        );
+    }
 
     let right_plan = right_most.clone();
     // Trivial exit on LIMIT 0
@@ -95,6 +104,7 @@ fn emit_compound_select(
         limit,
         offset,
         order_by,
+        ..
     } = plan
     else {
         unreachable!()
@@ -123,6 +133,8 @@ fn emit_compound_select(
                     limit,
                     offset,
                     order_by,
+                    limit_expr: None,
+                    offset_expr: None,
                 };
                 emit_compound_select(
                     program,
@@ -172,6 +184,8 @@ fn emit_compound_select(
                     limit,
                     offset,
                     order_by,
+                    limit_expr: None,
+                    offset_expr: None,
                 };
                 emit_compound_select(
                     program,

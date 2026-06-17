@@ -7,7 +7,9 @@ use limbo_sqlite3_parser::ast::{self};
 use tracing::{instrument, Level};
 
 use super::aggregation::emit_ungrouped_aggregation;
-use super::expr::{translate_condition_expr, translate_expr, ConditionMetadata};
+use super::expr::{
+    expr_contains_subquery, translate_condition_expr, translate_expr, ConditionMetadata,
+};
 use super::group_by::{
     group_by_agg_phase, group_by_emit_row_phase, init_group_by, GroupByMetadata, GroupByRowSource,
 };
@@ -18,7 +20,7 @@ use super::order_by::{emit_order_by, init_order_by, SortMetadata};
 use super::plan::{JoinOrderMember, Operation, SelectPlan, TableReferences, UpdatePlan};
 use super::select::emit_simple_count;
 use super::subquery::emit_subqueries;
-use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
+use crate::error::{LimboError, SQLITE_CONSTRAINT_PRIMARYKEY};
 use crate::function::Func;
 use crate::schema::Schema;
 use crate::translate::compound_select::emit_program_for_compound_select;
@@ -34,6 +36,10 @@ pub struct Resolver<'a> {
     pub schema: &'a Schema,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache: Vec<(&'a ast::Expr, usize)>,
+    /// Owned expression→register overrides used inside `DO UPDATE` upsert blocks.
+    /// Checked before `expr_to_reg_cache` so that `excluded.*` and old-value
+    /// references shadow any outer cache entries during DO UPDATE emit.
+    pub upsert_reg_overrides: Vec<(ast::Expr, usize)>,
 }
 
 impl<'a> Resolver<'a> {
@@ -42,6 +48,7 @@ impl<'a> Resolver<'a> {
             schema,
             symbol_table,
             expr_to_reg_cache: Vec::new(),
+            upsert_reg_overrides: Vec::new(),
         }
     }
 
@@ -56,6 +63,12 @@ impl<'a> Resolver<'a> {
     }
 
     pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<usize> {
+        // Check owned overrides first (upsert DO UPDATE context).
+        for (key, reg) in &self.upsert_reg_overrides {
+            if exprs_are_equivalent(expr, key) {
+                return Some(*reg);
+            }
+        }
         self.expr_to_reg_cache
             .iter()
             .find(|(e, _)| exprs_are_equivalent(expr, e))
@@ -98,6 +111,8 @@ pub struct TranslateCtx<'a> {
     // label for the instruction that jumps to the next phase of the query after the main loop
     // we don't know ahead of time what that is (GROUP BY, ORDER BY, etc.)
     pub label_main_loop_end: Option<BranchOffset>,
+    // label for immediately aborting all processing (used by parameterized LIMIT=0 to skip ORDER BY/GROUP BY)
+    pub label_abort: Option<BranchOffset>,
     // First register of the aggregation results
     pub reg_agg_start: Option<usize>,
     // In non-group-by statements with aggregations (e.g. SELECT foo, bar, sum(baz) FROM t),
@@ -138,6 +153,7 @@ impl<'a> TranslateCtx<'a> {
         TranslateCtx {
             labels_main_loop: (0..table_count).map(|_| LoopLabels::new(program)).collect(),
             label_main_loop_end: None,
+            label_abort: None,
             reg_agg_start: None,
             reg_nonagg_emit_once_flag: None,
             limit_ctx: None,
@@ -206,9 +222,9 @@ fn emit_program_for_select(
         plan.result_columns.len(),
     );
 
-    // Trivial exit on LIMIT 0
-    if let Some(limit) = plan.limit {
-        if limit == 0 {
+    // Trivial exit on LIMIT 0 (only for literal LIMIT, not parameterized)
+    if plan.limit_expr.is_none() {
+        if let Some(0) = plan.limit {
             program.epilogue(TransactionMode::Read);
             program.result_columns = plan.result_columns;
             program.table_references.extend(plan.table_references);
@@ -244,13 +260,27 @@ pub fn emit_query<'a>(
     // Emit subqueries first so the results can be read in the main query loop.
     emit_subqueries(program, t_ctx, &mut plan.table_references)?;
 
-    init_limit(program, t_ctx, plan.limit, plan.offset);
+    // Allocate end-of-loop label first so init_limit can emit LIMIT-0 jumps
+    let after_main_loop_label = program.allocate_label();
+    t_ctx.label_main_loop_end = Some(after_main_loop_label);
+
+    // Allocate abort label (points past ORDER BY / GROUP BY post-processing) so that
+    // a parameterized LIMIT=0 at runtime can skip all processing without touching cursors.
+    let abort_label = program.allocate_label();
+    t_ctx.label_abort = Some(abort_label);
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     // however an aggregation might still happen,
     // e.g. SELECT COUNT(*) WHERE 0 returns a row with 0, not an empty result set
-    let after_main_loop_label = program.allocate_label();
-    t_ctx.label_main_loop_end = Some(after_main_loop_label);
+    init_limit(
+        program,
+        t_ctx,
+        plan.limit,
+        plan.offset,
+        plan.limit_expr.as_deref(),
+        plan.offset_expr.as_deref(),
+    )?;
+
     if plan.contains_constant_false_condition {
         program.emit_insn(Insn::Goto {
             target_pc: after_main_loop_label,
@@ -299,14 +329,18 @@ pub fn emit_query<'a>(
 
     if plan.is_simple_count() {
         emit_simple_count(program, t_ctx, plan)?;
-        return Ok(t_ctx.reg_result_cols_start.unwrap());
+        return t_ctx
+            .reg_result_cols_start
+            .ok_or_else(|| LimboError::InternalError("reg_result_cols_start not set".to_string()));
     }
 
-    for where_term in plan
-        .where_clause
-        .iter()
-        .filter(|wt| wt.should_eval_before_loop(&plan.join_order))
-    {
+    for where_term in plan.where_clause.iter().filter(|wt| {
+        // A WHERE term containing a subquery (scalar / EXISTS / IN (SELECT ...)) must never be
+        // hoisted before the main loop: a correlated subquery needs the outer row's cursors to be
+        // positioned first. Such terms are evaluated inside the innermost loop instead (see
+        // `should_eval_term_at_loop` in main_loop.rs).
+        wt.should_eval_before_loop(&plan.join_order) && !expr_contains_subquery(&wt.expr)
+    }) {
         let jump_target_when_true = program.allocate_label();
         let condition_metadata = ConditionMetadata {
             jump_if_condition_is_true: false,
@@ -366,7 +400,15 @@ pub fn emit_query<'a>(
         emit_order_by(program, t_ctx, plan)?;
     }
 
-    Ok(t_ctx.reg_result_cols_start.unwrap())
+    // Assign the abort_label here — a parameterized LIMIT=0 jumps to this point,
+    // past all post-processing (ORDER BY, GROUP BY, etc.) and straight to epilogue.
+    if let Some(abort_label) = t_ctx.label_abort {
+        program.preassign_label_to_next_insn(abort_label);
+    }
+
+    t_ctx
+        .reg_result_cols_start
+        .ok_or_else(|| LimboError::InternalError("reg_result_cols_start not set".to_string()))
 }
 
 #[instrument(skip_all, level = Level::TRACE)]
@@ -384,19 +426,31 @@ fn emit_program_for_delete(
         plan.result_columns.len(),
     );
 
-    // exit early if LIMIT 0
-    if let Some(0) = plan.limit {
-        program.epilogue(TransactionMode::Write);
-        program.result_columns = plan.result_columns;
-        program.table_references.extend(plan.table_references);
-        return Ok(());
+    // exit early if LIMIT 0 (only for literal LIMIT, not parameterized)
+    if plan.limit_expr.is_none() {
+        if let Some(0) = plan.limit {
+            program.epilogue(TransactionMode::Write);
+            program.result_columns = plan.result_columns;
+            program.table_references.extend(plan.table_references);
+            return Ok(());
+        }
     }
 
-    init_limit(program, &mut t_ctx, plan.limit, None);
-
-    // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
+    // For DELETE there is no post-loop processing, so abort_label == after_main_loop_label.
+    t_ctx.label_abort = Some(after_main_loop_label);
+
+    // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
+    init_limit(
+        program,
+        &mut t_ctx,
+        plan.limit,
+        None,
+        plan.limit_expr.as_deref(),
+        None,
+    )?;
+
     if plan.contains_constant_false_condition {
         program.emit_insn(Insn::Goto {
             target_pc: after_main_loop_label,
@@ -445,7 +499,10 @@ fn emit_delete_insns(
     t_ctx: &mut TranslateCtx,
     table_references: &TableReferences,
 ) -> Result<()> {
-    let table_reference = table_references.joined_tables().first().unwrap();
+    let table_reference = table_references
+        .joined_tables()
+        .first()
+        .ok_or_else(|| LimboError::InternalError("DELETE: no table reference found".to_string()))?;
     let cursor_id = match &table_reference.op {
         Operation::Scan { .. } => {
             program.resolve_cursor_id(&CursorKey::table(table_reference.internal_id))
@@ -544,7 +601,9 @@ fn emit_delete_insns(
     if let Some(limit_ctx) = t_ctx.limit_ctx {
         program.emit_insn(Insn::DecrJumpZero {
             reg: limit_ctx.reg_limit,
-            target_pc: t_ctx.label_main_loop_end.unwrap(),
+            target_pc: t_ctx.label_main_loop_end.ok_or_else(|| {
+                LimboError::InternalError("label_main_loop_end not set".to_string())
+            })?,
         })
     }
 
@@ -567,17 +626,30 @@ fn emit_program_for_update(
         plan.returning.as_ref().map_or(0, |r| r.len()),
     );
 
-    // Exit on LIMIT 0
-    if let Some(0) = plan.limit {
-        program.epilogue(TransactionMode::None);
-        program.result_columns = plan.returning.unwrap_or_default();
-        program.table_references.extend(plan.table_references);
-        return Ok(());
+    // Exit on LIMIT 0 (only for literal LIMIT, not parameterized)
+    if plan.limit_expr.is_none() {
+        if let Some(0) = plan.limit {
+            program.epilogue(TransactionMode::None);
+            program.result_columns = plan.returning.unwrap_or_default();
+            program.table_references.extend(plan.table_references);
+            return Ok(());
+        }
     }
 
-    init_limit(program, &mut t_ctx, plan.limit, plan.offset);
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
+    // For UPDATE there is no post-loop processing, so abort_label == after_main_loop_label.
+    t_ctx.label_abort = Some(after_main_loop_label);
+
+    init_limit(
+        program,
+        &mut t_ctx,
+        plan.limit,
+        plan.offset,
+        plan.limit_expr.as_deref(),
+        plan.offset_expr.as_deref(),
+    )?;
+
     if plan.contains_constant_false_condition {
         program.emit_insn(Insn::Goto {
             target_pc: after_main_loop_label,
@@ -617,6 +689,19 @@ fn emit_program_for_update(
         let record_reg = program.alloc_register();
         index_cursors.push((index_cursor, record_reg));
     }
+    // Determine if statement-level savepoint is needed for UPDATE OR ABORT/ROLLBACK.
+    use limbo_sqlite3_parser::ast::ResolveType;
+    let needs_stmt_savepoint = matches!(
+        plan.or_conflict,
+        None | Some(ResolveType::Abort) | Some(ResolveType::Rollback)
+    );
+    if needs_stmt_savepoint {
+        use crate::vdbe::insn::SavepointOp;
+        program.emit_insn(Insn::Savepoint {
+            op: SavepointOp::Begin,
+            name: "_stmt".to_string(),
+        });
+    }
     open_loop(
         program,
         &mut t_ctx,
@@ -637,6 +722,13 @@ fn emit_program_for_update(
 
     after(program);
 
+    if needs_stmt_savepoint {
+        use crate::vdbe::insn::SavepointOp;
+        program.emit_insn(Insn::Savepoint {
+            op: SavepointOp::Release,
+            name: "_stmt".to_string(),
+        });
+    }
     // Finalize program
     program.epilogue(TransactionMode::Write);
     program.result_columns = plan.returning.unwrap_or_default();
@@ -694,7 +786,9 @@ fn emit_update_insns(
         let meta = ConditionMetadata {
             jump_if_condition_is_true: false,
             jump_target_when_true: jump_target,
-            jump_target_when_false: t_ctx.label_main_loop_end.unwrap(),
+            jump_target_when_false: t_ctx.label_main_loop_end.ok_or_else(|| {
+                LimboError::InternalError("label_main_loop_end not set".to_string())
+            })?,
         };
         translate_condition_expr(
             program,
@@ -751,7 +845,9 @@ fn emit_update_insns(
         // if no rowid, we're done
         program.emit_insn(Insn::IsNull {
             reg: beg,
-            target_pc: t_ctx.label_main_loop_end.unwrap(),
+            target_pc: t_ctx.label_main_loop_end.ok_or_else(|| {
+                LimboError::InternalError("label_main_loop_end not set".to_string())
+            })?,
         });
     }
 
@@ -947,10 +1043,12 @@ fn emit_update_insns(
             collation: program.curr_collation(),
         });
 
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_PRIMARYKEY, // TODO: distinct between primary key and unique index for error code
-            description: column_names,
-        });
+        emit_conflict_halt(
+            program,
+            &plan.or_conflict,
+            SQLITE_CONSTRAINT_PRIMARYKEY, // TODO: distinct between primary key and unique index
+            column_names,
+        );
 
         program.preassign_label_to_next_insn(constraint_check);
     }
@@ -983,9 +1081,11 @@ fn emit_update_insns(
                 target_pc: record_label,
             });
 
-            program.emit_insn(Insn::Halt {
-                err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                description: format!(
+            emit_conflict_halt(
+                program,
+                &plan.or_conflict,
+                SQLITE_CONSTRAINT_PRIMARYKEY,
+                format!(
                     "{}.{}",
                     table_ref.table.get_name(),
                     &table_ref
@@ -996,7 +1096,7 @@ fn emit_update_insns(
                         .as_ref()
                         .map_or("", |v| v)
                 ),
-            });
+            );
 
             program.preassign_label_to_next_insn(record_label);
         }
@@ -1079,7 +1179,9 @@ fn emit_update_insns(
     if let Some(limit_ctx) = t_ctx.limit_ctx {
         program.emit_insn(Insn::DecrJumpZero {
             reg: limit_ctx.reg_limit,
-            target_pc: t_ctx.label_main_loop_end.unwrap(),
+            target_pc: t_ctx.label_main_loop_end.ok_or_else(|| {
+                LimboError::InternalError("label_main_loop_end not set".to_string())
+            })?,
         })
     }
     // TODO(pthorpe): handle RETURNING clause
@@ -1091,40 +1193,200 @@ fn emit_update_insns(
     Ok(())
 }
 
+/// Emit the appropriate conflict-halt instructions for INSERT/UPDATE conflict resolution.
+///
+/// For ABORT (default) and ROLLBACK, emits a `Savepoint RollbackTo "_stmt"` before `Halt`
+/// so that partial writes by the current statement are undone.
+/// For FAIL, emits only `Halt` (prior writes are kept).
+fn emit_conflict_halt(
+    program: &mut ProgramBuilder,
+    or_conflict: &Option<limbo_sqlite3_parser::ast::ResolveType>,
+    err_code: usize,
+    description: String,
+) {
+    use crate::vdbe::insn::SavepointOp;
+    use limbo_sqlite3_parser::ast::ResolveType;
+    match or_conflict {
+        None | Some(ResolveType::Abort) | Some(ResolveType::Rollback) => {
+            program.emit_insn(Insn::Savepoint {
+                op: SavepointOp::RollbackTo,
+                name: "_stmt".to_string(),
+            });
+            program.emit_insn(Insn::Halt {
+                err_code,
+                description,
+            });
+        }
+        Some(ResolveType::Fail) => {
+            program.emit_insn(Insn::Halt {
+                err_code,
+                description,
+            });
+        }
+        // IGNORE and REPLACE are handled by caller; fall back to halt
+        _ => {
+            program.emit_insn(Insn::Halt {
+                err_code,
+                description,
+            });
+        }
+    }
+}
+
 /// Initialize the limit/offset counters and registers.
 /// In case of compound SELECTs, the limit counter is initialized only once,
 /// hence [LimitCtx::initialize_counter] being false in those cases.
+///
+/// `limit_expr` / `offset_expr` support runtime-bound parameters (?, $1, :name).
+/// When present they take precedence over the literal `limit` / `offset` values.
+/// The `t_ctx.label_main_loop_end` label **must** be allocated before calling this
+/// function so that a LIMIT=0 parameter can emit an immediate jump.
 fn init_limit(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     limit: Option<isize>,
     offset: Option<isize>,
-) {
-    if t_ctx.limit_ctx.is_none() {
-        t_ctx.limit_ctx = limit.map(|_| LimitCtx::new(program));
-    }
-    let Some(limit_ctx) = t_ctx.limit_ctx else {
-        return;
-    };
-    if limit_ctx.initialize_counter {
-        program.emit_insn(Insn::Integer {
-            value: limit.expect("limit must be Some if limit_ctx is Some") as i64,
-            dest: limit_ctx.reg_limit,
+    limit_expr: Option<&ast::Expr>,
+    offset_expr: Option<&ast::Expr>,
+) -> Result<()> {
+    // ── Set up LIMIT ─────────────────────────────────────────────────────────
+    if let Some(expr) = limit_expr {
+        // Parameterized limit: allocate a register, translate the expression.
+        if t_ctx.limit_ctx.is_none() {
+            t_ctx.limit_ctx = Some(LimitCtx::new(program));
+        }
+        let limit_reg = t_ctx
+            .limit_ctx
+            .expect("limit_ctx just initialised")
+            .reg_limit;
+
+        {
+            let resolver = &t_ctx.resolver;
+            translate_expr(program, None, expr, limit_reg, resolver)?;
+        }
+
+        // NULL → -1 (unlimited): DecrJumpZero never reaches 0 for -1.
+        let not_null_label = program.allocate_label();
+        program.emit_insn(Insn::NotNull {
+            reg: limit_reg,
+            target_pc: not_null_label,
         });
+        program.emit_int(-1, limit_reg);
+        program.preassign_label_to_next_insn(not_null_label);
+
+        // If the parameter is exactly 0, jump past all post-processing (ORDER BY, GROUP BY, etc.)
+        if let Some(abort_label) = t_ctx.label_abort {
+            program.emit_insn(Insn::IfNot {
+                reg: limit_reg,
+                target_pc: abort_label,
+                jump_if_null: false,
+            });
+        }
+    } else {
+        // Literal limit (original behaviour).
+        if t_ctx.limit_ctx.is_none() {
+            t_ctx.limit_ctx = limit.map(|_| LimitCtx::new(program));
+        }
+        let Some(limit_ctx) = t_ctx.limit_ctx else {
+            // No limit at all — still handle offset below.
+            return init_limit_offset_only(program, t_ctx, offset, offset_expr);
+        };
+        if limit_ctx.initialize_counter {
+            program.emit_insn(Insn::Integer {
+                value: limit
+                    .expect("limit must be Some when limit_ctx is initialised with a literal")
+                    as i64,
+                dest: limit_ctx.reg_limit,
+            });
+        }
     }
-    if t_ctx.reg_offset.is_none() && offset.is_some_and(|n| n.ne(&0)) {
+
+    // ── Set up OFFSET ─────────────────────────────────────────────────────────
+    if let Some(expr) = offset_expr {
+        // Parameterized offset.
+        if t_ctx.reg_offset.is_none() {
+            let reg = program.alloc_register();
+            t_ctx.reg_offset = Some(reg);
+            {
+                let resolver = &t_ctx.resolver;
+                translate_expr(program, None, expr, reg, resolver)?;
+            }
+            // NULL → 0 (no skip).
+            let not_null_label = program.allocate_label();
+            program.emit_insn(Insn::NotNull {
+                reg,
+                target_pc: not_null_label,
+            });
+            program.emit_int(0, reg);
+            program.preassign_label_to_next_insn(not_null_label);
+
+            if let Some(limit_ctx) = t_ctx.limit_ctx {
+                let combined_reg = program.alloc_register();
+                t_ctx.reg_limit_offset_sum = Some(combined_reg);
+                program.emit_insn(Insn::OffsetLimit {
+                    limit_reg: limit_ctx.reg_limit,
+                    offset_reg: reg,
+                    combined_reg,
+                });
+            }
+        }
+    } else if t_ctx.reg_offset.is_none() && offset.is_some_and(|n| n != 0) {
+        // Literal offset (original behaviour).
         let reg = program.alloc_register();
         t_ctx.reg_offset = Some(reg);
         program.emit_insn(Insn::Integer {
-            value: offset.unwrap() as i64,
+            value: offset.expect("offset is Some here") as i64,
             dest: reg,
         });
         let combined_reg = program.alloc_register();
         t_ctx.reg_limit_offset_sum = Some(combined_reg);
         program.emit_insn(Insn::OffsetLimit {
-            limit_reg: t_ctx.limit_ctx.unwrap().reg_limit,
+            limit_reg: t_ctx
+                .limit_ctx
+                .expect("limit_ctx must be Some when literal offset is active")
+                .reg_limit,
             offset_reg: reg,
             combined_reg,
         });
     }
+
+    Ok(())
+}
+
+/// Handle the offset-only path when there is no limit at all.
+/// This is an uncommon case (OFFSET without LIMIT is unusual in SQLite),
+/// but we handle it gracefully.
+#[inline]
+fn init_limit_offset_only(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    offset: Option<isize>,
+    offset_expr: Option<&ast::Expr>,
+) -> Result<()> {
+    // Without a limit register there is nowhere to store limit+offset for OffsetLimit.
+    // We still set up reg_offset so that emit_offset can emit IfPos skips.
+    if let Some(expr) = offset_expr {
+        if t_ctx.reg_offset.is_none() {
+            let reg = program.alloc_register();
+            t_ctx.reg_offset = Some(reg);
+            let resolver = &t_ctx.resolver;
+            translate_expr(program, None, expr, reg, resolver)?;
+            // NULL → 0
+            let not_null_label = program.allocate_label();
+            program.emit_insn(Insn::NotNull {
+                reg,
+                target_pc: not_null_label,
+            });
+            program.emit_int(0, reg);
+            program.preassign_label_to_next_insn(not_null_label);
+        }
+    } else if t_ctx.reg_offset.is_none() && offset.is_some_and(|n| n != 0) {
+        let reg = program.alloc_register();
+        t_ctx.reg_offset = Some(reg);
+        program.emit_insn(Insn::Integer {
+            value: offset.expect("offset is Some here") as i64,
+            dest: reg,
+        });
+    }
+    Ok(())
 }

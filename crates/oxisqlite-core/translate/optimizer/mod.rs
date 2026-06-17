@@ -1,4 +1,4 @@
-use std::{cell::RefCell, cmp::Ordering, collections::HashMap, sync::Arc};
+use std::{cell::RefCell, cmp::Ordering, sync::Arc};
 
 use constraints::{
     constraints_from_where_clause, usable_constraints_for_join_order, Constraint, ConstraintRef,
@@ -72,7 +72,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
 
     let best_join_order = optimize_table_access(
         &mut plan.table_references,
-        &schema.indexes,
+        schema,
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut plan.group_by,
@@ -153,15 +153,24 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
 /// Returns the join order if it was optimized, or None if the default join order was considered best.
 fn optimize_table_access(
     table_references: &mut TableReferences,
-    available_indexes: &HashMap<String, Vec<Arc<Index>>>,
+    schema: &Schema,
     where_clause: &mut Vec<WhereTerm>,
     order_by: &mut Option<Vec<(ast::Expr, SortOrder)>>,
     group_by: &mut Option<GroupBy>,
 ) -> Result<Option<Vec<JoinOrderMember>>> {
     let access_methods_arena = RefCell::new(Vec::new());
     let maybe_order_target = compute_order_target(order_by, group_by.as_mut());
+    // Consult persisted statistics only when some have been loaded. An empty
+    // side-map yields `None` from every lookup, so passing `None` here is
+    // bit-for-bit identical to passing `Some(&empty)` and keeps un-analyzed
+    // databases on the original hardcoded-estimate path.
+    let stats = if schema.stats.is_empty() {
+        None
+    } else {
+        Some(&schema.stats)
+    };
     let constraints_per_table =
-        constraints_from_where_clause(where_clause, &table_references, available_indexes)?;
+        constraints_from_where_clause(where_clause, &table_references, &schema.indexes, stats)?;
     let Some(best_join_order_result) = compute_best_join_order(
         table_references.joined_tables_mut(),
         maybe_order_target.as_ref(),
@@ -517,7 +526,8 @@ impl Optimizable for ast::Expr {
             Expr::Exists(..) => false,
             Expr::FunctionCall { .. } => false,
             Expr::FunctionCallStar { .. } => false,
-            Expr::Id(..) => panic!("Do not call is_nonnull before Id has been rewritten as Column"),
+            // May appear in DO UPDATE SET expressions before rewriting; nullability unknown.
+            Expr::Id(..) => false,
             Expr::Column {
                 table,
                 column,
@@ -528,7 +538,9 @@ impl Optimizable for ast::Expr {
                     return true;
                 }
 
-                let table_ref = tables.find_joined_table_by_internal_id(*table).unwrap();
+                let table_ref = tables
+                    .find_joined_table_by_internal_id(*table)
+                    .expect("column references a table that should exist in the join list");
                 let columns = table_ref.columns();
                 let column = &columns[*column];
                 return column.primary_key || column.notnull;
@@ -557,9 +569,8 @@ impl Optimizable for ast::Expr {
             Expr::Name(..) => false,
             Expr::NotNull(..) => true,
             Expr::Parenthesized(exprs) => exprs.iter().all(|expr| expr.is_nonnull(tables)),
-            Expr::Qualified(..) => {
-                panic!("Do not call is_nonnull before Qualified has been rewritten as Column")
-            }
+            // May appear in DO UPDATE SET expressions before rewriting; not known to be non-null.
+            Expr::Qualified(..) => false,
             Expr::Raise(..) => false,
             Expr::Subquery(..) => false,
             Expr::Unary(_, expr) => expr.is_nonnull(tables),
@@ -611,7 +622,11 @@ impl Optimizable for ast::Expr {
                     })
             }
             Expr::FunctionCallStar { .. } => false,
-            Expr::Id(_) => panic!("Id should have been rewritten as Column"),
+            // Expr::Id and Expr::Qualified are column references — not constant,
+            // and may appear in DO UPDATE SET expressions before rewriting.
+            // They are handled (or rejected) at translate_expr time via the
+            // resolver override cache or a parse error.
+            Expr::Id(_) => false,
             Expr::Column { .. } => false,
             Expr::RowId { .. } => false,
             Expr::InList { lhs, rhs, .. } => {
@@ -638,9 +653,8 @@ impl Optimizable for ast::Expr {
             Expr::Name(_) => false,
             Expr::NotNull(expr) => expr.is_constant(resolver),
             Expr::Parenthesized(exprs) => exprs.iter().all(|expr| expr.is_constant(resolver)),
-            Expr::Qualified(_, _) => {
-                panic!("Qualified should have been rewritten as Column")
-            }
+            // See Expr::Id note above.
+            Expr::Qualified(_, _) => false,
             Expr::Raise(_, expr) => expr
                 .as_ref()
                 .map_or(true, |expr| expr.is_constant(resolver)),
@@ -717,7 +731,9 @@ impl Optimizable for ast::Expr {
                         AlwaysTrueOrFalse::AlwaysFalse
                     }));
                 }
-                let rhs = rhs.as_ref().unwrap();
+                let rhs = rhs
+                    .as_ref()
+                    .expect("rhs is Some after is_none() check guarantees it is not None");
                 if rhs.is_empty() {
                     return Ok(Some(if *not {
                         AlwaysTrueOrFalse::AlwaysTrue
@@ -778,7 +794,10 @@ fn ephemeral_index_build(
         .iter()
         .enumerate()
         .map(|(i, c)| IndexColumn {
-            name: c.name.clone().unwrap(),
+            name: c
+                .name
+                .clone()
+                .expect("index column name should always be set"),
             order: SortOrder::Asc,
             pos_in_table: i,
             collation: c.collation,
@@ -843,7 +862,11 @@ pub fn build_seek_def_from_constraints(
 
     // We know all but potentially the last term is an equality, so we can use the operator of the last term
     // to form the SeekOp
-    let op = constraints[constraint_refs.last().unwrap().constraint_vec_pos].operator;
+    let op = constraints[constraint_refs
+        .last()
+        .expect("constraint_refs is non-empty (asserted above)")
+        .constraint_vec_pos]
+        .operator;
 
     let seek_def = build_seek_def(op, iter_dir, key)?;
     Ok(seek_def)
@@ -881,7 +904,10 @@ fn build_seek_def(
     key: Vec<(ast::Expr, SortOrder)>,
 ) -> Result<SeekDef> {
     let key_len = key.len();
-    let sort_order_of_last_key = key.last().unwrap().1;
+    let sort_order_of_last_key = key
+        .last()
+        .expect("key is non-empty (caller always passes a non-empty key list)")
+        .1;
 
     // For the commented examples below, keep in mind that since a descending index is laid out in reverse order, the comparison operators are reversed, e.g. LT becomes GT, LE becomes GE, etc.
     // Also keep in mind that index keys are compared based on the number of columns given, so for example:

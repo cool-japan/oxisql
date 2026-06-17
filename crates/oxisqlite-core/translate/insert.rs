@@ -1,14 +1,15 @@
 use std::rc::Rc;
 
 use limbo_sqlite3_parser::ast::{
-    DistinctNames, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, With,
+    DistinctNames, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, Set,
+    Upsert, UpsertDo, UpsertIndex, With,
 };
 
 use crate::error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY};
-use crate::schema::{IndexColumn, Table};
+use crate::schema::{BTreeTable, IndexColumn, Table};
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
-use crate::vdbe::insn::{IdxInsertFlags, InsertFlags, RegisterOrLiteral};
+use crate::vdbe::insn::{IdxInsertFlags, InsertFlags, RegisterOrLiteral, SavepointOp};
 use crate::vdbe::BranchOffset;
 use crate::{
     schema::{Column, Schema},
@@ -24,6 +25,154 @@ use super::expr::{translate_expr, translate_expr_no_constant_opt, NoConstantOptR
 use super::optimizer::rewrite_expr;
 use super::plan::QueryDestination;
 use super::select::translate_select;
+use super::upsert::emit_upsert_do_update;
+
+/// What to do when a specific conflict fires during an upsert.
+#[derive(Debug, Clone)]
+enum UpsertAction {
+    /// Skip the row (ON CONFLICT DO NOTHING).
+    Nothing,
+    /// Update the conflicting row (ON CONFLICT DO UPDATE SET …).
+    Update {
+        sets: Vec<Set>,
+        where_clause: Option<Expr>,
+    },
+}
+
+/// Maps each conflict target to its resolved action for a single INSERT.
+#[derive(Debug)]
+struct UpsertPlan {
+    /// Action for the rowid/INTEGER-PK `NotExists` check.
+    rowid_action: Option<UpsertAction>,
+    /// Actions for specific unique-index `NoConflict` checks (by index name).
+    index_actions: Vec<(String, UpsertAction)>,
+    /// `ON CONFLICT DO NOTHING` with no target → every conflict check Goto-skips.
+    catch_all_nothing: bool,
+}
+
+/// Walk the ON CONFLICT chain and build a `UpsertPlan` that records which
+/// action should be taken at each possible conflict site.
+///
+/// Errors are emitted here for:
+/// - target-less DO UPDATE (invalid per SQLite spec)
+/// - partial-index targets (where_clause on an index target — not yet supported)
+/// - targets that do not match any PRIMARY KEY or UNIQUE constraint
+fn resolve_upsert_targets(
+    schema: &Schema,
+    table_name: &str,
+    btree_table: &BTreeTable,
+    upsert: &Upsert,
+) -> Result<UpsertPlan> {
+    let mut plan = UpsertPlan {
+        rowid_action: None,
+        index_actions: Vec::new(),
+        catch_all_nothing: false,
+    };
+
+    let mut current: Option<&Upsert> = Some(upsert);
+    while let Some(clause) = current {
+        match clause.index.as_deref() {
+            None => {
+                // Target-less ON CONFLICT clause.
+                match clause.do_clause.as_ref() {
+                    UpsertDo::Nothing => {
+                        plan.catch_all_nothing = true;
+                    }
+                    UpsertDo::Set { .. } => {
+                        crate::bail_parse_error!(
+                            "ON CONFLICT DO UPDATE requires a conflict target"
+                        );
+                    }
+                }
+            }
+            Some(UpsertIndex {
+                targets,
+                where_clause,
+            }) => {
+                if where_clause.is_some() {
+                    crate::bail_parse_error!("partial-index ON CONFLICT target is not supported");
+                }
+
+                // Collect and normalise the target column names.
+                let mut target_cols: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                for sorted_col in targets {
+                    let col_name = match &sorted_col.expr {
+                        Expr::Id(id) => normalize_ident(&id.0),
+                        Expr::Name(name) => normalize_ident(&name.0),
+                        other => {
+                            crate::bail_parse_error!(
+                                "unsupported ON CONFLICT target expression: {:?}",
+                                other
+                            )
+                        }
+                    };
+                    target_cols.insert(col_name);
+                }
+
+                let action = match clause.do_clause.as_ref() {
+                    UpsertDo::Nothing => UpsertAction::Nothing,
+                    UpsertDo::Set { sets, where_clause } => UpsertAction::Update {
+                        sets: sets.clone(),
+                        where_clause: where_clause.clone(),
+                    },
+                };
+
+                // Try to match target against the rowid alias / INTEGER PRIMARY KEY.
+                let is_rowid_match = btree_table
+                    .columns
+                    .iter()
+                    .find(|c| c.is_rowid_alias)
+                    .and_then(|pk_col| pk_col.name.as_deref())
+                    .map(|pk_name| {
+                        let pk_norm = normalize_ident(pk_name);
+                        target_cols.len() == 1 && target_cols.contains(&pk_norm)
+                    })
+                    .unwrap_or(false);
+
+                if is_rowid_match {
+                    if plan.rowid_action.is_some() {
+                        crate::bail_parse_error!(
+                            "multiple ON CONFLICT clauses for the same target"
+                        );
+                    }
+                    plan.rowid_action = Some(action);
+                } else {
+                    // Try to match against unique indexes.
+                    let mut matched = false;
+                    for index in schema.get_indices(table_name) {
+                        if !index.unique {
+                            continue;
+                        }
+                        let idx_cols: std::collections::BTreeSet<String> = index
+                            .columns
+                            .iter()
+                            .map(|c| normalize_ident(&c.name))
+                            .collect();
+                        if idx_cols == target_cols {
+                            if plan.index_actions.iter().any(|(n, _)| n == &index.name) {
+                                crate::bail_parse_error!(
+                                    "multiple ON CONFLICT clauses for the same target"
+                                );
+                            }
+                            plan.index_actions.push((index.name.clone(), action));
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if !matched {
+                        crate::bail_parse_error!(
+                            "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"
+                        );
+                    }
+                }
+            }
+        }
+        current = clause.next.as_deref();
+    }
+
+    Ok(plan)
+}
 
 struct TempTableCtx {
     cursor_id: usize,
@@ -54,9 +203,31 @@ pub fn translate_insert(
     if with.is_some() {
         crate::bail_parse_error!("WITH clause is not supported");
     }
-    if on_conflict.is_some() {
-        crate::bail_parse_error!("ON CONFLICT clause is not supported");
-    }
+    // Determine the requested OR-conflict resolution for `INSERT OR <action>`.
+    // All five conflict actions are supported:
+    //   * IGNORE    — skip the offending row, leaving no partial table/index state.
+    //   * REPLACE   — delete the conflicting victim row(s) (and ALL their index
+    //                 entries) before inserting the new row.
+    //   * ABORT     — (default) roll back all rows inserted by this statement,
+    //                 keep prior transaction work, return error. For multi-row INSERTs,
+    //                 a statement-level savepoint ("_stmt") is opened before writes and
+    //                 rolled back on conflict.
+    //   * FAIL      — keep rows inserted so far, stop on conflict, return error.
+    //                 No savepoint needed (partial work is intentionally preserved).
+    //   * ROLLBACK  — like ABORT but should roll back the entire transaction.
+    //                 Currently uses the same savepoint mechanism as ABORT (rolls back
+    //                 only rows from this statement; full-transaction rollback is a
+    //                 follow-up).
+    let on_conflict_ignore = matches!(on_conflict, Some(ResolveType::Ignore));
+    let on_conflict_replace = matches!(on_conflict, Some(ResolveType::Replace));
+    let on_conflict_abort = matches!(on_conflict, None | Some(ResolveType::Abort));
+    let _on_conflict_fail = matches!(on_conflict, Some(ResolveType::Fail));
+    let on_conflict_rollback = matches!(on_conflict, Some(ResolveType::Rollback));
+    // ABORT and ROLLBACK need a statement-level savepoint to revert partial inserts on
+    // multi-row INSERTs. Single-row INSERTs have no partial state to revert.
+    // FAIL keeps rows inserted so far, so it does NOT need a savepoint.
+    // The final `needs_stmt_savepoint` is computed after `inserting_multiple_rows` is known.
+    let on_conflict_needs_savepoint = on_conflict_abort || on_conflict_rollback;
 
     #[cfg(not(feature = "index_experimental"))]
     {
@@ -74,7 +245,7 @@ pub fn translate_insert(
         None => crate::bail_parse_error!("no such table: {}", table_name),
     };
 
-    let resolver = Resolver::new(schema, syms);
+    let mut resolver = Resolver::new(schema, syms);
 
     if let Some(virtual_table) = &table.virtual_table() {
         program = translate_virtual_table_insert(
@@ -98,6 +269,18 @@ pub fn translate_insert(
 
     let root_page = btree_table.root_page;
 
+    // Extract the upsert clause from the INSERT body *before* body is consumed
+    // by the pre-pass below.  Taking it here avoids borrowing `body` mutably
+    // twice and makes the `upsert_plan` available for the rest of the function.
+    let upsert_opt: Option<Upsert> = match &mut body {
+        InsertBody::Select(_, u) => u.take(),
+        InsertBody::DefaultValues => None,
+    };
+    let upsert_plan: Option<UpsertPlan> = upsert_opt
+        .as_ref()
+        .map(|u| resolve_upsert_targets(schema, &table_name.0, &*btree_table, u))
+        .transpose()?;
+
     let mut values: Option<Vec<Expr>> = None;
     let inserting_multiple_rows = match &mut body {
         InsertBody::Select(select, _) => match select.body.select.as_mut() {
@@ -117,6 +300,8 @@ pub fn translate_insert(
         },
         InsertBody::DefaultValues => false,
     };
+    // Savepoint is only needed for multi-row inserts; single-row has no partial state.
+    let needs_stmt_savepoint = on_conflict_needs_savepoint && inserting_multiple_rows;
 
     let halt_label = program.allocate_label();
     let loop_start_label = program.allocate_label();
@@ -124,7 +309,6 @@ pub fn translate_insert(
     let mut yield_reg_opt = None;
     let mut temp_table_ctx = None;
     let (num_values, cursor_id) = match body {
-        // TODO: upsert
         InsertBody::Select(select, _) => {
             // Simple Common case of INSERT INTO <table> VALUES (...)
             if matches!(select.body.select.as_ref(),  OneSelect::Values(values) if values.len() <= 1)
@@ -192,9 +376,9 @@ pub fn translate_insert(
                         is_table: true,
                     });
 
-                    // Main loop
-                    // FIXME: rollback is not implemented. E.g. if you insert 2 rows and one fails to unique constraint violation,
-                    // the other row will still be inserted.
+                    // Main loop: fills the ephemeral temp table from the coroutine.
+                    // Rollback of the real table writes is handled via the "_stmt" savepoint
+                    // opened before OpenWrite; conflict handlers emit Savepoint RollbackTo before Halt.
                     program.preassign_label_to_next_insn(loop_start_label);
 
                     let yield_label = program.allocate_label();
@@ -233,21 +417,33 @@ pub fn translate_insert(
 
                     program.preassign_label_to_next_insn(yield_label);
 
+                    if needs_stmt_savepoint {
+                        program.emit_insn(Insn::Savepoint {
+                            op: SavepointOp::Begin,
+                            name: "_stmt".to_string(),
+                        });
+                    }
                     program.emit_insn(Insn::OpenWrite {
                         cursor_id,
                         root_page: RegisterOrLiteral::Literal(root_page),
                         name: table_name.0.clone(),
                     });
                 } else {
+                    if needs_stmt_savepoint {
+                        program.emit_insn(Insn::Savepoint {
+                            op: SavepointOp::Begin,
+                            name: "_stmt".to_string(),
+                        });
+                    }
                     program.emit_insn(Insn::OpenWrite {
                         cursor_id,
                         root_page: RegisterOrLiteral::Literal(root_page),
                         name: table_name.0.clone(),
                     });
 
-                    // Main loop
-                    // FIXME: rollback is not implemented. E.g. if you insert 2 rows and one fails to unique constraint violation,
-                    // the other row will still be inserted.
+                    // Main loop: each iteration yields a row from the coroutine, processes it,
+                    // and inserts it. Rollback of partial inserts is handled via the "_stmt" savepoint
+                    // opened before OpenWrite; conflict handlers emit Savepoint RollbackTo before Halt.
                     program.preassign_label_to_next_insn(loop_start_label);
                     program.emit_insn(Insn::Yield {
                         yield_reg,
@@ -306,6 +502,16 @@ pub fn translate_insert(
 
     let record_register = program.alloc_register();
 
+    // Names of the columns that make up the table's PRIMARY KEY (normalized for
+    // case-insensitive comparison). Used as defense-in-depth so that an unmapped
+    // PRIMARY KEY column is never silently populated with NULL, even when the
+    // key is declared via a table-level `PRIMARY KEY(...)` constraint.
+    let primary_key_columns: Vec<String> = btree_table
+        .primary_key_columns
+        .iter()
+        .map(|(name, _)| normalize_ident(name))
+        .collect();
+
     if inserting_multiple_rows {
         if let Some(ref temp_table_ctx) = temp_table_ctx {
             // Rewind loop to read from ephemeral table
@@ -322,9 +528,16 @@ pub fn translate_insert(
             yield_reg_opt.unwrap() + 1,
             &resolver,
             &temp_table_ctx,
+            &primary_key_columns,
         )?;
     } else {
         // Single row - populate registers directly
+        if needs_stmt_savepoint {
+            program.emit_insn(Insn::Savepoint {
+                op: SavepointOp::Begin,
+                name: "_stmt".to_string(),
+            });
+        }
         program.emit_insn(Insn::OpenWrite {
             cursor_id,
             root_page: RegisterOrLiteral::Literal(root_page),
@@ -338,6 +551,7 @@ pub fn translate_insert(
             column_registers_start,
             rowid_reg,
             &resolver,
+            &primary_key_columns,
         )?;
     }
     // Open all the index btrees for writing
@@ -386,32 +600,112 @@ pub fn translate_insert(
         program.emit_insn(Insn::MustBeInt { reg: rowid_reg });
     }
 
+    // Label that all conflict-resolution paths converge on once this row has
+    // been fully processed. For `INSERT OR IGNORE`, a conflicting row jumps here
+    // (skipping every IdxInsert and the table Insert) so it leaves NO partial
+    // index/table state. It is preassigned to the instruction immediately AFTER
+    // the table Insert below, i.e. the natural continue point: single-row falls
+    // through to the end; multi-row continues via Next / Goto loop_start.
+    let next_record_label = program.allocate_label();
+
+    // ---------------------------------------------------------------------
+    // CONFLICT-CHECK PHASE
+    //
+    // Audit checkpoint (partial-state safety): EVERY conflict check (the rowid
+    // NotExists plus each unique-index NoConflict) is emitted here, BEFORE any
+    // IdxInsert or the table Insert in the insert phase further below. That way
+    // an IGNORE that bails on a late-discovered conflict cannot have written any
+    // earlier index entry, and a REPLACE only ever deletes pre-existing victims.
+    // ---------------------------------------------------------------------
+
     // Check uniqueness constraint for rowid if it was provided by user.
     // When the DB allocates it there are no need for separate uniqueness checks.
     if has_user_provided_rowid {
-        let make_record_label = program.allocate_label();
+        // NotExists falls through (to pc+1) when the rowid ALREADY exists (the
+        // table cursor is then positioned on the conflicting victim row), and
+        // jumps to `no_rowid_conflict_label` when it does not exist.
+        let no_rowid_conflict_label = program.allocate_label();
         program.emit_insn(Insn::NotExists {
             cursor: cursor_id,
             rowid_reg,
-            target_pc: make_record_label,
+            target_pc: no_rowid_conflict_label,
         });
-        let rowid_column_name = if let Some(index) = rowid_alias_index {
-            btree_table
-                .columns
-                .get(index)
-                .unwrap()
-                .name
-                .as_ref()
-                .expect("column name is None")
-        } else {
-            "rowid"
-        };
 
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-            description: format!("{}.{}", table_name.0, rowid_column_name),
+        // Upsert DO NOTHING on the rowid/PK target or a catch-all clause.
+        let rowid_upsert_nothing = upsert_plan.as_ref().map_or(false, |p| {
+            p.catch_all_nothing || matches!(p.rowid_action, Some(UpsertAction::Nothing))
         });
-        program.preassign_label_to_next_insn(make_record_label);
+
+        if rowid_upsert_nothing {
+            // Skip this row entirely (upsert DO NOTHING).
+            program.emit_insn(Insn::Goto {
+                target_pc: next_record_label,
+            });
+        } else if let Some(UpsertAction::Update { sets, where_clause }) =
+            upsert_plan.as_ref().and_then(|p| p.rowid_action.as_ref())
+        {
+            emit_upsert_do_update(
+                &mut program,
+                schema,
+                &table_name.0,
+                &btree_table,
+                cursor_id,
+                column_registers_start,
+                rowid_reg,
+                num_cols,
+                rowid_alias_index,
+                sets,
+                where_clause.as_ref(),
+                next_record_label,
+                needs_stmt_savepoint,
+                &idx_cursors,
+                &mut resolver,
+            )?;
+        } else if on_conflict_ignore {
+            // Skip this row entirely; the table cursor is on the victim but we
+            // perform no inserts, so no partial state is produced.
+            program.emit_insn(Insn::Goto {
+                target_pc: next_record_label,
+            });
+        } else if on_conflict_replace {
+            // REPLACE: the table cursor is positioned on the victim, so delete
+            // the victim (and ALL its index entries) and carry on. Because this
+            // deletion also removes the victim's unique-index entries, a later
+            // NoConflict on those same entries will find nothing — this is what
+            // dedups a single existing row that collides on both rowid and a
+            // unique index (no double delete).
+            emit_replace_victim_deletion(
+                &mut program,
+                schema,
+                &table_name.0,
+                cursor_id,
+                &idx_cursors,
+            );
+        } else {
+            let rowid_column_name = if let Some(index) = rowid_alias_index {
+                btree_table
+                    .columns
+                    .get(index)
+                    .unwrap()
+                    .name
+                    .as_ref()
+                    .expect("column name is None")
+            } else {
+                "rowid"
+            };
+
+            if needs_stmt_savepoint {
+                program.emit_insn(Insn::Savepoint {
+                    op: SavepointOp::RollbackTo,
+                    name: "_stmt".to_string(),
+                });
+            }
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                description: format!("{}.{}", table_name.0, rowid_column_name),
+            });
+        }
+        program.preassign_label_to_next_insn(no_rowid_conflict_label);
     }
 
     match table.btree() {
@@ -426,7 +720,23 @@ pub fn translate_insert(
         _ => (),
     }
 
+    // Pre-build the index records for every index, then run all the conflict
+    // checks, then perform all the insertions. Keeping the per-index scratch
+    // registers and MakeRecord results alive across these phases lets us emit
+    // every NoConflict before any IdxInsert (see the partial-state checkpoint).
+    struct IndexInsertPlan {
+        idx_cursor_id: usize,
+        idx_start_reg: usize,
+        num_cols: usize,
+        record_reg: usize,
+        unique: bool,
+        conflict_description: String,
+        /// Normalised index name — used to look up upsert actions.
+        index_name: String,
+    }
+
     let index_col_mappings = resolve_indicies_for_insert(schema, table.as_ref(), &column_mappings)?;
+    let mut index_insert_plans: Vec<IndexInsertPlan> = Vec::with_capacity(index_col_mappings.len());
     for index_col_mapping in index_col_mappings {
         // find which cursor we opened earlier for this index
         let idx_cursor_id = idx_cursors
@@ -460,7 +770,33 @@ pub fn translate_insert(
             .get_index(&table_name.0, &index_col_mapping.idx_name)
             .expect("index should be present");
 
+        let column_names = index_col_mapping.columns.iter().enumerate().fold(
+            String::with_capacity(50),
+            |mut accum, (idx, (index, _))| {
+                if idx > 0 {
+                    accum.push_str(", ");
+                }
+
+                accum.push_str(&btree_table.name);
+                accum.push('.');
+
+                let name = btree_table
+                    .columns
+                    .get(*index)
+                    .unwrap()
+                    .name
+                    .as_ref()
+                    .expect("column name is None");
+                accum.push_str(name);
+
+                accum
+            },
+        );
+
         let record_reg = program.alloc_register();
+        // Clone the name before it is moved into MakeRecord so we can store it
+        // in IndexInsertPlan for upsert action look-ups.
+        let this_index_name = index_col_mapping.idx_name.clone();
         program.emit_insn(Insn::MakeRecord {
             start_reg: idx_start_reg,
             count: num_cols + 1,
@@ -468,60 +804,152 @@ pub fn translate_insert(
             index_name: Some(index_col_mapping.idx_name),
         });
 
-        if index.unique {
-            let label_idx_insert = program.allocate_label();
-            program.emit_insn(Insn::NoConflict {
-                cursor_id: idx_cursor_id,
-                target_pc: label_idx_insert,
-                record_reg: idx_start_reg,
-                num_regs: num_cols,
+        index_insert_plans.push(IndexInsertPlan {
+            idx_cursor_id,
+            idx_start_reg,
+            num_cols,
+            record_reg,
+            unique: index.unique,
+            conflict_description: column_names,
+            index_name: this_index_name,
+        });
+    }
+
+    // Unique-index conflict checks (run for every unique index BEFORE any insert).
+    for plan in index_insert_plans.iter() {
+        if !plan.unique {
+            continue;
+        }
+        // NoConflict jumps to `no_idx_conflict_label` when there is NO conflict
+        // (or the key contains NULLs); it falls through (to pc+1) when a
+        // conflicting index entry exists, leaving the INDEX cursor positioned on
+        // that entry.
+        let no_idx_conflict_label = program.allocate_label();
+        program.emit_insn(Insn::NoConflict {
+            cursor_id: plan.idx_cursor_id,
+            target_pc: no_idx_conflict_label,
+            record_reg: plan.idx_start_reg,
+            num_regs: plan.num_cols,
+        });
+
+        // Upsert action for this specific index target, or catch-all.
+        let idx_upsert_nothing = upsert_plan.as_ref().map_or(false, |p| {
+            p.catch_all_nothing
+                || p.index_actions
+                    .iter()
+                    .find(|(n, _)| n == &plan.index_name)
+                    .map_or(false, |(_, a)| matches!(a, UpsertAction::Nothing))
+        });
+        let idx_upsert_update = upsert_plan.as_ref().map_or(false, |p| {
+            !p.catch_all_nothing
+                && p.index_actions
+                    .iter()
+                    .find(|(n, _)| n == &plan.index_name)
+                    .map_or(false, |(_, a)| matches!(a, UpsertAction::Update { .. }))
+        });
+
+        if idx_upsert_nothing {
+            // Upsert DO NOTHING — skip this row.
+            program.emit_insn(Insn::Goto {
+                target_pc: next_record_label,
             });
-            let column_names = index_col_mapping.columns.iter().enumerate().fold(
-                String::with_capacity(50),
-                |mut accum, (idx, (index, _))| {
-                    if idx > 0 {
-                        accum.push_str(", ");
-                    }
-
-                    accum.push_str(&btree_table.name);
-                    accum.push('.');
-
-                    let name = btree_table
-                        .columns
-                        .get(*index)
-                        .unwrap()
-                        .name
-                        .as_ref()
-                        .expect("column name is None");
-                    accum.push_str(name);
-
-                    accum
-                },
+        } else if idx_upsert_update {
+            // Position table cursor on the victim row via the index.
+            let victim_rowid_reg = program.alloc_register();
+            program.emit_insn(Insn::IdxRowId {
+                cursor_id: plan.idx_cursor_id,
+                dest: victim_rowid_reg,
+            });
+            let victim_seeked_label = program.allocate_label();
+            program.emit_insn(Insn::SeekRowid {
+                cursor_id,
+                src_reg: victim_rowid_reg,
+                target_pc: victim_seeked_label,
+            });
+            // SeekRowid falls through when found — cursor is now on the victim.
+            if let Some((_, UpsertAction::Update { sets, where_clause })) = upsert_plan
+                .as_ref()
+                .and_then(|p| p.index_actions.iter().find(|(n, _)| n == &plan.index_name))
+            {
+                emit_upsert_do_update(
+                    &mut program,
+                    schema,
+                    &table_name.0,
+                    &btree_table,
+                    cursor_id,
+                    column_registers_start,
+                    rowid_reg,
+                    num_cols,
+                    rowid_alias_index,
+                    sets,
+                    where_clause.as_ref(),
+                    next_record_label,
+                    needs_stmt_savepoint,
+                    &idx_cursors,
+                    &mut resolver,
+                )?;
+            }
+            program.preassign_label_to_next_insn(victim_seeked_label);
+        } else if on_conflict_ignore {
+            program.emit_insn(Insn::Goto {
+                target_pc: next_record_label,
+            });
+        } else if on_conflict_replace {
+            // REPLACE at a unique-index conflict: the index cursor is on the
+            // conflicting entry. Read its rowid, seek the TABLE cursor onto that
+            // victim row, then delete the victim (and ALL its index entries).
+            //
+            // Audit checkpoint (victim dedup): this interleaved check->delete
+            // structure naturally dedups — deletions only ever REMOVE entries and
+            // can never turn an earlier "no conflict" into a conflict, so a row
+            // that collides on multiple unique indexes pointing at DIFFERENT
+            // existing rows deletes every distinct victim, while a single row
+            // colliding on several keys is deleted once (later NoConflicts then
+            // find nothing).
+            let victim_rowid_reg = program.alloc_register();
+            program.emit_insn(Insn::IdxRowId {
+                cursor_id: plan.idx_cursor_id,
+                dest: victim_rowid_reg,
+            });
+            // SeekRowid positions the table cursor on the victim. It should
+            // always be found (the index entry references a live row); route the
+            // not-found branch to the same place as the found path so that, in
+            // the worst case, we simply skip a spurious delete rather than
+            // corrupt anything.
+            let victim_seeked_label = program.allocate_label();
+            program.emit_insn(Insn::SeekRowid {
+                cursor_id,
+                src_reg: victim_rowid_reg,
+                target_pc: victim_seeked_label,
+            });
+            emit_replace_victim_deletion(
+                &mut program,
+                schema,
+                &table_name.0,
+                cursor_id,
+                &idx_cursors,
             );
-
+            program.preassign_label_to_next_insn(victim_seeked_label);
+        } else {
+            if needs_stmt_savepoint {
+                program.emit_insn(Insn::Savepoint {
+                    op: SavepointOp::RollbackTo,
+                    name: "_stmt".to_string(),
+                });
+            }
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                description: column_names,
+                description: plan.conflict_description.clone(),
             });
-
-            program.resolve_label(label_idx_insert, program.offset());
         }
 
-        // now do the actual index insertion using the unpacked registers
-        program.emit_insn(Insn::IdxInsert {
-            cursor_id: idx_cursor_id,
-            record_reg,
-            unpacked_start: Some(idx_start_reg), // TODO: enable optimization
-            unpacked_count: Some((num_cols + 1) as u16),
-            // TODO: figure out how to determine whether or not we need to seek prior to insert.
-            flags: IdxInsertFlags::new(),
-        });
+        program.preassign_label_to_next_insn(no_idx_conflict_label);
     }
 
     for (i, col) in column_mappings
         .iter()
         .enumerate()
-        .filter(|(_, col)| col.column.notnull)
+        .filter(|(_, col)| col.column.notnull && !col.column.is_rowid_alias)
     {
         let target_reg = i + column_registers_start;
         program.emit_insn(Insn::HaltIfNull {
@@ -537,6 +965,42 @@ pub fn translate_insert(
             ),
         });
     }
+
+    // ---------------------------------------------------------------------
+    // INSERT PHASE
+    // ---------------------------------------------------------------------
+
+    // Audit checkpoint (cursor-position hazard): for REPLACE, a unique-index
+    // conflict deletion moved the TABLE cursor via SeekRowid (and a rowid
+    // conflict deletion left it on the now-deleted victim). The final table
+    // Insert (op_insert) is emitted with moved_before=true and otherwise relies
+    // on the positioning established by NotExists / NewRowid, so we MUST re-seek
+    // the table cursor to the target rowid before inserting. SeekRowid leaves the
+    // cursor on the correct leaf page even when the rowid is absent (which it now
+    // is), making moved_before=true valid. Both the found and not-found branches
+    // converge on the very next instruction, so this is purely a reposition.
+    if on_conflict_replace {
+        let reseek_done_label = program.allocate_label();
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id,
+            src_reg: rowid_reg,
+            target_pc: reseek_done_label,
+        });
+        program.preassign_label_to_next_insn(reseek_done_label);
+    }
+
+    // Now perform every index insertion using the unpacked registers.
+    for plan in index_insert_plans.iter() {
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: plan.idx_cursor_id,
+            record_reg: plan.record_reg,
+            unpacked_start: Some(plan.idx_start_reg), // TODO: enable optimization
+            unpacked_count: Some((plan.num_cols + 1) as u16),
+            // TODO: figure out how to determine whether or not we need to seek prior to insert.
+            flags: IdxInsertFlags::new(),
+        });
+    }
+
     // Create and insert the record
     program.emit_insn(Insn::MakeRecord {
         start_reg: column_registers_start,
@@ -552,6 +1016,9 @@ pub fn translate_insert(
         flag: InsertFlags::new(),
         table_name: table_name.to_string(),
     });
+
+    // IGNORE jumps here, skipping all inserts; a successful insert falls through.
+    program.preassign_label_to_next_insn(next_record_label);
 
     if inserting_multiple_rows {
         if let Some(temp_table_ctx) = temp_table_ctx {
@@ -572,10 +1039,83 @@ pub fn translate_insert(
         }
     }
 
+    // Release statement savepoint after all rows processed successfully.
+    // IMPORTANT: halt_label must be resolved BEFORE emitting the Release instruction,
+    // so that the direct-coroutine Yield (end_offset: halt_label) jumps to the Release
+    // when the coroutine finishes. For the temp-table path, control falls through here
+    // naturally and executes the Release as well. Without this ordering, the Release
+    // would be unreachable via the Yield-done path.
     program.resolve_label(halt_label, program.offset());
+    if needs_stmt_savepoint {
+        program.emit_insn(Insn::Savepoint {
+            op: SavepointOp::Release,
+            name: "_stmt".to_string(),
+        });
+    }
     program.epilogue(super::emitter::TransactionMode::Write);
 
     Ok(program)
+}
+
+/// Emit the code that removes a single conflicting "victim" row during
+/// `INSERT OR REPLACE`.
+///
+/// Preconditions: the table cursor (`table_cursor_id`) is already positioned on
+/// the victim row (e.g. by `NotExists` falling through at a rowid conflict, or by
+/// `IdxRowId` + `SeekRowid` at a unique-index conflict).
+///
+/// This mirrors [`super::emitter::emit_delete_insns`]: it reads the OLD column
+/// values of the victim directly from the positioned table cursor and deletes
+/// the victim's entry from EVERY index (unique and non-unique) before deleting
+/// the table row itself. Removing entries can never invalidate an earlier
+/// "no conflict" decision, so interleaving these deletions with the remaining
+/// conflict checks is safe (and naturally dedups victims — see
+/// `translate_insert`).
+///
+/// `idx_cursors` is the `(name, root_page, cursor_id)` list opened for writing in
+/// `translate_insert`; only indexes that have a materialized cursor are touched.
+fn emit_replace_victim_deletion(
+    program: &mut ProgramBuilder,
+    schema: &Schema,
+    table_name: &str,
+    table_cursor_id: usize,
+    idx_cursors: &[(&String, usize, usize)],
+) {
+    // Delete from all indexes first, then the table row (matching emit_delete_insns).
+    for index in schema.get_indices(table_name) {
+        // Find the cursor we opened for this index; skip if it was not
+        // materialized (indexes are only opened under index_experimental).
+        let Some((_, _, idx_cursor_id)) =
+            idx_cursors.iter().find(|(name, _, _)| **name == index.name)
+        else {
+            continue;
+        };
+        let num_regs = index.columns.len() + 1;
+        let start_reg = program.alloc_registers(num_regs);
+        // Emit the OLD values of the columns that make up the index, read from
+        // the positioned table cursor.
+        for (reg_offset, idx_col) in index.columns.iter().enumerate() {
+            program.emit_column(
+                table_cursor_id,
+                idx_col.pos_in_table,
+                start_reg + reg_offset,
+            );
+        }
+        // The trailing register is the victim's rowid.
+        program.emit_insn(Insn::RowId {
+            cursor_id: table_cursor_id,
+            dest: start_reg + num_regs - 1,
+        });
+        program.emit_insn(Insn::IdxDelete {
+            start_reg,
+            num_regs,
+            cursor_id: *idx_cursor_id,
+        });
+    }
+    // Finally remove the victim's table row.
+    program.emit_insn(Insn::Delete {
+        cursor_id: table_cursor_id,
+    });
 }
 
 #[derive(Debug)]
@@ -739,6 +1279,7 @@ fn populate_columns_multiple_rows(
     yield_reg: usize,
     resolver: &Resolver,
     temp_table_ctx: &Option<TempTableCtx>,
+    primary_key_columns: &[String],
 ) -> Result<()> {
     let mut value_index_seen = 0;
     let mut other_values_seen = 0;
@@ -769,9 +1310,16 @@ fn populate_columns_multiple_rows(
         } else if let Some(default_expr) = mapping.default_value {
             translate_expr(program, None, default_expr, target_reg, resolver)?;
         } else {
-            // Column was not specified as has no DEFAULT - use NULL if it is nullable, otherwise error
-            // Rowid alias columns can be NULL because we will autogenerate a rowid in that case.
-            let is_nullable = !mapping.column.primary_key || mapping.column.is_rowid_alias;
+            // Column was not specified and has no DEFAULT - use NULL if it is
+            // nullable, otherwise error.
+            //
+            // Rowid-alias columns may be NULL here because the engine
+            // autogenerates a rowid for them. A column belonging to the table's
+            // PRIMARY KEY is never silently NULL-able: we consult both the
+            // per-column `primary_key` flag AND the table's `primary_key_columns`
+            // list (case-insensitively) so that an unmapped PK column is rejected
+            // even if some earlier path failed to set the flag.
+            let is_nullable = column_is_nullable(mapping.column, primary_key_columns);
             if is_nullable {
                 program.emit_insn(Insn::Null {
                     dest: target_reg,
@@ -788,6 +1336,33 @@ fn populate_columns_multiple_rows(
     Ok(())
 }
 
+/// Determines whether an *unmapped* column (no VALUES entry, no DEFAULT) may be
+/// populated with NULL during an INSERT.
+///
+/// A column is NULL-able unless it is part of the table's PRIMARY KEY, with one
+/// exception: a rowid-alias column (`INTEGER PRIMARY KEY`) is treated as
+/// NULL-able because the engine autogenerates a rowid for it.
+///
+/// PRIMARY KEY membership is checked via both the per-column `primary_key` flag
+/// and the table's `primary_key_columns` list (compared case-insensitively).
+/// The latter is defense-in-depth: a table-level `PRIMARY KEY(col)` constraint
+/// must never let an unmapped key column silently default to NULL even if the
+/// per-column flag was not propagated for some reason.
+fn column_is_nullable(column: &Column, primary_key_columns: &[String]) -> bool {
+    if column.is_rowid_alias {
+        return true;
+    }
+    if column.primary_key {
+        return false;
+    }
+    let in_table_pk = column.name.as_ref().is_some_and(|name| {
+        primary_key_columns
+            .iter()
+            .any(|pk| pk.eq_ignore_ascii_case(name))
+    });
+    !in_table_pk
+}
+
 /// Populates the column registers with values for a single row
 #[allow(clippy::too_many_arguments)]
 fn populate_column_registers(
@@ -797,6 +1372,7 @@ fn populate_column_registers(
     column_registers_start: usize,
     rowid_reg: usize,
     resolver: &Resolver,
+    primary_key_columns: &[String],
 ) -> Result<()> {
     for (i, mapping) in column_mappings.iter().enumerate() {
         let target_reg = column_registers_start + i;
@@ -832,9 +1408,12 @@ fn populate_column_registers(
                 NoConstantOptReason::RegisterReuse,
             )?;
         } else {
-            // Column was not specified as has no DEFAULT - use NULL if it is nullable, otherwise error
-            // Rowid alias columns can be NULL because we will autogenerate a rowid in that case.
-            let is_nullable = !mapping.column.primary_key || mapping.column.is_rowid_alias;
+            // Column was not specified and has no DEFAULT - use NULL if it is
+            // nullable, otherwise error. See `column_is_nullable`: PRIMARY KEY
+            // columns (including those named only in a table-level
+            // `PRIMARY KEY(...)` clause) are never silently NULL-able, while a
+            // rowid-alias column is, because a rowid is autogenerated.
+            let is_nullable = column_is_nullable(mapping.column, primary_key_columns);
             if is_nullable {
                 program.emit_insn(Insn::Null {
                     dest: target_reg,
@@ -867,7 +1446,9 @@ fn translate_virtual_table_insert(
             _ => crate::bail_parse_error!("Virtual tables only support VALUES clause in INSERT"),
         },
         InsertBody::DefaultValues => (0, vec![]),
-        _ => crate::bail_parse_error!("Unsupported INSERT body for virtual tables"),
+        InsertBody::Select(_, Some(_)) => {
+            crate::bail_parse_error!("ON CONFLICT is not supported for virtual tables")
+        }
     };
     let table = Table::Virtual(virtual_table.clone());
     let column_mappings = resolve_columns_for_insert(&table, &columns, num_values)?;
@@ -886,6 +1467,8 @@ fn translate_virtual_table_insert(
     });
 
     let values_reg = program.alloc_registers(column_mappings.len());
+    // Virtual tables have no rowid-based PRIMARY KEY bookkeeping here; the module
+    // performs its own constraint handling via VUpdate.
     populate_column_registers(
         &mut program,
         &value,
@@ -893,6 +1476,7 @@ fn translate_virtual_table_insert(
         values_reg,
         registers_start,
         resolver,
+        &[],
     )?;
     let conflict_action = on_conflict.as_ref().map(|c| c.bit_value()).unwrap_or(0) as u16;
 
@@ -909,4 +1493,296 @@ fn translate_virtual_table_insert(
     program.resolve_label(halt_label, program.offset());
 
     Ok(program)
+}
+
+#[cfg(test)]
+mod insert_pk_param_tests {
+    //! Regression tests for positional-parameter binding against columns that
+    //! belong to a table-level `PRIMARY KEY(...)` constraint.
+    //!
+    //! Historically, an `INTEGER NOT NULL` column promoted to a rowid alias by a
+    //! table-level PRIMARY KEY would trip the column's `NOT NULL` HaltIfNull
+    //! guard (the rowid-alias register is intentionally SoftNull'd), causing a
+    //! spurious "NOT NULL constraint failed" on `INSERT ... VALUES (?)`. These
+    //! tests pin the corrected behaviour end-to-end.
+
+    use crate::schema::Column;
+    use crate::schema::Type;
+    use crate::{Database, StepResult, Value};
+    use std::num::NonZero;
+    use std::sync::Arc;
+
+    use super::column_is_nullable;
+
+    /// Build an in-memory database, run `create`, INSERT a single bound integer
+    /// parameter via `INSERT INTO t VALUES (?)`, then read column `select_col`
+    /// back from the single resulting row.
+    fn insert_param_and_read_back(create: &str, select_col: &str, bound: i64) -> Value {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let db =
+            Database::open_file(io.clone(), ":memory:", false).expect("open in-memory database");
+        let conn = db.connect().expect("connect");
+        conn.execute(create).expect("create table");
+
+        let mut stmt = conn
+            .prepare("INSERT INTO t VALUES (?)")
+            .expect("prepare insert");
+        stmt.bind_at(
+            NonZero::new(1).expect("nonzero index"),
+            Value::Integer(bound),
+        );
+        loop {
+            match stmt.step().expect("insert step") {
+                StepResult::Done => break,
+                StepResult::IO => io.run_once().expect("insert io"),
+                other => panic!("unexpected insert step result: {other:?}"),
+            }
+        }
+
+        let mut q = conn
+            .prepare(&format!("SELECT {select_col} FROM t"))
+            .expect("prepare select");
+        loop {
+            match q.step().expect("select step") {
+                StepResult::Row => {
+                    return q.row().expect("row").get_value(0).clone();
+                }
+                StepResult::IO => io.run_once().expect("select io"),
+                StepResult::Done => panic!("no row returned for SELECT {select_col}"),
+                other => panic!("unexpected select step result: {other:?}"),
+            }
+        }
+    }
+
+    /// Helper to construct a `Column` for `column_is_nullable` unit tests.
+    fn col(name: &str, primary_key: bool, is_rowid_alias: bool) -> Column {
+        Column {
+            name: Some(name.to_string()),
+            ty: Type::Integer,
+            ty_str: "INTEGER".to_string(),
+            primary_key,
+            is_rowid_alias,
+            notnull: false,
+            default: None,
+            unique: false,
+            collation: None,
+        }
+    }
+
+    #[test]
+    fn table_level_pk_param_not_null() {
+        // The exact historically-failing case: a bound parameter against an
+        // INTEGER NOT NULL column that is the table-level PRIMARY KEY must round
+        // trip, NOT raise a spurious NOT NULL error nor become NULL.
+        let got = insert_param_and_read_back(
+            "CREATE TABLE t(a INTEGER NOT NULL, PRIMARY KEY(a))",
+            "a",
+            42,
+        );
+        assert_eq!(
+            got,
+            Value::Integer(42),
+            "bound param must round-trip, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn pk_column_before_constraint() {
+        // Column declared before the table-level PRIMARY KEY clause.
+        let got = insert_param_and_read_back(
+            "CREATE TABLE t(a INTEGER NOT NULL, PRIMARY KEY(a))",
+            "a",
+            7,
+        );
+        assert_eq!(got, Value::Integer(7));
+    }
+
+    #[cfg(feature = "index_experimental")]
+    #[test]
+    fn pk_column_after_constraint() {
+        // Order-independence: a non-rowid (TEXT) PK plus a trailing column. The
+        // PK column `a` is bound via an explicit column list; the unmapped
+        // nullable column `b` must default to NULL while `a` round-trips. This
+        // also exercises the defense-in-depth path where `a` (PK) is unmapped vs
+        // mapped depending on the column list.
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let db =
+            Database::open_file(io.clone(), ":memory:", false).expect("open in-memory database");
+        let conn = db.connect().expect("connect");
+        conn.execute("CREATE TABLE t(a TEXT NOT NULL, b TEXT, PRIMARY KEY(a))")
+            .expect("create table");
+
+        let mut stmt = conn
+            .prepare("INSERT INTO t(a) VALUES (?)")
+            .expect("prepare insert");
+        stmt.bind_at(NonZero::new(1).expect("idx"), Value::Integer(123));
+        loop {
+            match stmt.step().expect("insert step") {
+                StepResult::Done => break,
+                StepResult::IO => io.run_once().expect("insert io"),
+                other => panic!("unexpected insert step: {other:?}"),
+            }
+        }
+
+        let mut q = conn.prepare("SELECT a, b FROM t").expect("prepare select");
+        loop {
+            match q.step().expect("select step") {
+                StepResult::Row => {
+                    let row = q.row().expect("row");
+                    assert_eq!(row.get_value(0).clone(), Value::Integer(123));
+                    assert_eq!(row.get_value(1).clone(), Value::Null, "unmapped b is NULL");
+                    return;
+                }
+                StepResult::IO => io.run_once().expect("select io"),
+                StepResult::Done => panic!("no row returned"),
+                other => panic!("unexpected select step: {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(feature = "index_experimental")]
+    #[test]
+    fn composite_table_level_pk_params() {
+        // Composite table-level PRIMARY KEY: both key columns receive bound
+        // parameters and must round-trip (composite PK -> no rowid alias).
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let db =
+            Database::open_file(io.clone(), ":memory:", false).expect("open in-memory database");
+        let conn = db.connect().expect("connect");
+        conn.execute("CREATE TABLE t(a INTEGER NOT NULL, b INTEGER NOT NULL, PRIMARY KEY(a, b))")
+            .expect("create table");
+
+        let mut stmt = conn
+            .prepare("INSERT INTO t VALUES (?, ?)")
+            .expect("prepare insert");
+        stmt.bind_at(NonZero::new(1).expect("idx"), Value::Integer(10));
+        stmt.bind_at(NonZero::new(2).expect("idx"), Value::Integer(20));
+        loop {
+            match stmt.step().expect("insert step") {
+                StepResult::Done => break,
+                StepResult::IO => io.run_once().expect("insert io"),
+                other => panic!("unexpected insert step: {other:?}"),
+            }
+        }
+
+        let mut q = conn.prepare("SELECT a, b FROM t").expect("prepare select");
+        loop {
+            match q.step().expect("select step") {
+                StepResult::Row => {
+                    let row = q.row().expect("row");
+                    assert_eq!(row.get_value(0).clone(), Value::Integer(10));
+                    assert_eq!(row.get_value(1).clone(), Value::Integer(20));
+                    return;
+                }
+                StepResult::IO => io.run_once().expect("select io"),
+                StepResult::Done => panic!("no row returned"),
+                other => panic!("unexpected select step: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn column_level_int_pk_still_works() {
+        // No regression: a column-level INTEGER PRIMARY KEY rowid alias still
+        // accepts a bound parameter and stores it as the rowid value.
+        let got = insert_param_and_read_back("CREATE TABLE t(a INTEGER PRIMARY KEY)", "a", 99);
+        assert_eq!(got, Value::Integer(99));
+    }
+
+    #[test]
+    fn real_not_null_violation_still_errors() {
+        // The HaltIfNull relaxation must remain scoped to rowid-alias columns: a
+        // genuine NOT NULL violation on an ordinary column must still error.
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let db =
+            Database::open_file(io.clone(), ":memory:", false).expect("open in-memory database");
+        let conn = db.connect().expect("connect");
+        conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT NOT NULL)")
+            .expect("create table");
+
+        let mut stmt = conn
+            .prepare("INSERT INTO t(a) VALUES (1)")
+            .expect("prepare insert");
+        let mut errored = false;
+        loop {
+            match stmt.step() {
+                Ok(StepResult::Done) => break,
+                Ok(StepResult::IO) => io.run_once().expect("io"),
+                Ok(other) => panic!("unexpected step: {other:?}"),
+                Err(_) => {
+                    errored = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            errored,
+            "NOT NULL violation on non-rowid column must still error"
+        );
+    }
+
+    #[cfg(feature = "index_experimental")]
+    #[test]
+    fn unmapped_table_level_pk_column_is_not_silently_null() {
+        // Defense-in-depth at the statement level: a table-level PRIMARY KEY
+        // column omitted from the INSERT column list (and without DEFAULT) must
+        // be rejected as non-nullable rather than silently populated with NULL.
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let db =
+            Database::open_file(io.clone(), ":memory:", false).expect("open in-memory database");
+        let conn = db.connect().expect("connect");
+        // Composite PK avoids the rowid-alias special case; `a` is part of the
+        // PK but omitted below.
+        conn.execute("CREATE TABLE t(a TEXT, b TEXT, PRIMARY KEY(a, b))")
+            .expect("create table");
+
+        let result = conn.prepare("INSERT INTO t(b) VALUES ('x')");
+        match result {
+            // Rejected at translation time (preferred).
+            Err(_) => {}
+            // Or rejected at execution time.
+            Ok(mut stmt) => {
+                let mut errored = false;
+                loop {
+                    match stmt.step() {
+                        Ok(StepResult::Done) => break,
+                        Ok(StepResult::IO) => io.run_once().expect("io"),
+                        Ok(other) => panic!("unexpected step: {other:?}"),
+                        Err(_) => {
+                            errored = true;
+                            break;
+                        }
+                    }
+                }
+                assert!(
+                    errored,
+                    "omitting PK column `a` must not silently insert NULL"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn column_is_nullable_unit() {
+        // Rowid alias is always nullable (rowid is autogenerated).
+        assert!(column_is_nullable(&col("a", true, true), &[]));
+        // Per-column PK flag set -> not nullable.
+        assert!(!column_is_nullable(&col("a", true, false), &[]));
+        // Non-PK column not in the table PK list -> nullable.
+        assert!(column_is_nullable(&col("a", false, false), &[]));
+        // Defense-in-depth: flag missing but name is in the table PK list
+        // (case-insensitive) -> not nullable.
+        assert!(!column_is_nullable(
+            &col("a", false, false),
+            &["a".to_string()]
+        ));
+        assert!(!column_is_nullable(
+            &col("A", false, false),
+            &["a".to_string()]
+        ));
+        assert!(!column_is_nullable(
+            &col("a", false, false),
+            &["A".to_string()]
+        ));
+    }
 }

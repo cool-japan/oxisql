@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::fast_lock::SpinLock;
 use crate::schema::Schema;
-use crate::storage::pager::AutoVacuumMode;
+use crate::storage::pager::{AutoVacuumMode, SynchronousMode};
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, MIN_PAGE_CACHE_SIZE};
 use crate::storage::wal::CheckpointMode;
 use crate::util::{normalize_ident, parse_signed_number};
@@ -176,9 +176,44 @@ fn update_pragma(
             });
             Ok(())
         }
+        PragmaName::ApplicationId => {
+            // SQLite presents application_id as a SIGNED 32-bit integer.
+            // Parse the user-supplied signed-number and narrow to i32 so that
+            // values such as -1 round-trip faithfully through the header.
+            let data = parse_signed_number(&value)?;
+            let application_id_value = match data {
+                Value::Integer(i) => i as i32,
+                Value::Float(f) => f as i32,
+                other => {
+                    return Err(crate::LimboError::InvalidArgument(format!(
+                        "application_id must be an integer, got {other:?}"
+                    )));
+                }
+            };
+
+            program.emit_insn(Insn::SetCookie {
+                db: 0,
+                cookie: Cookie::ApplicationId,
+                value: application_id_value,
+                p5: 1,
+            });
+            Ok(())
+        }
         PragmaName::SchemaVersion => {
-            // TODO: Implement updating schema_version
-            todo!("updating schema_version not yet implemented")
+            let data = parse_signed_number(&value)?;
+            let schema_version_value = match data {
+                Value::Integer(i) => i as i32,
+                Value::Float(f) => f as i32,
+                _ => unreachable!(),
+            };
+
+            program.emit_insn(Insn::SetCookie {
+                db: 0,
+                cookie: Cookie::SchemaVersion,
+                value: schema_version_value,
+                p5: 1,
+            });
+            Ok(())
         }
         PragmaName::TableInfo | PragmaName::ForeignKeyList => {
             // because we need control over the write parameter for the transaction,
@@ -243,6 +278,49 @@ fn update_pragma(
                 value: auto_vacuum_mode - 1,
                 p5: 0,
             });
+            Ok(())
+        }
+        PragmaName::Synchronous => {
+            let mode = match &value {
+                Expr::Name(name) => {
+                    let n = name.0.to_ascii_lowercase();
+                    match n.as_str() {
+                        "off" => SynchronousMode::Off,
+                        "normal" => SynchronousMode::Normal,
+                        "full" => SynchronousMode::Full,
+                        "extra" => SynchronousMode::Extra,
+                        _ => {
+                            return Err(LimboError::InvalidArgument(format!(
+                                "invalid synchronous mode: {}",
+                                name.0
+                            )));
+                        }
+                    }
+                }
+                _ => {
+                    let n = match parse_signed_number(&value)? {
+                        Value::Integer(i) => i,
+                        Value::Float(f) => f as i64,
+                        other => {
+                            return Err(LimboError::InvalidArgument(format!(
+                                "invalid synchronous mode: {other:?}"
+                            )));
+                        }
+                    };
+                    match n {
+                        0 => SynchronousMode::Off,
+                        1 => SynchronousMode::Normal,
+                        2 => SynchronousMode::Full,
+                        3 => SynchronousMode::Extra,
+                        _ => {
+                            return Err(LimboError::InvalidArgument(format!(
+                                "invalid synchronous mode value: {n}"
+                            )));
+                        }
+                    }
+                }
+            };
+            pager.set_synchronous_mode(mode);
             Ok(())
         }
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
@@ -425,6 +503,15 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.to_string());
             program.emit_result_row(register, 1);
         }
+        PragmaName::ApplicationId => {
+            program.emit_insn(Insn::ReadCookie {
+                db: 0,
+                dest: register,
+                cookie: Cookie::ApplicationId,
+            });
+            program.add_pragma_result_column(pragma.to_string());
+            program.emit_result_row(register, 1);
+        }
         PragmaName::SchemaVersion => {
             program.emit_insn(Insn::ReadCookie {
                 db: 0,
@@ -454,6 +541,12 @@ fn query_pragma(
                 value: auto_vacuum_mode_i64,
             });
             program.emit_result_row(register, 1);
+        }
+        PragmaName::Synchronous => {
+            let mode = pager.get_synchronous_mode();
+            program.emit_int(mode.as_i64(), register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
         }
         PragmaName::IntegrityCheck => {
             translate_integrity_check(schema, program)?;

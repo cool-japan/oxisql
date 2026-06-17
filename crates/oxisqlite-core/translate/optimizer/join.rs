@@ -14,7 +14,6 @@ use crate::{
 use super::{
     access_method::{find_best_access_method_for_join_order, AccessMethod},
     constraints::TableConstraints,
-    cost::ESTIMATED_HARDCODED_ROWS_PER_TABLE,
     order::OrderTarget,
 };
 
@@ -94,10 +93,9 @@ pub fn join_lhs_and_rhs<'a>(
     // Produce a number of rows estimated to be returned when this table is filtered by the WHERE clause.
     // If this table is the rightmost table in the join order, we multiply by the input cardinality,
     // which is the output cardinality of the previous tables.
-    let output_cardinality = (input_cardinality as f64
-        * ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64
-        * output_cardinality_multiplier)
-        .ceil() as usize;
+    let output_cardinality =
+        (input_cardinality as f64 * rhs_constraints.base_row_count * output_cardinality_multiplier)
+            .ceil() as usize;
 
     Ok(Some(JoinN {
         data: best_access_methods,
@@ -530,9 +528,13 @@ mod tests {
         let where_clause = vec![];
 
         let access_methods_arena = RefCell::new(Vec::new());
-        let table_constraints =
-            constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
-                .unwrap();
+        let table_constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            None,
+        )
+        .unwrap();
 
         let result = compute_best_join_order(
             table_references.joined_tables(),
@@ -559,9 +561,13 @@ mod tests {
         let where_clause = vec![];
 
         let access_methods_arena = RefCell::new(Vec::new());
-        let table_constraints =
-            constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
-                .unwrap();
+        let table_constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            None,
+        )
+        .unwrap();
 
         // SELECT * from test_table
         // expecting best_best_plan() not to do any work due to empty where clause.
@@ -599,9 +605,13 @@ mod tests {
         let table_references = TableReferences::new(joined_tables, vec![]);
         let access_methods_arena = RefCell::new(Vec::new());
         let available_indexes = HashMap::new();
-        let table_constraints =
-            constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
-                .unwrap();
+        let table_constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            None,
+        )
+        .unwrap();
 
         // SELECT * FROM test_table WHERE id = 42
         // expecting a RowidEq access method because id is a rowid alias.
@@ -666,9 +676,13 @@ mod tests {
         });
         available_indexes.insert("test_table".to_string(), vec![index]);
 
-        let table_constraints =
-            constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
-                .unwrap();
+        let table_constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            None,
+        )
+        .unwrap();
         // SELECT * FROM test_table WHERE id = 42
         // expecting an IndexScan access method because id is a primary key with an index
         let result = compute_best_join_order(
@@ -744,9 +758,13 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let access_methods_arena = RefCell::new(Vec::new());
-        let table_constraints =
-            constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
-                .unwrap();
+        let table_constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            None,
+        )
+        .unwrap();
 
         let result = compute_best_join_order(
             table_references.joined_tables(),
@@ -916,9 +934,13 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let access_methods_arena = RefCell::new(Vec::new());
-        let table_constraints =
-            constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
-                .unwrap();
+        let table_constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            None,
+        )
+        .unwrap();
 
         let result = compute_best_join_order(
             table_references.joined_tables(),
@@ -1025,9 +1047,13 @@ mod tests {
         let table_references = TableReferences::new(joined_tables, vec![]);
         let available_indexes = HashMap::new();
         let access_methods_arena = RefCell::new(Vec::new());
-        let table_constraints =
-            constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
-                .unwrap();
+        let table_constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            None,
+        )
+        .unwrap();
 
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
@@ -1131,9 +1157,13 @@ mod tests {
         let table_references = TableReferences::new(joined_tables, vec![]);
         let access_methods_arena = RefCell::new(Vec::new());
         let available_indexes = HashMap::new();
-        let table_constraints =
-            constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
-                .unwrap();
+        let table_constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            None,
+        )
+        .unwrap();
 
         let result = compute_best_join_order(
             table_references.joined_tables(),
@@ -1215,9 +1245,13 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let access_methods_arena = RefCell::new(Vec::new());
-        let table_constraints =
-            constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
-                .unwrap();
+        let table_constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            None,
+        )
+        .unwrap();
 
         // Run the optimizer
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
@@ -1332,9 +1366,13 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let access_methods_arena = RefCell::new(Vec::new());
-        let table_constraints =
-            constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
-                .unwrap();
+        let table_constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            None,
+        )
+        .unwrap();
 
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
@@ -1439,9 +1477,13 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let access_methods_arena = RefCell::new(Vec::new());
-        let table_constraints =
-            constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
-                .unwrap();
+        let table_constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            None,
+        )
+        .unwrap();
 
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
@@ -1569,9 +1611,13 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let access_methods_arena = RefCell::new(Vec::new());
-        let table_constraints =
-            constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
-                .unwrap();
+        let table_constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            None,
+        )
+        .unwrap();
 
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),

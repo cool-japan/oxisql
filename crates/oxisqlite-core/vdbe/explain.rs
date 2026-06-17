@@ -651,7 +651,7 @@ pub fn insn_to_str(
                 0,
                 "".to_string(),
             ),
-            Insn::Transaction { write } => (
+            Insn::Transaction { write, .. } => (
                 "Transaction",
                 0,
                 *write as i32,
@@ -1578,6 +1578,19 @@ pub fn insn_to_str(
                 Value::build_text(""),
                 0,
                 "".to_string(),
+            ),
+            Insn::IdxStat {
+                cursor_id,
+                num_cols,
+                dest,
+            } => (
+                "IdxStat",
+                *cursor_id as i32,
+                *num_cols as i32,
+                *dest as i32,
+                Value::build_text(""),
+                0,
+                format!("r[{}]=stat({})", *dest, *cursor_id),
             ),
             Insn::Int64 {
                 _p1,

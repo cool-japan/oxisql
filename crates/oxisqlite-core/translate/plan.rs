@@ -34,12 +34,12 @@ impl ResultSetColumn {
         }
         match &self.expr {
             ast::Expr::Column { table, column, .. } => {
-                let table_ref = tables.find_table_by_internal_id(*table).unwrap();
-                table_ref.get_column_at(*column).unwrap().name.as_deref()
+                let table_ref = tables.find_table_by_internal_id(*table)?;
+                table_ref.get_column_at(*column)?.name.as_deref()
             }
             ast::Expr::RowId { table, .. } => {
                 // If there is a rowid alias column, use its name
-                let table_ref = tables.find_table_by_internal_id(*table).unwrap();
+                let table_ref = tables.find_table_by_internal_id(*table)?;
                 if let Table::BTree(table) = &table_ref {
                     if let Some(rowid_alias_column) = table.get_rowid_alias_column() {
                         if let Some(name) = &rowid_alias_column.1.name {
@@ -188,14 +188,12 @@ pub fn convert_where_to_vtab_constraint(
             },
         ) => {
             // one side must be the virtual table
-            let tbl_l_idx = join_order
-                .iter()
-                .position(|j| j.table_id == *tbl_l)
-                .unwrap();
-            let tbl_r_idx = join_order
-                .iter()
-                .position(|j| j.table_id == *tbl_r)
-                .unwrap();
+            let Some(tbl_l_idx) = join_order.iter().position(|j| j.table_id == *tbl_l) else {
+                return Ok(None);
+            };
+            let Some(tbl_r_idx) = join_order.iter().position(|j| j.table_id == *tbl_r) else {
+                return Ok(None);
+            };
             let vtab_on_l = tbl_l_idx == table_idx;
             let vtab_on_r = tbl_r_idx == table_idx;
             if vtab_on_l == vtab_on_r {
@@ -216,8 +214,7 @@ pub fn convert_where_to_vtab_constraint(
             if join_order
                 .iter()
                 .position(|j| j.table_id == *table)
-                .unwrap()
-                == table_idx =>
+                .map_or(false, |pos| pos == table_idx) =>
         {
             (
                 column,
@@ -230,8 +227,7 @@ pub fn convert_where_to_vtab_constraint(
             if join_order
                 .iter()
                 .position(|j| j.table_id == *table)
-                .unwrap()
-                == table_idx =>
+                .map_or(false, |pos| pos == table_idx) =>
         {
             (
                 column,
@@ -297,6 +293,8 @@ pub enum Plan {
         limit: Option<isize>,
         offset: Option<isize>,
         order_by: Option<Vec<(ast::Expr, SortOrder)>>,
+        limit_expr: Option<Box<ast::Expr>>,
+        offset_expr: Option<Box<ast::Expr>>,
     },
     Delete(DeletePlan),
     Update(UpdatePlan),
@@ -435,6 +433,10 @@ pub struct SelectPlan {
     pub limit: Option<isize>,
     /// offset clause
     pub offset: Option<isize>,
+    /// runtime limit expression (when LIMIT is a parameter or expression, not a literal)
+    pub limit_expr: Option<Box<ast::Expr>>,
+    /// runtime offset expression (when OFFSET is a parameter or expression, not a literal)
+    pub offset_expr: Option<Box<ast::Expr>>,
     /// query contains a constant condition that is always false
     pub contains_constant_false_condition: bool,
     /// the destination of the resulting rows from this plan.
@@ -502,11 +504,15 @@ impl SelectPlan {
         {
             return false;
         }
-        let table_ref = self.table_references.joined_tables().first().unwrap();
+        let Some(table_ref) = self.table_references.joined_tables().first() else {
+            return false;
+        };
         if !matches!(table_ref.table, crate::schema::Table::BTree(..)) {
             return false;
         }
-        let agg = self.aggregates.first().unwrap();
+        let Some(agg) = self.aggregates.first() else {
+            return false;
+        };
         if !matches!(agg.func, AggFunc::Count0) {
             return false;
         }
@@ -522,7 +528,10 @@ impl SelectPlan {
             name: limbo_sqlite3_parser::ast::Id("count".to_string()),
             filter_over: None,
         };
-        let result_col_expr = &self.result_columns.first().unwrap().expr;
+        let Some(result_col) = self.result_columns.first() else {
+            return false;
+        };
+        let result_col_expr = &result_col.expr;
         if *result_col_expr != count && *result_col_expr != count_star {
             return false;
         }
@@ -544,6 +553,10 @@ pub struct DeletePlan {
     pub limit: Option<isize>,
     /// offset clause
     pub offset: Option<isize>,
+    /// runtime limit expression (when LIMIT is a parameter or expression, not a literal)
+    pub limit_expr: Option<Box<ast::Expr>>,
+    /// runtime offset expression (when OFFSET is a parameter or expression, not a literal)
+    pub offset_expr: Option<Box<ast::Expr>>,
     /// query contains a constant condition that is always false
     pub contains_constant_false_condition: bool,
     /// Indexes that must be updated by the delete operation.
@@ -559,11 +572,17 @@ pub struct UpdatePlan {
     pub order_by: Option<Vec<(ast::Expr, SortOrder)>>,
     pub limit: Option<isize>,
     pub offset: Option<isize>,
+    /// runtime limit expression (when LIMIT is a parameter or expression, not a literal)
+    pub limit_expr: Option<Box<ast::Expr>>,
+    /// runtime offset expression (when OFFSET is a parameter or expression, not a literal)
+    pub offset_expr: Option<Box<ast::Expr>>,
     // TODO: optional RETURNING clause
     pub returning: Option<Vec<ResultSetColumn>>,
     // whether the WHERE clause is always false
     pub contains_constant_false_condition: bool,
     pub indexes_to_update: Vec<Arc<Index>>,
+    /// ON CONFLICT action for UPDATE OR <action> statements.
+    pub or_conflict: Option<limbo_sqlite3_parser::ast::ResolveType>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

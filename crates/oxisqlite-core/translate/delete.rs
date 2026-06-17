@@ -2,7 +2,7 @@ use crate::schema::Table;
 use crate::translate::emitter::emit_program;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{DeletePlan, Operation, Plan};
-use crate::translate::planner::{parse_limit, parse_where};
+use crate::translate::planner::{parse_limit_full, parse_where, LimitValue};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode, TableRefIdCounter};
 use crate::{schema::Schema, Result, SymbolTable};
 use limbo_sqlite3_parser::ast::{Expr, Limit, QualifiedName};
@@ -98,7 +98,25 @@ pub fn prepare_delete_plan(
     )?;
 
     // Parse the LIMIT/OFFSET clause
-    let (resolved_limit, resolved_offset) = limit.map_or(Ok((None, None)), |l| parse_limit(&l))?;
+    let (limit_val, offset_val) = limit.map_or(Ok((LimitValue::None, LimitValue::None)), |l| {
+        parse_limit_full(&l)
+    })?;
+    let resolved_limit = match &limit_val {
+        LimitValue::Literal(n) => Some(*n),
+        _ => None,
+    };
+    let resolved_offset = match &offset_val {
+        LimitValue::Literal(n) => Some(*n),
+        _ => None,
+    };
+    let limit_expr = match limit_val {
+        LimitValue::Expr(e) => Some(e),
+        _ => None,
+    };
+    let offset_expr = match offset_val {
+        LimitValue::Expr(e) => Some(e),
+        _ => None,
+    };
 
     let plan = DeletePlan {
         table_references,
@@ -107,6 +125,8 @@ pub fn prepare_delete_plan(
         order_by: None,
         limit: resolved_limit,
         offset: resolved_offset,
+        limit_expr,
+        offset_expr,
         contains_constant_false_condition: false,
         indexes,
     };

@@ -9,13 +9,13 @@ use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{Aggregate, GroupBy, Plan, ResultSetColumn, SelectPlan};
 use crate::translate::planner::{
     bind_column_references, break_predicate_at_and_boundaries, parse_from, parse_limit,
-    parse_where, resolve_aggregates,
+    parse_limit_full, parse_where, resolve_aggregates, LimitValue,
 };
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode, TableRefIdCounter};
 use crate::vdbe::insn::Insn;
 use crate::SymbolTable;
-use crate::{schema::Schema, vdbe::builder::ProgramBuilder, Result};
+use crate::{schema::Schema, vdbe::builder::ProgramBuilder, LimboError, Result};
 use limbo_sqlite3_parser::ast::{self, CompoundSelect, SortOrder};
 use limbo_sqlite3_parser::ast::{ResultColumn, SelectInner};
 
@@ -176,6 +176,8 @@ pub fn prepare_select_plan<'a>(
                 limit,
                 offset,
                 order_by: None,
+                limit_expr: None,
+                offset_expr: None,
             })
         }
     }
@@ -273,6 +275,8 @@ fn prepare_one_select_plan<'a>(
                 aggregates: vec![],
                 limit: None,
                 offset: None,
+                limit_expr: None,
+                offset_expr: None,
                 contains_constant_false_condition: false,
                 query_destination,
                 distinctness: Distinctness::from_ast(distinctness.as_ref()),
@@ -304,7 +308,9 @@ fn prepare_one_select_plan<'a>(
                         if referenced_table.is_none() {
                             crate::bail_parse_error!("Table {} not found", name.0);
                         }
-                        let table = referenced_table.unwrap();
+                        let table = referenced_table.ok_or_else(|| {
+                            LimboError::InternalError("referenced table not found".to_string())
+                        })?;
                         let num_columns = table.columns().len();
                         for idx in 0..num_columns {
                             let is_rowid_alias = {
@@ -426,7 +432,7 @@ fn prepare_one_select_plan<'a>(
                                             } else {
                                                 let agg = Aggregate {
                                                     func: AggFunc::External(f.func.clone().into()),
-                                                    args: args.as_ref().unwrap().clone(),
+                                                    args: args.as_ref().ok_or_else(|| LimboError::InternalError("args missing for external aggregate".to_string()))?.clone(),
                                                     original_expr: expr.clone(),
                                                     distinctness,
                                                 };
@@ -574,7 +580,25 @@ fn prepare_one_select_plan<'a>(
             }
 
             // Parse the LIMIT/OFFSET clause
-            (plan.limit, plan.offset) = limit.map_or(Ok((None, None)), |l| parse_limit(l))?;
+            if let Some(limit_clause) = limit {
+                let (limit_val, offset_val) = parse_limit_full(limit_clause)?;
+                plan.limit = match &limit_val {
+                    LimitValue::Literal(n) => Some(*n),
+                    LimitValue::Expr(_) | LimitValue::None => None,
+                };
+                plan.offset = match &offset_val {
+                    LimitValue::Literal(n) => Some(*n),
+                    LimitValue::Expr(_) | LimitValue::None => None,
+                };
+                plan.limit_expr = match limit_val {
+                    LimitValue::Expr(e) => Some(e),
+                    _ => None,
+                };
+                plan.offset_expr = match offset_val {
+                    LimitValue::Expr(e) => Some(e),
+                    _ => None,
+                };
+            }
 
             // Return the unoptimized query plan
             Ok(plan)
@@ -600,6 +624,8 @@ fn prepare_one_select_plan<'a>(
                 aggregates: vec![],
                 limit: None,
                 offset: None,
+                limit_expr: None,
+                offset_expr: None,
                 contains_constant_false_condition: false,
                 query_destination,
                 distinctness: Distinctness::NonDistinct,
@@ -720,7 +746,7 @@ pub fn emit_simple_count<'a>(
     let cursors = plan
         .joined_tables()
         .get(0)
-        .unwrap()
+        .ok_or_else(|| LimboError::InternalError("no table in plan for count".to_string()))?
         .resolve_cursors(program)?;
 
     let cursor_id = {

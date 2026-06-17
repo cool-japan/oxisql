@@ -63,5 +63,10 @@ pub mod connection;
 pub mod error;
 pub mod types;
 
+#[cfg(feature = "blocking")]
+pub mod blocking;
+#[cfg(feature = "blocking")]
+pub use blocking::{SqliteBlockingPrepared, SqliteBlockingTransaction, SqliteConnectionBlocking};
+
 pub use connection::SqliteConnection;
 pub use error::SqliteCompatError;

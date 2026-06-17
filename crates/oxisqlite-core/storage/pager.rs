@@ -4,14 +4,14 @@ use crate::storage::btree::BTreePageInner;
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::sqlite3_ondisk::{
-    self, DatabaseHeader, PageContent, PageType, DATABASE_HEADER_PAGE_ID,
+    self, DatabaseHeader, PageContent, PageType, DATABASE_HEADER_PAGE_ID, DATABASE_HEADER_SIZE,
 };
 use crate::storage::wal::{CheckpointResult, Wal, WalFsyncStatus};
 use crate::types::CursorResult;
 use crate::Completion;
 use crate::{Buffer, LimboError, Result};
 use parking_lot::RwLock;
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -192,6 +192,35 @@ pub enum AutoVacuumMode {
     Incremental,
 }
 
+/// Durability level set by `PRAGMA synchronous`.
+///
+/// Mirrors SQLite's synchronous settings. Controls when fsync is issued to the
+/// WAL and the database file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SynchronousMode {
+    /// `0` — never fsync. Fastest, least durable (data may be lost on OS crash).
+    Off,
+    /// `1` — fsync the WAL at checkpoint time only. The default.
+    Normal,
+    /// `2` — fsync the WAL on every commit AND fsync the DB file after checkpoint.
+    Full,
+    /// `3` — like FULL with extra fsync of the directory containing the rollback
+    /// journal; for WAL mode this behaves like FULL for our purposes.
+    Extra,
+}
+
+impl SynchronousMode {
+    /// Numeric form used by `PRAGMA synchronous` (and SQLite's on-the-wire value).
+    pub fn as_i64(self) -> i64 {
+        match self {
+            SynchronousMode::Off => 0,
+            SynchronousMode::Normal => 1,
+            SynchronousMode::Full => 2,
+            SynchronousMode::Extra => 3,
+        }
+    }
+}
+
 /// A snapshot of WAL state captured at SAVEPOINT open time.
 ///
 /// Used by ROLLBACK TO SAVEPOINT to restore the WAL (and thus the database)
@@ -232,6 +261,8 @@ pub struct Pager {
     checkpoint_inflight: Rc<RefCell<usize>>,
     syncing: Rc<RefCell<bool>>,
     auto_vacuum_mode: RefCell<AutoVacuumMode>,
+    /// Durability level controlled by `PRAGMA synchronous`. Defaults to NORMAL.
+    synchronous_mode: Cell<SynchronousMode>,
     /// Stack of active savepoints for SAVEPOINT / ROLLBACK TO / RELEASE.
     pub savepoints: RefCell<Vec<SavepointFrame>>,
 }
@@ -285,6 +316,7 @@ impl Pager {
             checkpoint_inflight: Rc::new(RefCell::new(0)),
             buffer_pool,
             auto_vacuum_mode: RefCell::new(AutoVacuumMode::None),
+            synchronous_mode: Cell::new(SynchronousMode::Normal),
             savepoints: RefCell::new(Vec::new()),
         })
     }
@@ -295,6 +327,14 @@ impl Pager {
 
     pub fn set_auto_vacuum_mode(&self, mode: AutoVacuumMode) {
         *self.auto_vacuum_mode.borrow_mut() = mode;
+    }
+
+    pub fn get_synchronous_mode(&self) -> SynchronousMode {
+        self.synchronous_mode.get()
+    }
+
+    pub fn set_synchronous_mode(&self, mode: SynchronousMode) {
+        self.synchronous_mode.set(mode);
     }
 
     /// Retrieves the pointer map entry for a given database page.
@@ -673,6 +713,83 @@ impl Pager {
         Ok(())
     }
 
+    /// Refresh the shared in-memory database header from the write-ahead log.
+    ///
+    /// The header occupies the first 100 bytes of page 1. At open time the
+    /// header is read straight from the main database file (see
+    /// [`Pager::begin_open`] / `sqlite3_ondisk::begin_read_database_header`),
+    /// which deliberately bypasses the WAL. Every *other* page is read through
+    /// [`Pager::read_page`], which consults the WAL via
+    /// [`crate::storage::wal::Wal::find_frame`]. That asymmetry means a page-1
+    /// change that has been committed to the WAL but not yet checkpointed back
+    /// into the main file (the normal state after a non-checkpointing close)
+    /// is invisible to the header — so cookies written via `PRAGMA
+    /// application_id` / `PRAGMA user_version` reset to their pre-write value on
+    /// reopen even though they are durably recorded in the WAL.
+    ///
+    /// This routine closes that gap the way SQLite itself resolves the header:
+    /// if the WAL holds a frame for page 1, page 1 is read through the
+    /// WAL-aware pager path and the shared header is re-decoded from that
+    /// frame. When the WAL has no page-1 frame the header read from the main
+    /// file at open time is already authoritative and the call is a no-op.
+    ///
+    /// It is intended to be invoked once, immediately after the shared WAL has
+    /// been opened/recovered, before any connection observes the header.
+    pub fn refresh_header_from_wal(&self) -> Result<()> {
+        // A read transaction publishes the recovered `max_frame` to this
+        // connection's WAL view so `find_frame` can see frames written by a
+        // previous process/connection. Without it `find_frame` would observe a
+        // zero read mark and miss the page-1 frame entirely.
+        if let LimboResult::Busy = self.begin_read_tx()? {
+            // Someone else holds the relevant lock; the header from the main
+            // file remains a valid (if possibly stale) view and a later
+            // transaction will resolve page 1 through the WAL as usual.
+            return Ok(());
+        }
+
+        let result = self.refresh_header_from_wal_inner();
+
+        // Always release the read transaction, even if the refresh failed.
+        self.end_read_tx()?;
+        result
+    }
+
+    fn refresh_header_from_wal_inner(&self) -> Result<()> {
+        let has_wal_frame = self
+            .wal
+            .borrow()
+            .find_frame(DATABASE_HEADER_PAGE_ID as u64)?
+            .is_some();
+        if !has_wal_frame {
+            // No newer page-1 frame in the WAL: the header read from the main
+            // database file at open time is authoritative.
+            return Ok(());
+        }
+
+        // Resolve page 1 through the WAL-aware read path.
+        let header_page = self.read_page(DATABASE_HEADER_PAGE_ID)?;
+        while header_page.is_locked() {
+            // FIXME: we should never run io here! (mirrors write_database_header)
+            self.io.run_once()?;
+        }
+
+        let page = header_page.get();
+        let contents = page.contents.as_ref().ok_or_else(|| {
+            LimboError::InternalError(
+                "page 1 contents missing while refreshing database header from WAL".to_string(),
+            )
+        })?;
+        let buf = contents.as_ptr();
+        sqlite3_ondisk::parse_database_header_into(&buf[..DATABASE_HEADER_SIZE], &self.db_header)?;
+
+        // The page now lives in this throwaway pager's cache with a frame that
+        // belongs to the recovered WAL view. Drop it so the first real
+        // connection re-reads page 1 under its own read transaction rather than
+        // reusing a cache entry populated outside a proper transaction scope.
+        self.clear_page_cache();
+        Ok(())
+    }
+
     /// Changes the size of the page cache.
     pub fn change_page_cache_size(&self, capacity: usize) -> Result<CacheResizeResult> {
         let mut page_cache = self.page_cache.write();
@@ -732,7 +849,9 @@ impl Pager {
                     }
                 }
                 FlushState::SyncWal => {
-                    if WalFsyncStatus::IO == self.wal.borrow_mut().sync()? {
+                    if self.synchronous_mode.get() != SynchronousMode::Off
+                        && WalFsyncStatus::IO == self.wal.borrow_mut().sync()?
+                    {
                         return Ok(PagerCacheflushStatus::IO);
                     }
 
@@ -754,6 +873,10 @@ impl Pager {
                     };
                 }
                 FlushState::SyncDbFile => {
+                    if self.synchronous_mode.get() == SynchronousMode::Off {
+                        self.flush_info.borrow_mut().state = FlushState::Start;
+                        break;
+                    }
                     sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
                     self.flush_info.borrow_mut().state = FlushState::WaitSyncDbFile;
                 }
@@ -808,9 +931,14 @@ impl Pager {
                     };
                 }
                 CheckpointState::SyncDbFile => {
-                    sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
-                    self.checkpoint_state
-                        .replace(CheckpointState::WaitSyncDbFile);
+                    if self.synchronous_mode.get() == SynchronousMode::Off {
+                        self.checkpoint_state
+                            .replace(CheckpointState::CheckpointDone);
+                    } else {
+                        sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
+                        self.checkpoint_state
+                            .replace(CheckpointState::WaitSyncDbFile);
+                    }
                 }
                 CheckpointState::WaitSyncDbFile => {
                     if *self.syncing.borrow() {
@@ -1005,19 +1133,29 @@ impl Pager {
         let mut attempts = 0;
         {
             let mut wal = self.wal.borrow_mut();
-            // fsync the wal syncronously before beginning checkpoint
-            while let Ok(WalFsyncStatus::IO) = wal.sync() {
-                if attempts >= 10 {
-                    return Err(LimboError::InternalError(
-                        "Failed to fsync WAL before final checkpoint, fd likely closed".into(),
-                    ));
+            // fsync the wal synchronously before beginning checkpoint (unless OFF)
+            if self.synchronous_mode.get() != SynchronousMode::Off {
+                while let Ok(WalFsyncStatus::IO) = wal.sync() {
+                    if attempts >= 10 {
+                        return Err(LimboError::InternalError(
+                            "Failed to fsync WAL before final checkpoint, fd likely closed".into(),
+                        ));
+                    }
+                    self.io.run_once()?;
+                    attempts += 1;
                 }
-                self.io.run_once()?;
-                attempts += 1;
             }
         }
-        self.wal_checkpoint();
-        Ok(())
+        // Truncate the WAL on clean close so the .db is self-contained; if a
+        // Truncate checkpoint cannot complete (e.g. other active readers), fall
+        // back to a Passive checkpoint.
+        match self.wal_checkpoint_mode(CheckpointMode::Truncate) {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                let _ = self.wal_checkpoint_mode(CheckpointMode::Passive);
+                Ok(())
+            }
+        }
     }
 
     pub fn wal_checkpoint(&self) -> CheckpointResult {
@@ -1044,6 +1182,32 @@ impl Pager {
             .clear()
             .expect("Failed to clear page cache");
         checkpoint_result
+    }
+
+    /// Run a blocking checkpoint in the given mode (used by close()/Drop and by
+    /// `PRAGMA wal_checkpoint(<MODE>)` at the pager level). Unlike
+    /// [`Self::wal_checkpoint`], this never panics and returns a `Result`.
+    pub fn wal_checkpoint_mode(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
+        let checkpoint_result;
+        loop {
+            match self
+                .wal
+                .borrow_mut()
+                .checkpoint(self, Rc::new(RefCell::new(0)), mode)?
+            {
+                CheckpointStatus::IO => {
+                    self.io.run_once()?;
+                }
+                CheckpointStatus::Done(res) => {
+                    checkpoint_result = res;
+                    break;
+                }
+            }
+        }
+        self.page_cache.write().clear().map_err(|_| {
+            crate::error::LimboError::InternalError("failed to clear page cache".to_string())
+        })?;
+        Ok(checkpoint_result)
     }
 
     // Providing a page is optional, if provided it will be used to avoid reading the page from disk.

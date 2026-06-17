@@ -175,6 +175,50 @@ pub fn parse_schema_rows(
     Ok(())
 }
 
+/// Load persisted `sqlite_stat1` rows into `schema.stats`.
+///
+/// Mirrors [`parse_schema_rows`]'s row-stepping mechanism. Robust: NULL/non-text
+/// columns or malformed `stat` strings are skipped, never panic. An absent
+/// `sqlite_stat1` table is handled by the caller (it passes `rows = None`,
+/// making this a no-op).
+pub fn load_stat1(
+    rows: Option<Statement>,
+    schema: &mut Schema,
+    io: Arc<dyn IO>,
+    mv_tx_id: Option<u64>,
+) -> Result<()> {
+    if let Some(mut rows) = rows {
+        rows.set_mv_tx_id(mv_tx_id);
+        loop {
+            match rows.step()? {
+                StepResult::Row => {
+                    let Some(row) = rows.row() else {
+                        continue;
+                    };
+                    // col0 tbl (text, required); skip row if NULL/non-text.
+                    let Ok(tbl) = row.get::<&str>(0) else {
+                        continue;
+                    };
+                    // col1 idx (text, nullable): NULL/non-text => None (not an error).
+                    let idx = row.get::<&str>(1).ok();
+                    // col2 stat (text, required); skip row if NULL/non-text.
+                    let Ok(stat) = row.get::<&str>(2) else {
+                        continue;
+                    };
+                    schema.stats.record(tbl, idx, stat);
+                }
+                StepResult::IO => {
+                    io.run_once()?;
+                }
+                StepResult::Interrupt => break,
+                StepResult::Done => break,
+                StepResult::Busy => break,
+            }
+        }
+    }
+    Ok(())
+}
+
 fn cmp_numeric_strings(num_str: &str, other: &str) -> bool {
     match (num_str.parse::<f64>(), other.parse::<f64>()) {
         (Ok(num), Ok(other)) => num == other,

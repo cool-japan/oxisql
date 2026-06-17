@@ -78,7 +78,7 @@ i.e. straight from the 70s! The DP algorithm is explained below.
 
 Currently, in the absence of `ANALYZE`, `sqlite_stat1` etc. we assume the following:
 
-1. Each table has `1,000,000` rows.
+1. Each table has `1,000,000` rows. This is only a fallback used when the table has no loaded `sqlite_stat1` row count; once `ANALYZE` statistics are loaded, the real per-table row count is used instead.
 2. Each equality (`=`) filter will filter out some percentage of the result set.
 3. Each nonequality (e.g. `>`) will filter out some smaller percentage of the result set.
 4. Each `4096` byte database page holds `50` rows, i.e. roughly `80` bytes per row 
@@ -122,7 +122,7 @@ Even though `t2` is a larger table, because we were able to reduce the input set
 
 #### Statistics
 
-Since we don't support `ANALYZE`, nor can we assume that users will call `ANALYZE` anyway, we use simple magic constants to estimate the selectivity of join predicates, row count of tables, and so on. When we have support for `ANALYZE`, we should plug the statistics from `sqlite_stat1` and friends into the optimizer to make more informed decisions.
+`ANALYZE` is now supported: when `sqlite_stat1` statistics are loaded, the optimizer uses real per-table row counts and index selectivity to make more informed decisions. The magic constants remain only as the fallback for un-analyzed databases (or when no `ANALYZE` has been run), so behavior is bit-for-bit unchanged whenever statistics are absent.
 
 ### Estimating the output cardinality of a join
 

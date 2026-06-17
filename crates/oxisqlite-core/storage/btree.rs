@@ -505,6 +505,52 @@ pub struct BTreeCursor {
     read_overflow_state: RefCell<Option<ReadPayloadOverflow>>,
     /// Contains the current cell_idx for `find_cell`
     find_cell_state: FindCellState,
+    /// Resumable state for the ANALYZE walk (sqlite_stat1 computation).
+    /// `None` unless an `index_stat` walk is in progress and has yielded for I/O.
+    analyze_walk: Option<AnalyzeWalk>,
+}
+
+/// Phase of the resumable ANALYZE cursor walk used by [`BTreeCursor::index_stat`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AnalyzePhase {
+    Init,
+    Rewind,
+    Read,
+    Advance,
+    Done,
+}
+
+/// Resumable accumulator state for computing an `sqlite_stat1` entry while
+/// walking a table or index b-tree. Persisted on the cursor so the walk can
+/// survive I/O yields.
+#[derive(Debug)]
+struct AnalyzeWalk {
+    phase: AnalyzePhase,
+    /// Total number of entries seen so far.
+    n: i64,
+    /// `distinct[i]` counts how many times the prefix of length `i + 1` changed.
+    /// The number of distinct prefixes of length `i + 1` is therefore `distinct[i] + 1`.
+    distinct: Vec<i64>,
+    /// Owned copy of the previous row's leading key columns (for change detection).
+    prev_key: Vec<Value>,
+    /// Number of leading key columns to consider (0 for a plain table walk).
+    num_cols: usize,
+}
+
+/// Return the index of the first key column (in `0..num_cols`) at which `prev`
+/// and `cur` differ, or `num_cols` if the keys are equal over the whole prefix.
+///
+/// Column equality uses [`Value`]'s own `PartialEq`, which compares numeric
+/// values across the integer/float boundary, treats `NULL` as equal to `NULL`
+/// (so consecutive NULL keys collapse into one group, matching SQLite's
+/// `sqlite_stat1` behaviour), and compares text/blob by their raw bytes.
+fn first_change(prev: &[Value], cur: &[Value], num_cols: usize) -> usize {
+    for (i, (p, c)) in prev.iter().zip(cur.iter()).take(num_cols).enumerate() {
+        if p != c {
+            return i;
+        }
+    }
+    num_cols
 }
 
 impl BTreeCursor {
@@ -538,6 +584,7 @@ impl BTreeCursor {
             read_overflow_state: RefCell::new(None),
             find_cell_state: FindCellState(None),
             parse_record_state: RefCell::new(ParseRecordState::Init),
+            analyze_walk: None,
         }
     }
 
@@ -5058,6 +5105,108 @@ impl BTreeCursor {
                         self.stack.push(mem_page);
                     }
                     _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    /// Walk every entry of the b-tree to compute the data needed for an
+    /// `sqlite_stat1` row: the total number of entries `N` and, for an index
+    /// over `num_cols` leading key columns, a `distinct` vector where
+    /// `distinct[i]` is the number of times the prefix of length `i + 1`
+    /// changed (so the number of distinct prefixes is `distinct[i] + 1`).
+    ///
+    /// `num_cols == 0` denotes a plain table walk: only `N` is computed and the
+    /// returned `distinct` vector is empty.
+    ///
+    /// The walk is resumable: if any underlying I/O yields, the accumulated
+    /// state is stashed on the cursor and `CursorResult::IO` is returned so the
+    /// VDBE can re-enter this method until it completes.
+    pub fn index_stat(&mut self, num_cols: usize) -> Result<CursorResult<(i64, Vec<i64>)>> {
+        if self.mv_cursor.is_some() {
+            return Err(LimboError::InternalError(
+                "ANALYZE not supported on MVCC cursors yet".to_string(),
+            ));
+        }
+        let mut walk = self.analyze_walk.take().unwrap_or_else(|| AnalyzeWalk {
+            phase: AnalyzePhase::Init,
+            n: 0,
+            distinct: vec![0i64; num_cols],
+            prev_key: Vec::new(),
+            num_cols,
+        });
+        loop {
+            match walk.phase {
+                AnalyzePhase::Init => {
+                    walk.phase = AnalyzePhase::Rewind;
+                }
+                AnalyzePhase::Rewind => match self.rewind()? {
+                    CursorResult::IO => {
+                        self.analyze_walk = Some(walk);
+                        return Ok(CursorResult::IO);
+                    }
+                    CursorResult::Ok(()) => {
+                        walk.phase = AnalyzePhase::Read;
+                    }
+                },
+                AnalyzePhase::Read => {
+                    if self.is_empty() {
+                        walk.phase = AnalyzePhase::Done;
+                        continue;
+                    }
+                    if walk.num_cols > 0 {
+                        let num_cols = walk.num_cols;
+                        // Eagerly collect owned values so the borrow of the cursor's
+                        // record is released before we advance (and possibly yield).
+                        let key_result: CursorResult<Option<Vec<Value>>> = match self.record()? {
+                            CursorResult::IO => CursorResult::IO,
+                            CursorResult::Ok(opt) => CursorResult::Ok(opt.map(|record| {
+                                record
+                                    .get_values()
+                                    .iter()
+                                    .take(num_cols)
+                                    .map(|rv| rv.to_owned())
+                                    .collect()
+                            })),
+                        };
+                        let cur_key = match key_result {
+                            CursorResult::IO => {
+                                self.analyze_walk = Some(walk);
+                                return Ok(CursorResult::IO);
+                            }
+                            CursorResult::Ok(None) => {
+                                walk.phase = AnalyzePhase::Done;
+                                continue;
+                            }
+                            CursorResult::Ok(Some(key)) => key,
+                        };
+                        if walk.n > 0 {
+                            let change_pos = first_change(&walk.prev_key, &cur_key, walk.num_cols);
+                            for dist in walk.distinct.iter_mut().skip(change_pos) {
+                                *dist += 1;
+                            }
+                        }
+                        walk.prev_key = cur_key;
+                    }
+                    walk.n += 1;
+                    walk.phase = AnalyzePhase::Advance;
+                }
+                AnalyzePhase::Advance => match self.next()? {
+                    CursorResult::IO => {
+                        self.analyze_walk = Some(walk);
+                        return Ok(CursorResult::IO);
+                    }
+                    CursorResult::Ok(has_record) => {
+                        walk.phase = if has_record {
+                            AnalyzePhase::Read
+                        } else {
+                            AnalyzePhase::Done
+                        };
+                    }
+                },
+                AnalyzePhase::Done => {
+                    self.analyze_walk = None;
+                    return Ok(CursorResult::Ok((walk.n, walk.distinct)));
                 }
             }
         }

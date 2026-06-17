@@ -619,7 +619,7 @@ impl Wal for WalFile {
         if frames.is_none() {
             return Ok(None);
         }
-        let frames = frames.unwrap();
+        let frames = frames.expect("frames must be Some after is_none() check");
         for frame in frames.iter().rev() {
             if *frame <= self.max_frame {
                 return Ok(Some(*frame));
@@ -636,7 +636,8 @@ impl Wal for WalFile {
         let frame = page.clone();
         let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
             let frame = frame.clone();
-            finish_read_page(page.get().id, buf, frame).unwrap();
+            finish_read_page(page.get().id, buf, frame)
+                .expect("finish_read_page failed in WAL read completion");
         });
         begin_read_wal_frame(
             &self.get_shared().file,
@@ -732,10 +733,6 @@ impl Wal for WalFile {
         write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<CheckpointStatus> {
-        assert!(
-            matches!(mode, CheckpointMode::Passive),
-            "only passive mode supported for now"
-        );
         'checkpoint_loop: loop {
             let state = self.ongoing_checkpoint.state;
             tracing::debug!(?state);
@@ -856,21 +853,20 @@ impl Wal for WalFile {
                     let everything_backfilled = shared.max_frame.load(Ordering::SeqCst)
                         == self.ongoing_checkpoint.max_frame;
                     if everything_backfilled {
-                        // TODO: Even in Passive mode, if everything was backfilled we should
-                        // truncate and fsync the *db file*
-
-                        // To properly reset the *wal file* we will need restart and/or truncate mode.
-                        // Currently, it will grow the WAL file indefinetly, but don't resetting is better than breaking.
-                        // Check: https://github.com/sqlite/sqlite/blob/2bd9f69d40dd240c4122c6d02f1ff447e7b5c098/src/wal.c#L2193
                         if !matches!(mode, CheckpointMode::Passive) {
-                            // Here we know that we backfilled everything, therefore we can safely
-                            // reset the wal.
+                            // Everything was backfilled into the db file, so it is
+                            // safe to reset the WAL bookkeeping.
                             shared.frame_cache.lock().clear();
                             shared.pages_in_frames.lock().clear();
                             shared.max_frame.store(0, Ordering::SeqCst);
                             shared.nbackfills.store(0, Ordering::SeqCst);
-                            // TODO: if all frames were backfilled into the db file, calls fsync
-                            // TODO(pere): truncate wal file here.
+                            // For Restart/Truncate, physically reset the on-disk WAL:
+                            // rewrite a fresh header (new salt) so leftover frames are
+                            // rejected by future recovery, and for Truncate shrink the
+                            // file to zero bytes first.
+                            if matches!(mode, CheckpointMode::Restart | CheckpointMode::Truncate) {
+                                self.reset_wal_file(matches!(mode, CheckpointMode::Truncate))?;
+                            }
                         }
                     } else {
                         shared
@@ -1033,7 +1029,73 @@ impl WalFile {
 
     #[allow(clippy::mut_from_ref)]
     fn get_shared(&self) -> &mut WalFileShared {
-        unsafe { self.shared.get().as_mut().unwrap() }
+        unsafe {
+            self.shared
+                .get()
+                .as_mut()
+                .expect("WalFileShared pointer must be non-null")
+        }
+    }
+
+    /// Reset the on-disk WAL after a Restart/Truncate checkpoint.
+    ///
+    /// Rewrites the 32-byte WAL header with a freshly generated salt (so any
+    /// leftover frames still on disk are rejected by a future recovery via the
+    /// salt-mismatch check) and resets the in-memory cumulative checksum. When
+    /// `truncate` is true, the WAL file is also physically shrunk to zero bytes
+    /// and a fresh empty 32-byte header is rewritten, so the on-disk `-wal`
+    /// carries no frames (max_frame 0) and a byte-level reader sees a
+    /// self-contained database file.
+    fn reset_wal_file(&self, truncate: bool) -> Result<()> {
+        let shared = self.get_shared();
+        // Generate a new salt so any leftover frames become unrecoverable, and
+        // recompute the header checksum over the first 24 bytes.
+        {
+            let mut header = shared.wal_header.lock();
+            header.salt_1 = self.io.generate_random_number() as u32;
+            header.salt_2 = self.io.generate_random_number() as u32;
+            let native = cfg!(target_endian = "big");
+            let checksums = checksum_wal(
+                &header.as_bytes()[..WAL_HEADER_SIZE - 2 * 4],
+                &header,
+                (0, 0),
+                native,
+            );
+            header.checksum_1 = checksums.0;
+            header.checksum_2 = checksums.1;
+            shared.last_checksum = checksums;
+        }
+        if truncate {
+            // Physically shrink the WAL file to 0 bytes, awaiting completion.
+            let truncated = Rc::new(Cell::new(false));
+            let truncated_cb = truncated.clone();
+            let completion = Completion::Sync(SyncCompletion {
+                complete: Box::new(move |_| {
+                    truncated_cb.set(true);
+                }),
+                is_completed: Cell::new(false),
+            });
+            shared.file.truncate(0, Arc::new(completion))?;
+            let mut attempts = 0;
+            while !truncated.get() {
+                self.io.run_once()?;
+                attempts += 1;
+                if attempts >= 1000 {
+                    return Err(crate::error::LimboError::InternalError(
+                        "failed to truncate WAL file".to_string(),
+                    ));
+                }
+            }
+        }
+        // Rewrite a valid, empty 32-byte header (fresh salt already set above) so
+        // subsequent in-process appends start after a well-formed header. After a
+        // physical truncate this makes the file exactly 32 bytes (zero frames);
+        // for Restart it rewrites the header in place.
+        {
+            let header = shared.wal_header.lock();
+            sqlite3_ondisk::begin_write_wal_header(&shared.file, &header)?;
+        }
+        Ok(())
     }
 }
 
@@ -1043,10 +1105,44 @@ impl WalFileShared {
         path: &str,
         page_size: u32,
     ) -> Result<Arc<UnsafeCell<WalFileShared>>> {
+        Self::open_shared_inner(io, path, page_size, false)
+    }
+
+    /// Open the shared WAL state for `path`.
+    ///
+    /// When `db_freshly_created` is true, the accompanying main database file
+    /// did not exist (or was empty) and was just bootstrapped by
+    /// [`crate::maybe_init_database_file`]. Any `-wal` file present on disk is
+    /// therefore an orphan left behind by a previous database incarnation
+    /// (e.g. the main `.db` was deleted while its `-wal` survived). Replaying
+    /// such a WAL would resurrect stale committed pages on top of the fresh
+    /// database, corrupting it (the classic symptom is row counts that grow by
+    /// the previous content on every reopen). In that case we discard the
+    /// orphaned WAL and start a fresh one instead of recovering from it.
+    pub fn open_shared_inner(
+        io: &Arc<dyn IO>,
+        path: &str,
+        page_size: u32,
+        db_freshly_created: bool,
+    ) -> Result<Arc<UnsafeCell<WalFileShared>>> {
         let file = io.open_file(path, crate::io::OpenFlags::Create, false)?;
-        let header = if file.size()? > 0 {
-            let wal_file_shared = sqlite3_ondisk::read_entire_wal_dumb(&file)?;
-            // TODO: Return a completion instead.
+        let orphaned_wal = db_freshly_created && file.size()? > 0;
+        if orphaned_wal {
+            tracing::warn!(
+                "discarding orphaned WAL at {:?}: main database file was freshly created, \
+                 so this WAL belongs to a previous database incarnation and will not be replayed",
+                path
+            );
+        }
+        // Recover from an existing WAL only when it is NOT orphaned. For an
+        // orphaned WAL we fall through to the fresh-header branch below, which
+        // overwrites the 32-byte WAL header with a brand-new random salt. That
+        // both (a) starts this session at max_frame = 0 (so none of the stale
+        // frames are visible now) and (b) guarantees every leftover frame still
+        // on disk carries the OLD salt, so a future `read_entire_wal_dumb`
+        // recovery rejects them at the first salt check and never replays them.
+        let header = if !orphaned_wal && file.size()? > 0 {
+            let (wal_file_shared, parse_error) = sqlite3_ondisk::read_entire_wal_dumb(&file)?;
             let mut max_loops = 100_000;
             while !unsafe { &*wal_file_shared.get() }
                 .loaded
@@ -1055,8 +1151,14 @@ impl WalFileShared {
                 io.run_once()?;
                 max_loops -= 1;
                 if max_loops == 0 {
-                    panic!("WAL file not loaded");
+                    return Err(crate::error::LimboError::InternalError(
+                        "WAL file not loaded after 100000 IO iterations".to_string(),
+                    ));
                 }
+            }
+            // If parsing the WAL detected corruption, surface it now.
+            if let Some(err) = parse_error.lock().take() {
+                return Err(err);
             }
             return Ok(wal_file_shared);
         } else {

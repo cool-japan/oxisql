@@ -207,7 +207,7 @@ impl IO for UringIO {
 
     fn generate_random_number(&self) -> i64 {
         let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).unwrap();
+        getrandom::getrandom(&mut buf).expect("getrandom failed");
         i64::from_ne_bytes(buf)
     }
 
@@ -334,6 +334,12 @@ impl File for UringFile {
 
     fn size(&self) -> Result<u64> {
         Ok(self.file.metadata()?.len())
+    }
+
+    fn truncate(&self, len: usize, c: Arc<Completion>) -> Result<()> {
+        self.file.set_len(len as u64).map_err(LimboError::IOError)?;
+        c.complete(0);
+        Ok(())
     }
 }
 

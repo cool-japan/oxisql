@@ -463,7 +463,7 @@ pub fn json_type(value: &Value, path: Option<&Value>) -> crate::Result<Value> {
 
         return Ok(Value::Text(Text::json(element_type.into())));
     }
-    if let Some(path) = json_path_from_owned_value(path.unwrap(), true)? {
+    if let Some(path) = json_path_from_owned_value(path.expect("path validated by caller"), true)? {
         let mut json = convert_dbtype_to_jsonb(value, Conv::Strict)?;
 
         if let Ok(mut path) = json.navigate_path(&path, PathOperationMode::ReplaceExisting) {

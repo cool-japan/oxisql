@@ -49,7 +49,8 @@ pub unsafe extern "C" fn execute(
                 let args_slice = &mut std::slice::from_raw_parts_mut(args, arg_count as usize);
                 for (i, val) in args_slice.iter_mut().enumerate() {
                     stmt.bind_at(
-                        NonZeroUsize::new(i + 1).unwrap(),
+                        // SAFETY: i is a loop index starting at 0, so i + 1 >= 1 > 0, making it always non-zero.
+                        unsafe { NonZeroUsize::new_unchecked(i + 1) },
                         Value::from_ffi(std::mem::take(val)).unwrap_or(Value::Null),
                     );
                 }

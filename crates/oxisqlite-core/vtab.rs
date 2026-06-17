@@ -322,7 +322,12 @@ impl ExtVirtualTableCursor {
         tracing::trace!("xFilter");
         let ext_args = args.iter().map(|arg| arg.to_ffi()).collect::<Vec<_>>();
         let c_idx_str = idx_str
-            .map(|s| std::ffi::CString::new(s).unwrap())
+            .map(|s| {
+                std::ffi::CString::new(s).map_err(|e| {
+                    LimboError::InternalError(format!("invalid idx_str for CString: {}", e))
+                })
+            })
+            .transpose()?
             .map(|cstr| cstr.into_raw())
             .unwrap_or(std::ptr::null_mut());
         let rc = unsafe {

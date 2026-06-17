@@ -4,6 +4,9 @@ use tracing::{instrument, Level};
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;
+use super::subquery::{
+    emit_in_subquery, emit_scalar_or_exists_subquery, plan_expr_subquery, ExprSubqueryKind,
+};
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
@@ -385,6 +388,14 @@ pub fn translate_condition_expr(
             translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
             emit_cond_jump(program, condition_metadata, expr_reg);
         }
+        // Subquery-valued conditions (EXISTS / IN (SELECT ...) / scalar subquery used as a
+        // boolean). We evaluate the subquery into a register via translate_expr() (which contains
+        // the full correlated/uncorrelated emission logic) and then perform the conditional jump.
+        ast::Expr::Exists(_) | ast::Expr::InSelect { .. } | ast::Expr::Subquery(_) => {
+            let reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
+            emit_cond_jump(program, condition_metadata, reg);
+        }
         other => todo!("expression {:?} not implemented", other),
     }
     Ok(())
@@ -657,7 +668,22 @@ pub fn translate_expr(
             Ok(target_register)
         }
         ast::Expr::DoublyQualified(_, _, _) => todo!(),
-        ast::Expr::Exists(_) => todo!(),
+        ast::Expr::Exists(select) => {
+            let outer = referenced_tables.ok_or_else(|| {
+                crate::error::LimboError::ParseError(
+                    "EXISTS subquery requires an enclosing query with table references".to_string(),
+                )
+            })?;
+            let mut planned = plan_expr_subquery(program, resolver, outer, select)?;
+            emit_scalar_or_exists_subquery(
+                program,
+                resolver,
+                &mut planned,
+                ExprSubqueryKind::Exists,
+                target_register,
+            )?;
+            Ok(target_register)
+        }
         ast::Expr::FunctionCall {
             name,
             distinctness: _,
@@ -1956,7 +1982,25 @@ pub fn translate_expr(
             Ok(target_register)
         }
         ast::Expr::InList { .. } => todo!(),
-        ast::Expr::InSelect { .. } => todo!(),
+        ast::Expr::InSelect { lhs, not, rhs } => {
+            let outer = referenced_tables.ok_or_else(|| {
+                crate::error::LimboError::ParseError(
+                    "IN (SELECT ...) requires an enclosing query with table references".to_string(),
+                )
+            })?;
+            let lhs_reg = program.alloc_register();
+            translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
+            let mut planned = plan_expr_subquery(program, resolver, outer, rhs)?;
+            emit_in_subquery(
+                program,
+                resolver,
+                &mut planned,
+                lhs_reg,
+                target_register,
+                *not,
+            )?;
+            Ok(target_register)
+        }
         ast::Expr::InTable { .. } => todo!(),
         ast::Expr::IsNull(expr) => {
             let reg = program.alloc_register();
@@ -2108,7 +2152,22 @@ pub fn translate_expr(
             unreachable!("Qualified should be resolved to a Column before translation")
         }
         ast::Expr::Raise(_, _) => todo!(),
-        ast::Expr::Subquery(_) => todo!(),
+        ast::Expr::Subquery(select) => {
+            let outer = referenced_tables.ok_or_else(|| {
+                crate::error::LimboError::ParseError(
+                    "scalar subquery requires an enclosing query with table references".to_string(),
+                )
+            })?;
+            let mut planned = plan_expr_subquery(program, resolver, outer, select)?;
+            emit_scalar_or_exists_subquery(
+                program,
+                resolver,
+                &mut planned,
+                ExprSubqueryKind::Scalar,
+                target_register,
+            )?;
+            Ok(target_register)
+        }
         ast::Expr::Unary(op, expr) => match (op, expr.as_ref()) {
             (UnaryOperator::Positive, expr) => {
                 translate_expr(program, referenced_tables, expr, target_register, resolver)
@@ -2195,7 +2254,7 @@ pub fn translate_expr(
             }
         },
         ast::Expr::Variable(name) => {
-            let index = program.parameters.push(name);
+            let index = program.parameters.push(name)?;
             program.emit_insn(Insn::Variable {
                 index,
                 dest: target_register,
@@ -2659,6 +2718,28 @@ pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {
         },
         _ => Ok((expr, paren_count)),
     }
+}
+
+/// Returns true if `expr` contains a subquery in expression position anywhere in its tree
+/// (a scalar `(SELECT ...)`, `EXISTS (...)`, or `... IN (SELECT ...)`).
+///
+/// This is used by the emitter to decide WHERE-term evaluation placement: a term containing a
+/// subquery must not be hoisted before the main loop, because a correlated subquery requires the
+/// outer row's cursors to be positioned first. (`walk_expr` visits subquery nodes but does not
+/// descend into their inner `Select`, which is exactly what we want here: detect presence without
+/// recursing into the as-yet-unplanned inner query.)
+pub fn expr_contains_subquery(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<()> {
+        if matches!(
+            e,
+            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. }
+        ) {
+            found = true;
+        }
+        Ok(())
+    });
+    found
 }
 
 /// Recursively walks an immutable expression, applying a function to each sub-expression.

@@ -12,7 +12,7 @@ use crate::{
         insn::Insn,
         BranchOffset,
     },
-    Result,
+    LimboError, Result,
 };
 
 use super::{
@@ -146,7 +146,11 @@ pub fn init_group_by(
                     let table_reference = plan
                         .table_references
                         .find_joined_table_by_internal_id(*table)
-                        .unwrap();
+                        .ok_or_else(|| {
+                            LimboError::InternalError(
+                                "table reference not found for group by column".to_string(),
+                            )
+                        })?;
 
                     let Some(table_column) = table_reference.table.get_column_at(*column) else {
                         crate::bail_parse_error!("column index out of bounds");
@@ -698,8 +702,14 @@ pub fn group_by_agg_phase<'a>(
 ) -> Result<()> {
     let GroupByMetadata {
         labels, row_source, ..
-    } = t_ctx.meta_group_by.as_mut().unwrap();
-    let group_by = plan.group_by.as_ref().unwrap();
+    } = t_ctx
+        .meta_group_by
+        .as_mut()
+        .ok_or_else(|| LimboError::InternalError("meta_group_by not set".to_string()))?;
+    let group_by = plan
+        .group_by
+        .as_ref()
+        .ok_or_else(|| LimboError::InternalError("group_by not set".to_string()))?;
 
     let label_sort_loop_start = labels.label_sort_loop_start;
     let label_sort_loop_end = labels.label_sort_loop_end;
@@ -710,7 +720,11 @@ pub fn group_by_agg_phase<'a>(
 
     group_by_process_single_group(program, group_by, plan, t_ctx)?;
 
-    let row_source = &t_ctx.meta_group_by.as_ref().unwrap().row_source;
+    let row_source = &t_ctx
+        .meta_group_by
+        .as_ref()
+        .ok_or_else(|| LimboError::InternalError("meta_group_by not set".to_string()))?
+        .row_source;
 
     // Continue to the next row in the sorter
     if let GroupByRowSource::Sorter { sort_cursor, .. } = row_source {
@@ -899,7 +913,9 @@ pub fn group_by_emit_row_phase<'a>(
                 Some(labels.label_group_by_end_without_emitting_row),
                 t_ctx.reg_nonagg_emit_once_flag,
                 t_ctx.reg_offset,
-                t_ctx.reg_result_cols_start.unwrap(),
+                t_ctx.reg_result_cols_start.ok_or_else(|| {
+                    LimboError::InternalError("reg_result_cols_start not set".to_string())
+                })?,
                 t_ctx.limit_ctx,
             )?;
         }

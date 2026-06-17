@@ -2,6 +2,7 @@ use std::{cmp::Ordering, collections::HashMap, sync::Arc};
 
 use crate::{
     schema::{Column, Index},
+    statistics::SchemaStats,
     translate::{
         expr::as_binary_components,
         plan::{JoinOrderMember, TableReferences, WhereTerm},
@@ -128,6 +129,10 @@ pub struct ConstraintUseCandidate {
     pub index: Option<Arc<Index>>,
     /// References to the constraints that may be used as an access path for the index.
     pub refs: Vec<ConstraintRef>,
+    /// Persisted `sqlite_stat1` `avgEq` values for this index, if loaded. `None`
+    /// for the rowid candidate and whenever no statistics have been loaded, in
+    /// which case the cost model falls back to its hardcoded selectivity.
+    pub index_stats: Option<Vec<i64>>,
 }
 
 #[derive(Debug)]
@@ -139,6 +144,10 @@ pub struct TableConstraints {
     pub constraints: Vec<Constraint>,
     /// Candidates for indexes that may use the constraints to perform a lookup.
     pub candidates: Vec<ConstraintUseCandidate>,
+    /// Estimated number of rows in the base table. Sourced from persisted
+    /// `sqlite_stat1` statistics when loaded, otherwise the hardcoded
+    /// [ESTIMATED_HARDCODED_ROWS_PER_TABLE] fallback.
+    pub base_row_count: f64,
 }
 
 /// In lieu of statistics, we estimate that an equality filter will reduce the output set to 1% of its size.
@@ -148,14 +157,15 @@ const SELECTIVITY_RANGE: f64 = 0.4;
 /// In lieu of statistics, we estimate that other filters will reduce the output set to 90% of its size.
 const SELECTIVITY_OTHER: f64 = 0.9;
 
-const SELECTIVITY_UNIQUE_EQUALITY: f64 = 1.0 / ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64;
-
 /// Estimate the selectivity of a constraint based on the operator and the column type.
-fn estimate_selectivity(column: &Column, op: ast::Operator) -> f64 {
+/// `base_row_count` is the estimated base table size (real `sqlite_stat1` row
+/// count when loaded, else the hardcoded fallback); a unique equality matches
+/// exactly one of those rows.
+fn estimate_selectivity(column: &Column, op: ast::Operator, base_row_count: f64) -> f64 {
     match op {
         ast::Operator::Equals => {
             if column.is_rowid_alias || column.primary_key {
-                SELECTIVITY_UNIQUE_EQUALITY
+                1.0 / base_row_count.max(1.0)
             } else {
                 SELECTIVITY_EQ
             }
@@ -174,6 +184,7 @@ pub fn constraints_from_where_clause(
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
     available_indexes: &HashMap<String, Vec<Arc<Index>>>,
+    stats: Option<&SchemaStats>,
 ) -> Result<Vec<TableConstraints>> {
     let mut constraints = Vec::new();
 
@@ -183,6 +194,14 @@ pub fn constraints_from_where_clause(
             .columns()
             .iter()
             .position(|c| c.is_rowid_alias);
+
+        // Per-table base row count: real `sqlite_stat1` count when loaded,
+        // otherwise the hardcoded fallback (which makes the cost model
+        // bit-for-bit identical to its pre-statistics behavior).
+        let base_row_count = stats
+            .and_then(|s| s.num_rows(table_reference.table.get_name()))
+            .map(|n| n as f64)
+            .unwrap_or(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64);
 
         let mut cs = TableConstraints {
             table_id: table_reference.internal_id,
@@ -195,14 +214,21 @@ pub fn constraints_from_where_clause(
                         .map(|index| ConstraintUseCandidate {
                             index: Some(index.clone()),
                             refs: Vec::new(),
+                            index_stats: stats
+                                .and_then(|s| {
+                                    s.index_stats(table_reference.table.get_name(), &index.name)
+                                })
+                                .map(|v| v.to_vec()),
                         })
                         .collect()
                 }),
+            base_row_count,
         };
         // Add a candidate for the rowid index, which is always available when the table has a rowid alias.
         cs.candidates.push(ConstraintUseCandidate {
             index: None,
             refs: Vec::new(),
+            index_stats: None,
         });
 
         for (i, term) in where_clause.iter().enumerate() {
@@ -228,7 +254,11 @@ pub fn constraints_from_where_clause(
                             operator,
                             table_col_pos: *column,
                             lhs_mask: table_mask_from_expr(rhs, table_references)?,
-                            selectivity: estimate_selectivity(table_column, operator),
+                            selectivity: estimate_selectivity(
+                                table_column,
+                                operator,
+                                base_row_count,
+                            ),
                         });
                     }
                 }
@@ -244,7 +274,11 @@ pub fn constraints_from_where_clause(
                             operator,
                             table_col_pos: rowid_alias_column.unwrap(),
                             lhs_mask: table_mask_from_expr(rhs, table_references)?,
-                            selectivity: estimate_selectivity(table_column, operator),
+                            selectivity: estimate_selectivity(
+                                table_column,
+                                operator,
+                                base_row_count,
+                            ),
                         });
                     }
                 }
@@ -259,7 +293,11 @@ pub fn constraints_from_where_clause(
                             operator: opposite_cmp_op(operator),
                             table_col_pos: *column,
                             lhs_mask: table_mask_from_expr(lhs, table_references)?,
-                            selectivity: estimate_selectivity(table_column, operator),
+                            selectivity: estimate_selectivity(
+                                table_column,
+                                operator,
+                                base_row_count,
+                            ),
                         });
                     }
                 }
@@ -272,7 +310,11 @@ pub fn constraints_from_where_clause(
                             operator: opposite_cmp_op(operator),
                             table_col_pos: rowid_alias_column.unwrap(),
                             lhs_mask: table_mask_from_expr(lhs, table_references)?,
-                            selectivity: estimate_selectivity(table_column, operator),
+                            selectivity: estimate_selectivity(
+                                table_column,
+                                operator,
+                                base_row_count,
+                            ),
                         });
                     }
                 }

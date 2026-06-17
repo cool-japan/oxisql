@@ -115,11 +115,20 @@ fn new_stmt_cache() -> StmtCache {
 
 /// Execute a SQL statement that has already been rewritten to `?` placeholders.
 ///
-/// On a cache miss, compiles the statement via `conn.prepare()`, inserts it into
-/// the cache, then executes it via `stmt.execute()`.  On a cache hit, retrieves
-/// the cached `limbo::Statement` and calls `stmt.execute()` directly —
-/// `Statement::execute()` calls `reset()` internally, which (after the engine
-/// fix in oxisqlite-core) also clears `n_change`, making reuse correct.
+/// All statements (DML and DDL) pass through the statement cache uniformly.
+/// On a cache miss the statement is compiled via `conn.prepare()`, executed,
+/// and stored for future reuse.  On a cache hit the existing `limbo::Statement`
+/// is retrieved, executed via `stmt.execute()` (which calls `reset()` before
+/// binding, zeroing `n_change` so reuse produces correct per-execution change
+/// counts), and returned to the cache.
+///
+/// If the cached statement was compiled before a schema change (DDL, ALTER,
+/// CREATE INDEX, etc.), the engine's `op_transaction` cookie check fires on
+/// the first `step()` and returns `SchemaChanged`.  This function catches that
+/// error, discards the stale compiled program, re-prepares against the
+/// refreshed schema, and retries exactly once.  This transparent re-prepare
+/// replaces the old `is_ddl` keyword-prefix heuristic that failed on
+/// comment-prefixed DDL and left DML statements stale after schema changes.
 ///
 /// The affected-row count is read from `conn.changes()` after execution,
 /// which reflects the count committed by the most recent write transaction on
@@ -134,51 +143,64 @@ async fn exec_rewritten(
     limbo_params: Vec<limbo::Value>,
     cache: Option<&StmtCache>,
 ) -> Result<u64, SqliteCompatError> {
-    let lp = if limbo_params.is_empty() {
-        LimboParams::None
-    } else {
-        LimboParams::Positional(limbo_params)
-    };
-
     match cache {
         Some(c) => {
-            // ── cache path ─────────────────────────────────────────────────────
-            //
-            // Retrieve a mutable reference to the cached statement, or compile a
-            // fresh one and insert it.  We hold the lock only for the duration of
-            // the lookup/insert, not across the `.await` in `stmt.execute()`.
-            //
-            // Because `StmtCache` holds the actual `Statement` value (not a
-            // reference-counted pointer to it), we need to take ownership on a
-            // cache miss and then put it back after execution.
-
-            // Try to remove a hit from the cache so we have owned access during
-            // the async execute call.
-            let cached_stmt: Option<limbo::Statement> = c
-                .lock()
-                .map_err(|e| SqliteCompatError::Other(format!("stmt_cache lock poisoned: {e}")))?
-                .pop(sql);
-
-            let mut stmt = match cached_stmt {
-                Some(s) => s,
-                None => {
-                    // Cache miss — compile a new statement.
-                    conn.prepare(sql).await.map_err(SqliteCompatError::from)?
-                }
+            // Clone before consuming so we can rebuild the parameter list for a
+            // re-prepare-and-retry if the engine signals SchemaChanged.
+            let retry_params = limbo_params.clone();
+            let lp = if limbo_params.is_empty() {
+                LimboParams::None
+            } else {
+                LimboParams::Positional(limbo_params)
             };
 
-            // Execute the (possibly retrieved-from-cache) statement.
-            // `Statement::execute()` calls `reset()` before binding parameters,
-            // and `reset()` now also zeroes `n_change`, so reuse is correct.
-            stmt.execute(lp).await.map_err(SqliteCompatError::from)?;
+            // Take the compiled statement out of the cache (if present).
+            // The lock is held only for this short lookup; never across `.await`.
+            let cached = {
+                let mut guard = c.lock().map_err(|e| {
+                    SqliteCompatError::Other(format!("stmt_cache lock poisoned: {e}"))
+                })?;
+                guard.pop(sql)
+            };
 
-            // Return the statement to the cache for future reuse.
-            c.lock()
-                .map_err(|e| SqliteCompatError::Other(format!("stmt_cache lock poisoned: {e}")))?
-                .put(sql.to_owned(), stmt);
+            let mut stmt = match cached {
+                Some(s) => s,
+                None => conn.prepare(sql).await.map_err(SqliteCompatError::from)?,
+            };
 
-            // Read the affected-row count from the connection's native counter.
-            // DDL and TCL statements leave this at 0.
+            match stmt.execute(lp).await {
+                Ok(_) => {
+                    // Execution succeeded — return the statement to the cache.
+                    c.lock()
+                        .map_err(|e| {
+                            SqliteCompatError::Other(format!("stmt_cache lock poisoned: {e}"))
+                        })?
+                        .put(sql.to_owned(), stmt);
+                }
+                Err(e) if e.is_schema_changed() => {
+                    // The schema changed after this statement was compiled. Drop
+                    // the stale program, re-compile against the refreshed schema,
+                    // and retry exactly once.
+                    drop(stmt);
+                    let retry_lp = if retry_params.is_empty() {
+                        LimboParams::None
+                    } else {
+                        LimboParams::Positional(retry_params)
+                    };
+                    let mut fresh = conn.prepare(sql).await.map_err(SqliteCompatError::from)?;
+                    fresh
+                        .execute(retry_lp)
+                        .await
+                        .map_err(SqliteCompatError::from)?;
+                    c.lock()
+                        .map_err(|e| {
+                            SqliteCompatError::Other(format!("stmt_cache lock poisoned: {e}"))
+                        })?
+                        .put(sql.to_owned(), fresh);
+                }
+                Err(e) => return Err(SqliteCompatError::from(e)),
+            }
+
             let n = conn
                 .changes()
                 .map_err(|e| SqliteCompatError::Other(format!("changes() failed: {e}")))?;
@@ -186,6 +208,11 @@ async fn exec_rewritten(
         }
         None => {
             // ── no-cache path (uncommon; bypasses the cache entirely) ──────────
+            let lp = if limbo_params.is_empty() {
+                LimboParams::None
+            } else {
+                LimboParams::Positional(limbo_params)
+            };
             conn.execute(sql, lp)
                 .await
                 .map_err(SqliteCompatError::from)?;

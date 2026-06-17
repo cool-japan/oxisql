@@ -95,7 +95,10 @@ pub fn translate_alter_table(
             );
 
             let mut parser = Parser::new(stmt.as_bytes());
-            let Some(ast::Cmd::Stmt(ast::Stmt::Update(mut update))) = parser.next().unwrap() else {
+            let Some(ast::Cmd::Stmt(ast::Stmt::Update(mut update))) = parser
+                .next()
+                .expect("parser should produce Update statement")
+            else {
                 unreachable!();
             };
 
@@ -153,6 +156,7 @@ pub fn translate_alter_table(
                         });
                     });
 
+                    program.emit_schema_change();
                     program.emit_insn(Insn::ParseSchema {
                         db: usize::MAX, // TODO: This value is unused, change when we do something with it
                         where_clause: None,
@@ -202,7 +206,10 @@ pub fn translate_alter_table(
             );
 
             let mut parser = Parser::new(stmt.as_bytes());
-            let Some(ast::Cmd::Stmt(ast::Stmt::Update(mut update))) = parser.next().unwrap() else {
+            let Some(ast::Cmd::Stmt(ast::Stmt::Update(mut update))) = parser
+                .next()
+                .expect("parser should produce Update statement")
+            else {
                 unreachable!();
             };
 
@@ -213,6 +220,7 @@ pub fn translate_alter_table(
                 syms,
                 program,
                 |program| {
+                    program.emit_schema_change();
                     program.emit_insn(Insn::ParseSchema {
                         db: usize::MAX, // TODO: This value is unused, change when we do something with it
                         where_clause: None,
@@ -299,6 +307,7 @@ pub fn translate_alter_table(
                 });
             });
 
+            program.emit_schema_change();
             program.emit_insn(Insn::ParseSchema {
                 db: usize::MAX, // TODO: This value is unused, change when we do something with it
                 where_clause: None,
@@ -377,6 +386,7 @@ pub fn translate_alter_table(
                 });
             });
 
+            program.emit_schema_change();
             program.emit_insn(Insn::ParseSchema {
                 db: usize::MAX, // TODO: This value is unused, change when we do something with it
                 where_clause: None,

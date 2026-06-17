@@ -76,7 +76,7 @@ mod tests {
             }));
         }
         for thread in threads {
-            thread.join().unwrap();
+            thread.join().expect("worker thread should not panic");
         }
         assert_eq!(*lock.lock(), NTHREADS);
     }

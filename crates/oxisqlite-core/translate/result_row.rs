@@ -108,18 +108,18 @@ pub fn emit_result_row_and_limit(
         }
     }
 
-    if plan.limit.is_some() {
+    if plan.limit.is_some() || limit_ctx.is_some() {
         if label_on_limit_reached.is_none() {
             // There are cases where LIMIT is ignored, e.g. aggregation without a GROUP BY clause.
             // We already early return on LIMIT 0, so we can just return here since the n of rows
             // is always 1 here.
             return Ok(());
         }
-        let limit_ctx = limit_ctx.expect("limit_ctx must be Some if plan.limit is Some");
+        let limit_ctx = limit_ctx.expect("limit_ctx must be Some when any limit is active");
 
         program.emit_insn(Insn::DecrJumpZero {
             reg: limit_ctx.reg_limit,
-            target_pc: label_on_limit_reached.unwrap(),
+            target_pc: label_on_limit_reached.expect("label_on_limit_reached checked above"),
         });
     }
     Ok(())
@@ -131,16 +131,15 @@ pub fn emit_offset(
     jump_to: BranchOffset,
     reg_offset: Option<usize>,
 ) -> Result<()> {
-    match plan.offset {
-        Some(offset) if offset > 0 => {
-            program.add_comment(program.offset(), "OFFSET");
-            program.emit_insn(Insn::IfPos {
-                reg: reg_offset.expect("reg_offset must be Some"),
-                target_pc: jump_to,
-                decrement_by: 1,
-            });
-        }
-        _ => {}
+    let needs_offset_skip =
+        plan.offset.is_some_and(|o| o > 0) || (plan.offset_expr.is_some() && reg_offset.is_some());
+    if needs_offset_skip {
+        program.add_comment(program.offset(), "OFFSET");
+        program.emit_insn(Insn::IfPos {
+            reg: reg_offset.expect("reg_offset must be Some when offset skipping is active"),
+            target_pc: jump_to,
+            decrement_by: 1,
+        });
     }
     Ok(())
 }

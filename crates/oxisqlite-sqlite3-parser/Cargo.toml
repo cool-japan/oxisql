@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "oxisqlite-sqlite3-parser"
-version = "0.1.0"
+version.workspace = true
 authors = ["gwenn"]
 autolib = false
 autobins = false
@@ -29,7 +29,7 @@ keywords = [
     "tokenizer",
 ]
 categories = ["parser-implementations"]
-license = "MIT OR Apache-2.0"
+license.workspace = true
 repository = "https://github.com/cool-japan/oxisql"
 
 [lib]

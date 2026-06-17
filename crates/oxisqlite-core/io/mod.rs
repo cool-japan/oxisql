@@ -17,6 +17,9 @@ pub trait File: Send + Sync {
     fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Arc<Completion>) -> Result<()>;
     fn sync(&self, c: Arc<Completion>) -> Result<()>;
     fn size(&self) -> Result<u64>;
+    /// Truncate the file to `len` bytes. Used to reset the WAL to empty after a
+    /// checkpoint in Truncate/Restart mode.
+    fn truncate(&self, len: usize, c: Arc<Completion>) -> Result<()>;
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]

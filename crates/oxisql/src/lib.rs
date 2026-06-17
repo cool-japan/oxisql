@@ -769,6 +769,188 @@ pub async fn connect(uri: &str) -> Result<Box<dyn Connection>, OxiSqlError> {
     Err(OxiSqlError::UnsupportedUri(uri.to_string()))
 }
 
+/// The wire-protocol family of a connection URI that supports server-side
+/// database creation (`CREATE DATABASE`).
+///
+/// Embedded backends (`memory://`, `redb://`, `fjall://`, `sled://`,
+/// `sqlite://`) create their storage on open and are not represented here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateScheme {
+    /// PostgreSQL (`postgres://` / `postgresql://`).
+    Postgres,
+    /// MySQL (`mysql://`).
+    Mysql,
+}
+
+impl CreateScheme {
+    /// Classify `uri` into a [`CreateScheme`], or `None` for embedded / unknown
+    /// schemes that do not support `CREATE DATABASE`.
+    fn from_uri(uri: &str) -> Option<Self> {
+        if uri.starts_with("postgres://") || uri.starts_with("postgresql://") {
+            Some(CreateScheme::Postgres)
+        } else if uri.starts_with("mysql://") {
+            Some(CreateScheme::Mysql)
+        } else {
+            None
+        }
+    }
+}
+
+/// Split a wire-protocol URI into its authority part (scheme + credentials +
+/// host[:port], up to but excluding the leading `/` of the path) and the
+/// target database name (the first path segment, percent-decoding left to the
+/// backend).
+///
+/// The returned tuple is `(authority, db_name)` where `authority` retains the
+/// scheme and any `?query`/`#fragment` is **not** part of `db_name`.  The query
+/// string (if any) is preserved on the authority half so callers can rebuild a
+/// maintenance URI without losing connection parameters.
+///
+/// # Errors
+///
+/// Returns [`OxiSqlError::UnsupportedUri`] when the URI has no `scheme://`
+/// prefix, no path component, or an empty database name.
+fn split_db_name(uri: &str) -> Result<(String, String), OxiSqlError> {
+    let scheme_end = uri
+        .find("://")
+        .ok_or_else(|| OxiSqlError::UnsupportedUri(format!("URI is missing a scheme://: {uri}")))?;
+    // Position just after "://".
+    let after_scheme = scheme_end + 3;
+    let rest = &uri[after_scheme..];
+
+    // The authority ends at the first '/' (start of the path).  A '?' or '#'
+    // before any '/' means there is no path → no database name.
+    let path_slash = rest.find('/');
+    let query_or_frag = rest.find(['?', '#']);
+
+    let slash_idx = match (path_slash, query_or_frag) {
+        (Some(s), Some(q)) if s < q => s,
+        (Some(s), None) => s,
+        _ => {
+            return Err(OxiSqlError::UnsupportedUri(format!(
+                "URI has no database path segment: {uri}"
+            )));
+        }
+    };
+
+    // authority = scheme + everything up to (not including) the path slash.
+    let authority = &uri[..after_scheme + slash_idx];
+
+    // The path begins right after the slash.  The database name is the first
+    // path segment, terminated by the next '/', '?' or '#'.
+    let path_and_after = &rest[slash_idx + 1..];
+    let db_end = path_and_after
+        .find(['/', '?', '#'])
+        .unwrap_or(path_and_after.len());
+    let db_name = &path_and_after[..db_end];
+
+    if db_name.is_empty() {
+        return Err(OxiSqlError::UnsupportedUri(format!(
+            "URI has an empty database name: {uri}"
+        )));
+    }
+
+    // Preserve any query string on the authority half so the maintenance URI
+    // keeps connection parameters (sslmode, application_name, …).
+    let query = match uri.find('?') {
+        Some(q) => &uri[q..],
+        None => "",
+    };
+
+    Ok((format!("{authority}{query}"), db_name.to_string()))
+}
+
+/// Build a *maintenance* connection URI from `uri` — one that connects to a
+/// database that is guaranteed to exist so a `CREATE DATABASE` for the real
+/// target can be issued.
+///
+/// - **PostgreSQL** connects to the built-in `postgres` maintenance database,
+///   reusing the same authority and query string.
+/// - **MySQL** connects with **no** database selected (no path), reusing the
+///   same authority and query string.
+///
+/// # Errors
+///
+/// Propagates [`OxiSqlError::UnsupportedUri`] from [`split_db_name`].
+fn maintenance_uri(uri: &str, scheme: CreateScheme) -> Result<String, OxiSqlError> {
+    // `split_db_name` returns the authority with any query string already
+    // appended (e.g. "postgres://user@host:5432?sslmode=require").
+    let (authority_with_query, _db) = split_db_name(uri)?;
+
+    match scheme {
+        CreateScheme::Postgres => {
+            // Insert the `/postgres` path *before* any query string.
+            match authority_with_query.split_once('?') {
+                Some((auth, query)) => Ok(format!("{auth}/postgres?{query}")),
+                None => Ok(format!("{authority_with_query}/postgres")),
+            }
+        }
+        // MySQL: no database path — the authority (with query) is exactly the
+        // maintenance URI.
+        CreateScheme::Mysql => Ok(authority_with_query),
+    }
+}
+
+/// Quote a SQL identifier for the given [`CreateScheme`], escaping the quote
+/// character per that dialect, and build a `CREATE DATABASE <quoted>` statement.
+///
+/// - **PostgreSQL** double-quotes the identifier, doubling embedded `"`.
+/// - **MySQL** backtick-quotes the identifier, doubling embedded `` ` ``.
+///
+/// # Errors
+///
+/// Returns [`OxiSqlError::UnsupportedUri`] when `db_name` is empty or contains a
+/// NUL byte (`\0`), which cannot be safely represented in a quoted identifier.
+fn create_database_stmt(scheme: CreateScheme, db_name: &str) -> Result<String, OxiSqlError> {
+    if db_name.is_empty() {
+        return Err(OxiSqlError::UnsupportedUri(
+            "cannot CREATE DATABASE with an empty name".to_string(),
+        ));
+    }
+    if db_name.contains('\0') {
+        return Err(OxiSqlError::UnsupportedUri(format!(
+            "database name contains a NUL byte and cannot be safely quoted: {db_name:?}"
+        )));
+    }
+
+    let quoted = match scheme {
+        // Postgres: "name", escape embedded '"' as '""'.
+        CreateScheme::Postgres => format!("\"{}\"", db_name.replace('"', "\"\"")),
+        // MySQL: `name`, escape embedded '`' as '``'.
+        CreateScheme::Mysql => format!("`{}`", db_name.replace('`', "``")),
+    };
+
+    Ok(format!("CREATE DATABASE {quoted}"))
+}
+
+/// Classify an [`OxiSqlError`] produced while connecting (or probing) a
+/// wire-protocol backend as a "target database does not exist" error.
+///
+/// - **PostgreSQL** reports SQLSTATE `3D000` (`invalid_catalog_name` /
+///   `undefined_database`).  The probe ([`pg_probe`]) embeds the SQLSTATE code
+///   in the message when the server supplies one (the facade's normal mapping
+///   discards it); the canonical-message substring `does not exist` is matched
+///   as a fallback for builds that cannot read the structured code.
+/// - **MySQL** reports server error code `1049` (`ER_BAD_DB_ERROR`,
+///   "Unknown database").  The numeric code survives in the backend error's
+///   `Display` (`ERROR 1049 (…): Unknown database …`), so it is matched
+///   directly.
+///
+/// The predicate is pure and operates only on the rendered error string, which
+/// makes it unit-testable against synthetic [`OxiSqlError`] values without a
+/// live server.
+fn is_database_missing_error(scheme: CreateScheme, err: &OxiSqlError) -> bool {
+    let msg = err.to_string();
+    match scheme {
+        // SQLSTATE 3D000 is the only state for a missing catalog.  Match the
+        // structured code first; fall back to the canonical server phrasing.
+        CreateScheme::Postgres => msg.contains("3D000") || msg.contains("does not exist"),
+        // MySQL error 1049 — match the numeric code, which `mysql_async`
+        // renders verbatim in the server-error Display.
+        CreateScheme::Mysql => msg.contains("1049"),
+    }
+}
+
 /// Connect to a database, creating it first if it does not already exist.
 ///
 /// # Per-backend behaviour
@@ -776,20 +958,26 @@ pub async fn connect(uri: &str) -> Result<Box<dyn Connection>, OxiSqlError> {
 /// | URI prefix | Behaviour |
 /// |---|---|
 /// | `memory://` | Identical to [`connect`]: always succeeds (no persistent storage to create). |
-/// | `postgres://` / `postgresql://` | Delegates to [`connect`].  Full auto-create (connecting to the `postgres` maintenance database and issuing `CREATE DATABASE`) is planned for a future release. |
-/// | `mysql://` | Delegates to [`connect`].  Full auto-create (connecting without a database and issuing `CREATE DATABASE IF NOT EXISTS`) is planned for a future release. |
+/// | `postgres://` / `postgresql://` | Attempts [`connect`]; on SQLSTATE `3D000` (database does not exist) connects to the `postgres` maintenance database, issues `CREATE DATABASE "<name>"`, then reconnects to the original URI. |
+/// | `mysql://` | Attempts [`connect`] and probes the connection; on error `1049` (unknown database) connects with no database selected, issues `` CREATE DATABASE `<name>` ``, then reconnects to the original URI. |
+/// | `redb://`, `fjall://`, `sled://`, `sqlite://`, `file://` | Identical to [`connect`]: these embedded backends create their storage on open. |
 /// | Unknown schemes | Returns the same error as [`connect`]. |
 ///
-/// For the `memory://` scheme this function is the most useful: it always
-/// produces a fresh in-memory database regardless of whether one previously
-/// existed.  Callers that want to be forward-compatible with persistent
-/// backends (once auto-create is implemented) should prefer this function
-/// over [`connect`] wherever database-creation semantics are desired.
+/// The database identifier is always safely quoted (PostgreSQL double-quotes,
+/// MySQL backticks, with embedded quote characters doubled) and a name that
+/// cannot be quoted (e.g. one containing a NUL byte) is rejected — the
+/// `CREATE DATABASE` statement is never built by raw interpolation.
+///
+/// `CREATE DATABASE` is issued on a freshly-opened maintenance connection and
+/// therefore runs in autocommit mode; it is **not** wrapped in a transaction
+/// (PostgreSQL forbids `CREATE DATABASE` inside one).
 ///
 /// # Errors
 ///
 /// Returns [`OxiSqlError::NotConnected`] when no backend is compiled in for
-/// the requested scheme, or a backend-specific error on connection failure.
+/// the requested scheme, [`OxiSqlError::UnsupportedUri`] when a `postgres://` /
+/// `mysql://` URI has no database name (so there is nothing to create), or a
+/// backend-specific error on connection / creation failure.
 ///
 /// # Example
 ///
@@ -804,13 +992,129 @@ pub async fn connect(uri: &str) -> Result<Box<dyn Connection>, OxiSqlError> {
 /// ```
 #[must_use = "the returned Connection should be used for database operations"]
 pub async fn connect_or_create(uri: &str) -> Result<Box<dyn Connection>, OxiSqlError> {
-    // For all current backends, `connect` already handles creation semantics
-    // as appropriate (embedded is always created fresh; network backends do
-    // not yet implement DDL-level auto-create).  This function provides the
-    // stable API surface for callers that want create-if-absent semantics,
-    // and will be enhanced in future releases to support PostgreSQL and MySQL
-    // database creation.
-    connect(uri).await
+    // Embedded backends (memory/redb/fjall/sled/sqlite) and unknown schemes
+    // create-on-open or have no create semantics — delegate unchanged.
+    let scheme = match CreateScheme::from_uri(uri) {
+        Some(s) => s,
+        None => return connect(uri).await,
+    };
+
+    // Probe whether the target database already exists.  For PostgreSQL the
+    // missing-database error surfaces eagerly during `connect`; for MySQL the
+    // pool connects lazily, so an extra round-trip is needed to force the
+    // server handshake (where the unknown-database error is raised).
+    let probe = match scheme {
+        CreateScheme::Postgres => pg_probe(uri).await,
+        CreateScheme::Mysql => mysql_probe(uri).await,
+    };
+
+    match probe {
+        // Database exists (or some other, non-fatal-to-detection state): hand
+        // back a normal facade connection.
+        Ok(()) => connect(uri).await,
+        Err(err) if is_database_missing_error(scheme, &err) => {
+            // Create the database via a maintenance connection, then reconnect.
+            let (_authority, db_name) = split_db_name(uri)?;
+            let stmt = create_database_stmt(scheme, &db_name)?;
+            let maint = maintenance_uri(uri, scheme)?;
+
+            // Fresh connection ⇒ autocommit; CREATE DATABASE is a simple
+            // statement and is NOT wrapped in a transaction.
+            let maint_conn = connect(&maint).await?;
+            maint_conn.execute(&stmt, &[]).await?;
+            drop(maint_conn);
+
+            connect(uri).await
+        }
+        // Any other error (auth failure, host unreachable, …) is returned as-is.
+        Err(err) => Err(err),
+    }
+}
+
+/// Render a backend error together with its full `source()` chain into a
+/// single string, so discriminating detail carried by a *source* error (e.g.
+/// PostgreSQL's `DbError` message, MySQL's numeric server code) survives even
+/// when the top-level `Display` is opaque (e.g. tokio-postgres renders database
+/// errors as just `"db error"`).
+///
+/// This avoids a direct dependency on the backend driver crates
+/// (`tokio_postgres` / `mysql_async`) — it relies only on the standard
+/// [`std::error::Error`] source chain.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+fn render_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut source = err.source();
+    // Bound the walk defensively against any pathological cyclic chain.
+    let mut guard = 0u8;
+    while let Some(inner) = source {
+        parts.push(inner.to_string());
+        source = inner.source();
+        guard = guard.saturating_add(1);
+        if guard >= 16 {
+            break;
+        }
+    }
+    parts.join(": ")
+}
+
+/// Attempt to open `uri` as PostgreSQL and confirm the target database exists.
+///
+/// Returns `Ok(())` when the connection (which selects the database during the
+/// startup handshake) succeeds, or the connection error — rendered with its
+/// full source chain so the canonical `database "…" does not exist` message is
+/// preserved — on failure.  This bypasses the facade's lossy error mapping so
+/// [`is_database_missing_error`] can classify a missing database.
+#[cfg(feature = "postgres")]
+async fn pg_probe(uri: &str) -> Result<(), OxiSqlError> {
+    match oxisql_postgres::PgConnection::connect(uri, oxisql_postgres::TlsMode::Disabled).await {
+        Ok(_conn) => Ok(()),
+        Err(e) => Err(OxiSqlError::Other(format!(
+            "postgres connect error: {}",
+            render_error_chain(&e)
+        ))),
+    }
+}
+
+/// PostgreSQL backend not compiled in — fall back to the facade `connect`
+/// (which yields a clear "unsupported scheme" error).
+#[cfg(not(feature = "postgres"))]
+async fn pg_probe(uri: &str) -> Result<(), OxiSqlError> {
+    connect(uri).await.map(|_| ())
+}
+
+/// Attempt to open `uri` as MySQL and confirm the target database exists.
+///
+/// MySQL's pool connects lazily, so a trivial `SELECT 1` probe is issued to
+/// force the server handshake where an unknown-database error (code `1049`)
+/// would be raised.  Returns `Ok(())` on success, or the error — rendered with
+/// its full source chain so the numeric `ERROR 1049` code is preserved — on
+/// failure.
+#[cfg(feature = "mysql")]
+async fn mysql_probe(uri: &str) -> Result<(), OxiSqlError> {
+    let conn = match oxisql_mysql::MyConnection::connect(uri, oxisql_mysql::TlsMode::Disabled).await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(OxiSqlError::Other(format!(
+                "mysql connect error: {}",
+                render_error_chain(&e)
+            )))
+        }
+    };
+    // Force the lazy pool to actually connect (and select the database).
+    match conn.query_binary("SELECT 1", &[]).await {
+        Ok(_rows) => Ok(()),
+        Err(e) => Err(OxiSqlError::Other(format!(
+            "mysql probe error: {}",
+            render_error_chain(&e)
+        ))),
+    }
+}
+
+/// MySQL backend not compiled in — fall back to the facade `connect`.
+#[cfg(not(feature = "mysql"))]
+async fn mysql_probe(uri: &str) -> Result<(), OxiSqlError> {
+    connect(uri).await.map(|_| ())
 }
 
 /// Connect to a database via a connection pool.
@@ -1074,5 +1378,261 @@ mod feature_flag_tests {
             let _: fn() -> crate::BackendInfo = crate::BackendInfo::datafusion_backend;
         }
         // If we reach here, all enabled feature combinations compiled
+    }
+}
+
+#[cfg(test)]
+mod auto_create_helpers_tests {
+    use super::{
+        create_database_stmt, is_database_missing_error, maintenance_uri, split_db_name,
+        CreateScheme, OxiSqlError,
+    };
+
+    // ── split_db_name ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn split_db_name_basic() {
+        let (authority, db) =
+            split_db_name("postgres://user:pw@localhost:5432/mydb").expect("splits");
+        assert_eq!(authority, "postgres://user:pw@localhost:5432");
+        assert_eq!(db, "mydb");
+    }
+
+    #[test]
+    fn split_db_name_with_params() {
+        // The query string must be preserved on the authority half so the
+        // maintenance URI keeps connection parameters.
+        let (authority, db) =
+            split_db_name("postgres://user@host:5432/appdb?sslmode=require&application_name=x")
+                .expect("splits");
+        assert_eq!(
+            authority,
+            "postgres://user@host:5432?sslmode=require&application_name=x"
+        );
+        assert_eq!(db, "appdb");
+    }
+
+    #[test]
+    fn split_db_name_mysql() {
+        let (authority, db) = split_db_name("mysql://root@127.0.0.1:3306/shop").expect("splits");
+        assert_eq!(authority, "mysql://root@127.0.0.1:3306");
+        assert_eq!(db, "shop");
+    }
+
+    #[test]
+    fn split_db_name_rejects_no_scheme() {
+        assert!(matches!(
+            split_db_name("localhost/db"),
+            Err(OxiSqlError::UnsupportedUri(_))
+        ));
+    }
+
+    #[test]
+    fn split_db_name_rejects_no_path() {
+        // Authority only, no '/' before the (optional) query → no database.
+        assert!(matches!(
+            split_db_name("postgres://localhost"),
+            Err(OxiSqlError::UnsupportedUri(_))
+        ));
+        assert!(matches!(
+            split_db_name("postgres://localhost?sslmode=require"),
+            Err(OxiSqlError::UnsupportedUri(_))
+        ));
+    }
+
+    #[test]
+    fn split_db_name_rejects_empty_db() {
+        assert!(matches!(
+            split_db_name("postgres://localhost/"),
+            Err(OxiSqlError::UnsupportedUri(_))
+        ));
+        assert!(matches!(
+            split_db_name("postgres://localhost/?x=1"),
+            Err(OxiSqlError::UnsupportedUri(_))
+        ));
+    }
+
+    // ── maintenance_uri ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn pg_maintenance_uri() {
+        let m = maintenance_uri(
+            "postgres://user:pw@localhost:5432/mydb",
+            CreateScheme::Postgres,
+        )
+        .expect("maintenance uri");
+        assert_eq!(m, "postgres://user:pw@localhost:5432/postgres");
+    }
+
+    #[test]
+    fn pg_maintenance_uri_preserves_query() {
+        let m = maintenance_uri(
+            "postgresql://u@h:5432/appdb?sslmode=require&connect_timeout=5",
+            CreateScheme::Postgres,
+        )
+        .expect("maintenance uri");
+        assert_eq!(
+            m,
+            "postgresql://u@h:5432/postgres?sslmode=require&connect_timeout=5"
+        );
+    }
+
+    #[test]
+    fn mysql_maintenance_uri() {
+        let m = maintenance_uri("mysql://root@127.0.0.1:3306/shop", CreateScheme::Mysql)
+            .expect("maintenance uri");
+        // No database path on the maintenance URI for MySQL.
+        assert_eq!(m, "mysql://root@127.0.0.1:3306");
+    }
+
+    #[test]
+    fn mysql_maintenance_uri_preserves_query() {
+        let m = maintenance_uri(
+            "mysql://root@127.0.0.1:3306/shop?pool_max=4",
+            CreateScheme::Mysql,
+        )
+        .expect("maintenance uri");
+        assert_eq!(m, "mysql://root@127.0.0.1:3306?pool_max=4");
+    }
+
+    // ── create_database_stmt ──────────────────────────────────────────────────────
+
+    #[test]
+    fn create_database_stmt_quotes_identifier() {
+        // PostgreSQL → double quotes.
+        assert_eq!(
+            create_database_stmt(CreateScheme::Postgres, "mydb").expect("stmt"),
+            r#"CREATE DATABASE "mydb""#
+        );
+        // MySQL → backticks.
+        assert_eq!(
+            create_database_stmt(CreateScheme::Mysql, "mydb").expect("stmt"),
+            "CREATE DATABASE `mydb`"
+        );
+    }
+
+    #[test]
+    fn create_database_stmt_escapes_embedded_quote() {
+        // PostgreSQL doubles an embedded double-quote.
+        assert_eq!(
+            create_database_stmt(CreateScheme::Postgres, r#"we"ird"#).expect("stmt"),
+            r#"CREATE DATABASE "we""ird""#
+        );
+        // MySQL doubles an embedded backtick.
+        assert_eq!(
+            create_database_stmt(CreateScheme::Mysql, "we`ird").expect("stmt"),
+            "CREATE DATABASE `we``ird`"
+        );
+    }
+
+    #[test]
+    fn create_database_stmt_rejects_bad_identifier() {
+        // A NUL byte cannot be safely represented in a quoted identifier.
+        assert!(matches!(
+            create_database_stmt(CreateScheme::Postgres, "bad\0name"),
+            Err(OxiSqlError::UnsupportedUri(_))
+        ));
+        assert!(matches!(
+            create_database_stmt(CreateScheme::Mysql, "bad\0name"),
+            Err(OxiSqlError::UnsupportedUri(_))
+        ));
+        // An empty name is rejected too.
+        assert!(matches!(
+            create_database_stmt(CreateScheme::Postgres, ""),
+            Err(OxiSqlError::UnsupportedUri(_))
+        ));
+    }
+
+    // ── is_database_missing_error ──────────────────────────────────────────────────
+
+    #[test]
+    fn classifier_matches_pg_missing_database() {
+        // Real-world rendering embeds SQLSTATE 3D000 and/or the canonical phrase.
+        let sqlstate_err = OxiSqlError::Other(
+            "postgres connect error: db error: FATAL: database \"mydb\" does not exist [SQLSTATE 3D000]"
+                .to_string(),
+        );
+        assert!(is_database_missing_error(
+            CreateScheme::Postgres,
+            &sqlstate_err
+        ));
+
+        let phrase_err = OxiSqlError::Other(
+            "postgres connect error: db error: FATAL: database \"mydb\" does not exist".to_string(),
+        );
+        assert!(is_database_missing_error(
+            CreateScheme::Postgres,
+            &phrase_err
+        ));
+    }
+
+    #[test]
+    fn classifier_rejects_unrelated_pg_error() {
+        // Authentication failure (SQLSTATE 28P01) must NOT be treated as missing-db.
+        let auth_err = OxiSqlError::Other(
+            "postgres connect error: db error: FATAL: password authentication failed [SQLSTATE 28P01]"
+                .to_string(),
+        );
+        assert!(!is_database_missing_error(
+            CreateScheme::Postgres,
+            &auth_err
+        ));
+
+        // A connection-refused error is unrelated.
+        let conn_err = OxiSqlError::Other(
+            "postgres connect error: error connecting to server: Connection refused".to_string(),
+        );
+        assert!(!is_database_missing_error(
+            CreateScheme::Postgres,
+            &conn_err
+        ));
+    }
+
+    #[test]
+    fn classifier_matches_mysql_missing_database() {
+        // mysql_async renders the numeric code in the server-error Display.
+        let err = OxiSqlError::Other(
+            "mysql probe error: mysql connection error: Server error: `ERROR 1049 (42000): \
+             Unknown database 'shop''"
+                .to_string(),
+        );
+        assert!(is_database_missing_error(CreateScheme::Mysql, &err));
+    }
+
+    #[test]
+    fn classifier_rejects_unrelated_mysql_error() {
+        // Access denied (error 1045) must NOT be treated as missing-db.
+        let access_err = OxiSqlError::Other(
+            "mysql connect error: mysql connection error: Server error: `ERROR 1045 (28000): \
+             Access denied for user 'root'@'localhost''"
+                .to_string(),
+        );
+        assert!(!is_database_missing_error(CreateScheme::Mysql, &access_err));
+
+        // An I/O / connection-refused error is unrelated.
+        let io_err = OxiSqlError::Other(
+            "mysql connect error: mysql connection error: Input/output error: Connection refused"
+                .to_string(),
+        );
+        assert!(!is_database_missing_error(CreateScheme::Mysql, &io_err));
+    }
+
+    #[test]
+    fn create_scheme_classifies_uris() {
+        assert_eq!(
+            CreateScheme::from_uri("postgres://h/db"),
+            Some(CreateScheme::Postgres)
+        );
+        assert_eq!(
+            CreateScheme::from_uri("postgresql://h/db"),
+            Some(CreateScheme::Postgres)
+        );
+        assert_eq!(
+            CreateScheme::from_uri("mysql://h/db"),
+            Some(CreateScheme::Mysql)
+        );
+        assert_eq!(CreateScheme::from_uri("memory://"), None);
+        assert_eq!(CreateScheme::from_uri("sqlite://x.db"), None);
+        assert_eq!(CreateScheme::from_uri("redb:///x.db"), None);
     }
 }

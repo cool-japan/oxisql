@@ -155,7 +155,7 @@ pub fn add_vfs_module(name: String, vfs: Arc<VfsMod>) {
     let mut modules = VFS_MODULES
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
-        .unwrap();
+        .expect("VFS_MODULES mutex poisoned");
     if !modules.iter().any(|v| v.0 == name) {
         modules.push((name, vfs));
     }
@@ -165,7 +165,7 @@ pub fn list_vfs_modules() -> Vec<String> {
     VFS_MODULES
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
-        .unwrap()
+        .expect("VFS_MODULES mutex poisoned")
         .iter()
         .map(|v| v.0.clone())
         .collect()
@@ -175,6 +175,6 @@ pub fn get_vfs_modules() -> Vec<Vfs> {
     VFS_MODULES
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
-        .unwrap()
+        .expect("VFS_MODULES mutex poisoned")
         .clone()
 }

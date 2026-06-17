@@ -24,7 +24,9 @@ pub fn emit_ungrouped_aggregation<'a>(
     t_ctx: &mut TranslateCtx<'a>,
     plan: &'a SelectPlan,
 ) -> Result<()> {
-    let agg_start_reg = t_ctx.reg_agg_start.unwrap();
+    let agg_start_reg = t_ctx
+        .reg_agg_start
+        .ok_or_else(|| LimboError::InternalError("reg_agg_start not set".to_string()))?;
     for (i, agg) in plan.aggregates.iter().enumerate() {
         let agg_result_reg = agg_start_reg + i;
         program.emit_insn(Insn::AggFinal {
@@ -52,7 +54,9 @@ pub fn emit_ungrouped_aggregation<'a>(
         None,
         t_ctx.reg_nonagg_emit_once_flag,
         t_ctx.reg_offset,
-        t_ctx.reg_result_cols_start.unwrap(),
+        t_ctx.reg_result_cols_start.ok_or_else(|| {
+            LimboError::InternalError("reg_result_cols_start not set".to_string())
+        })?,
         t_ctx.limit_ctx,
     )?;
 

@@ -22,17 +22,76 @@ use super::{
     aggregation::translate_aggregation_step,
     emitter::{OperationMode, TranslateCtx},
     expr::{
-        translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
-        ConditionMetadata, NoConstantOptReason,
+        expr_contains_subquery, translate_condition_expr, translate_expr,
+        translate_expr_no_constant_opt, ConditionMetadata, NoConstantOptReason,
     },
     group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
     optimizer::Optimizable,
     order_by::{order_by_sorter_insert, sorter_insert},
     plan::{
-        convert_where_to_vtab_constraint, Aggregate, GroupBy, IterationDirection, JoinOrderMember,
-        Operation, QueryDestination, Search, SeekDef, SelectPlan, TableReferences, WhereTerm,
+        convert_where_to_vtab_constraint, Aggregate, EvalAt, GroupBy, IterationDirection,
+        JoinOrderMember, Operation, QueryDestination, Search, SeekDef, SelectPlan, TableReferences,
+        WhereTerm,
     },
+    planner::determine_where_to_eval_term,
 };
+
+/// Decide whether a WHERE term should be evaluated at the loop with index `loop_idx`.
+///
+/// This refines [`WhereTerm::should_eval_at_loop`] to handle **correlated subqueries**. A term
+/// inside a correlated subquery may reference a column from an outer query scope. Such a column is
+/// not part of this query's `join_order`, so [`super::planner::determine_where_to_eval_expr`]
+/// computes its position as `usize::MAX`, yielding an out-of-range `EvalAt::Loop(MAX)`. Without
+/// special handling no real loop index would ever match that value and the predicate would be
+/// silently dropped (e.g. `WHERE b.k = a.k` in `(SELECT count(*) FROM b WHERE b.k = a.k)` would
+/// count every row of `b`).
+///
+/// Outer-scope columns are guaranteed to be in scope (their cursors are positioned by the outer
+/// query before this query runs), so an out-of-range eval point means "evaluate at the innermost
+/// loop", where every in-query table has also been positioned. We route such terms to the last
+/// loop in the join order.
+fn should_eval_term_at_loop(
+    cond: &WhereTerm,
+    loop_idx: usize,
+    join_order: &[JoinOrderMember],
+) -> bool {
+    if cond.consumed.get() {
+        return false;
+    }
+    if let Some(table_id) = cond.from_outer_join {
+        // Mirror determine_where_to_eval_term's OUTER JOIN special-case.
+        let idx = join_order
+            .iter()
+            .position(|t| t.table_id == table_id)
+            .unwrap_or(usize::MAX);
+        return clamp_loop_idx(idx, join_order.len()) == loop_idx;
+    }
+    // A WHERE term containing a subquery is intentionally NOT evaluated before the loop (the
+    // emitter skips it there) so that a correlated subquery sees positioned outer cursors. The
+    // optimizer, which cannot see into the not-yet-planned inner query, may compute its eval point
+    // as BeforeLoop; route such terms to the innermost loop instead.
+    let contains_subquery = expr_contains_subquery(&cond.expr);
+    let Ok(eval_at) = determine_where_to_eval_term(cond, join_order) else {
+        return false;
+    };
+    match eval_at {
+        EvalAt::BeforeLoop => {
+            // Only subquery-bearing terms are deferred here; plain BeforeLoop terms are emitted
+            // before the loop by the emitter and must not be re-emitted inside it.
+            contains_subquery && loop_idx + 1 == join_order.len()
+        }
+        EvalAt::Loop(idx) => clamp_loop_idx(idx, join_order.len()) == loop_idx,
+    }
+}
+
+/// Clamp an eval-point loop index to the innermost real loop. An out-of-range index (produced for
+/// outer-scope/correlated column references) maps to the last loop in the join order.
+fn clamp_loop_idx(idx: usize, num_loops: usize) -> usize {
+    if num_loops == 0 {
+        return idx;
+    }
+    idx.min(num_loops - 1)
+}
 
 // Metadata for handling LEFT JOIN operations
 #[derive(Debug)]
@@ -557,7 +616,7 @@ pub fn open_loop(
 
                 for cond in predicates
                     .iter()
-                    .filter(|cond| cond.should_eval_at_loop(join_index, join_order))
+                    .filter(|cond| should_eval_term_at_loop(cond, join_index, join_order))
                 {
                     let jump_target_when_true = program.allocate_label();
                     let condition_metadata = ConditionMetadata {
@@ -669,7 +728,7 @@ pub fn open_loop(
 
                 for cond in predicates
                     .iter()
-                    .filter(|cond| cond.should_eval_at_loop(join_index, join_order))
+                    .filter(|cond| should_eval_term_at_loop(cond, join_index, join_order))
                 {
                     let jump_target_when_true = program.allocate_label();
                     let condition_metadata = ConditionMetadata {

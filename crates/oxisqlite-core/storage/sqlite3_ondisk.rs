@@ -155,7 +155,7 @@ pub struct DatabaseHeader {
     pub incremental_vacuum_enabled: u32,
 
     /// The "Application ID" set by PRAGMA application_id.
-    application_id: u32,
+    pub application_id: u32,
 
     /// Reserved for expansion. Must be zero.
     reserved_for_expansion: [u8; 20],
@@ -311,6 +311,22 @@ fn finish_read_database_header(
 ) -> Result<()> {
     let buf = buf.borrow();
     let buf = buf.as_slice();
+    parse_database_header_into(buf, &header)
+}
+
+/// Decode the 100-byte SQLite database header located at the start of `buf`
+/// into `header`, overwriting every field.
+///
+/// This is the single source of truth for header decoding: both the initial
+/// raw page-1 read at open time ([`finish_read_database_header`]) and the
+/// WAL-aware header refresh ([`crate::storage::pager::Pager::refresh_header_from_wal`])
+/// funnel through here so the on-disk byte layout is interpreted identically
+/// regardless of whether the header came from the main database file or from a
+/// committed page-1 frame in the write-ahead log.
+pub fn parse_database_header_into(
+    buf: &[u8],
+    header: &Arc<SpinLock<DatabaseHeader>>,
+) -> Result<()> {
     let mut header = header.lock();
     header.magic.copy_from_slice(&buf[0..16]);
     header.page_size = u16::from_be_bytes([buf[16], buf[17]]);
@@ -1340,8 +1356,15 @@ pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
     payload.extend_from_slice(&varint[0..n]);
 }
 
+/// Shared slot used to surface a corruption error detected inside the
+/// asynchronous WAL-read completion closure of [`read_entire_wal_dumb`] back to
+/// its synchronous caller.
+pub type WalParseErrorSlot = Arc<SpinLock<Option<LimboError>>>;
+
 /// We need to read the WAL file on open to reconstruct the WAL frame cache.
-pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFileShared>>> {
+pub fn read_entire_wal_dumb(
+    file: &Arc<dyn File>,
+) -> Result<(Arc<UnsafeCell<WalFileShared>>, WalParseErrorSlot)> {
     let drop_fn = Rc::new(|_buf| {});
     let size = file.size()?;
     #[allow(clippy::arc_with_non_send_sync)]
@@ -1368,148 +1391,192 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
         loaded: AtomicBool::new(false),
     }));
     let wal_file_shared_for_completion = wal_file_shared_ret.clone();
+    let parse_error: WalParseErrorSlot = Arc::new(SpinLock::new(None));
+    let parse_error_for_closure = parse_error.clone();
 
     let complete: Box<Complete> = Box::new(move |buf: Arc<RefCell<Buffer>>| {
-        let buf = buf.borrow();
-        let buf_slice = buf.as_slice();
-        let mut header_locked = header.lock();
-        // Read header
-        header_locked.magic =
-            u32::from_be_bytes([buf_slice[0], buf_slice[1], buf_slice[2], buf_slice[3]]);
-        header_locked.file_format =
-            u32::from_be_bytes([buf_slice[4], buf_slice[5], buf_slice[6], buf_slice[7]]);
-        header_locked.page_size =
-            u32::from_be_bytes([buf_slice[8], buf_slice[9], buf_slice[10], buf_slice[11]]);
-        header_locked.checkpoint_seq =
-            u32::from_be_bytes([buf_slice[12], buf_slice[13], buf_slice[14], buf_slice[15]]);
-        header_locked.salt_1 =
-            u32::from_be_bytes([buf_slice[16], buf_slice[17], buf_slice[18], buf_slice[19]]);
-        header_locked.salt_2 =
-            u32::from_be_bytes([buf_slice[20], buf_slice[21], buf_slice[22], buf_slice[23]]);
-        header_locked.checksum_1 =
-            u32::from_be_bytes([buf_slice[24], buf_slice[25], buf_slice[26], buf_slice[27]]);
-        header_locked.checksum_2 =
-            u32::from_be_bytes([buf_slice[28], buf_slice[29], buf_slice[30], buf_slice[31]]);
-
-        // Read frames into frame_cache and pages_in_frames
-        if buf_slice.len() < WAL_HEADER_SIZE {
-            panic!("WAL file too small for header");
-        }
-
-        let use_native_endian_checksum =
-            cfg!(target_endian = "big") == ((header_locked.magic & 1) != 0);
-
-        let calculated_header_checksum = checksum_wal(
-            &buf_slice[0..24],
-            &*header_locked,
-            (0, 0),
-            use_native_endian_checksum,
-        );
-
-        if calculated_header_checksum != (header_locked.checksum_1, header_locked.checksum_2) {
-            panic!(
-                "WAL header checksum mismatch. Expected ({}, {}), Got ({}, {})",
-                header_locked.checksum_1,
-                header_locked.checksum_2,
-                calculated_header_checksum.0,
-                calculated_header_checksum.1
-            );
-        }
-
-        let mut cumulative_checksum = (header_locked.checksum_1, header_locked.checksum_2);
-        let page_size_u32 = header_locked.page_size;
-
-        if page_size_u32 < MIN_PAGE_SIZE
-            || page_size_u32 > MAX_PAGE_SIZE
-            || page_size_u32.count_ones() != 1
-        {
-            panic!("Invalid page size in WAL header: {}", page_size_u32);
-        }
-        let page_size = page_size_u32 as usize;
-
-        let mut current_offset = WAL_HEADER_SIZE;
-        let mut frame_idx = 1_u64;
-
         let wfs_data = unsafe { &mut *wal_file_shared_for_completion.get() };
-
-        while current_offset + WAL_FRAME_HEADER_SIZE + page_size <= buf_slice.len() {
-            let frame_header_slice =
-                &buf_slice[current_offset..current_offset + WAL_FRAME_HEADER_SIZE];
-            let page_data_slice = &buf_slice[current_offset + WAL_FRAME_HEADER_SIZE
-                ..current_offset + WAL_FRAME_HEADER_SIZE + page_size];
-
-            let frame_h_page_number =
-                u32::from_be_bytes(frame_header_slice[0..4].try_into().unwrap());
-            let _frame_h_db_size = u32::from_be_bytes(frame_header_slice[4..8].try_into().unwrap());
-            let frame_h_salt_1 = u32::from_be_bytes(frame_header_slice[8..12].try_into().unwrap());
-            let frame_h_salt_2 = u32::from_be_bytes(frame_header_slice[12..16].try_into().unwrap());
-            let frame_h_checksum_1 =
-                u32::from_be_bytes(frame_header_slice[16..20].try_into().unwrap());
-            let frame_h_checksum_2 =
-                u32::from_be_bytes(frame_header_slice[20..24].try_into().unwrap());
-
-            // It contains more frames with mismatched SALT values, which means they're leftovers from previous checkpoints
-            if frame_h_salt_1 != header_locked.salt_1 || frame_h_salt_2 != header_locked.salt_2 {
-                tracing::trace!(
-                    "WAL frame salt mismatch: expected ({}, {}), got ({}, {}), ignoring frame",
-                    header_locked.salt_1,
-                    header_locked.salt_2,
-                    frame_h_salt_1,
-                    frame_h_salt_2
-                );
-                break;
+        let result: Result<()> = (|| {
+            let buf = buf.borrow();
+            let buf_slice = buf.as_slice();
+            // Validate the buffer holds a full WAL header BEFORE reading any
+            // header fields, otherwise indexing below would panic on a short file.
+            if buf_slice.len() < WAL_HEADER_SIZE {
+                return Err(LimboError::Corrupt(
+                    "WAL file too small for header".to_string(),
+                ));
             }
+            let mut header_locked = header.lock();
+            // Read header
+            header_locked.magic =
+                u32::from_be_bytes([buf_slice[0], buf_slice[1], buf_slice[2], buf_slice[3]]);
+            header_locked.file_format =
+                u32::from_be_bytes([buf_slice[4], buf_slice[5], buf_slice[6], buf_slice[7]]);
+            header_locked.page_size =
+                u32::from_be_bytes([buf_slice[8], buf_slice[9], buf_slice[10], buf_slice[11]]);
+            header_locked.checkpoint_seq =
+                u32::from_be_bytes([buf_slice[12], buf_slice[13], buf_slice[14], buf_slice[15]]);
+            header_locked.salt_1 =
+                u32::from_be_bytes([buf_slice[16], buf_slice[17], buf_slice[18], buf_slice[19]]);
+            header_locked.salt_2 =
+                u32::from_be_bytes([buf_slice[20], buf_slice[21], buf_slice[22], buf_slice[23]]);
+            header_locked.checksum_1 =
+                u32::from_be_bytes([buf_slice[24], buf_slice[25], buf_slice[26], buf_slice[27]]);
+            header_locked.checksum_2 =
+                u32::from_be_bytes([buf_slice[28], buf_slice[29], buf_slice[30], buf_slice[31]]);
 
-            let checksum_after_fh_meta = checksum_wal(
-                &frame_header_slice[0..8],
-                &*header_locked,
-                cumulative_checksum,
-                use_native_endian_checksum,
-            );
-            let calculated_frame_checksum = checksum_wal(
-                page_data_slice,
-                &*header_locked,
-                checksum_after_fh_meta,
+            let use_native_endian_checksum =
+                cfg!(target_endian = "big") == ((header_locked.magic & 1) != 0);
+
+            let calculated_header_checksum = checksum_wal(
+                &buf_slice[0..24],
+                &header_locked,
+                (0, 0),
                 use_native_endian_checksum,
             );
 
-            if calculated_frame_checksum != (frame_h_checksum_1, frame_h_checksum_2) {
-                panic!(
-                    "WAL frame checksum mismatch. Expected ({}, {}), Got ({}, {})",
-                    frame_h_checksum_1,
-                    frame_h_checksum_2,
-                    calculated_frame_checksum.0,
-                    calculated_frame_checksum.1
-                );
+            if calculated_header_checksum != (header_locked.checksum_1, header_locked.checksum_2) {
+                return Err(LimboError::Corrupt(format!(
+                    "WAL header checksum mismatch. Expected ({}, {}), Got ({}, {})",
+                    header_locked.checksum_1,
+                    header_locked.checksum_2,
+                    calculated_header_checksum.0,
+                    calculated_header_checksum.1
+                )));
             }
 
-            cumulative_checksum = calculated_frame_checksum;
+            let mut cumulative_checksum = (header_locked.checksum_1, header_locked.checksum_2);
+            let page_size_u32 = header_locked.page_size;
+
+            if page_size_u32 < MIN_PAGE_SIZE
+                || page_size_u32 > MAX_PAGE_SIZE
+                || page_size_u32.count_ones() != 1
+            {
+                return Err(LimboError::Corrupt(format!(
+                    "Invalid page size in WAL header: {}",
+                    page_size_u32
+                )));
+            }
+            let page_size = page_size_u32 as usize;
+
+            let mut current_offset = WAL_HEADER_SIZE;
+            let mut frame_idx = 1_u64;
+
+            while current_offset + WAL_FRAME_HEADER_SIZE + page_size <= buf_slice.len() {
+                let frame_header_slice =
+                    &buf_slice[current_offset..current_offset + WAL_FRAME_HEADER_SIZE];
+                let page_data_slice = &buf_slice[current_offset + WAL_FRAME_HEADER_SIZE
+                    ..current_offset + WAL_FRAME_HEADER_SIZE + page_size];
+
+                // The while-loop guard guarantees `frame_header_slice` is exactly
+                // WAL_FRAME_HEADER_SIZE (24) bytes, so these fixed indices are in-bounds.
+                let frame_h_page_number = u32::from_be_bytes([
+                    frame_header_slice[0],
+                    frame_header_slice[1],
+                    frame_header_slice[2],
+                    frame_header_slice[3],
+                ]);
+                let _frame_h_db_size = u32::from_be_bytes([
+                    frame_header_slice[4],
+                    frame_header_slice[5],
+                    frame_header_slice[6],
+                    frame_header_slice[7],
+                ]);
+                let frame_h_salt_1 = u32::from_be_bytes([
+                    frame_header_slice[8],
+                    frame_header_slice[9],
+                    frame_header_slice[10],
+                    frame_header_slice[11],
+                ]);
+                let frame_h_salt_2 = u32::from_be_bytes([
+                    frame_header_slice[12],
+                    frame_header_slice[13],
+                    frame_header_slice[14],
+                    frame_header_slice[15],
+                ]);
+                let frame_h_checksum_1 = u32::from_be_bytes([
+                    frame_header_slice[16],
+                    frame_header_slice[17],
+                    frame_header_slice[18],
+                    frame_header_slice[19],
+                ]);
+                let frame_h_checksum_2 = u32::from_be_bytes([
+                    frame_header_slice[20],
+                    frame_header_slice[21],
+                    frame_header_slice[22],
+                    frame_header_slice[23],
+                ]);
+
+                // It contains more frames with mismatched SALT values, which means they're leftovers from previous checkpoints
+                if frame_h_salt_1 != header_locked.salt_1 || frame_h_salt_2 != header_locked.salt_2
+                {
+                    tracing::trace!(
+                        "WAL frame salt mismatch: expected ({}, {}), got ({}, {}), ignoring frame",
+                        header_locked.salt_1,
+                        header_locked.salt_2,
+                        frame_h_salt_1,
+                        frame_h_salt_2
+                    );
+                    break;
+                }
+
+                let checksum_after_fh_meta = checksum_wal(
+                    &frame_header_slice[0..8],
+                    &header_locked,
+                    cumulative_checksum,
+                    use_native_endian_checksum,
+                );
+                let calculated_frame_checksum = checksum_wal(
+                    page_data_slice,
+                    &header_locked,
+                    checksum_after_fh_meta,
+                    use_native_endian_checksum,
+                );
+
+                if calculated_frame_checksum != (frame_h_checksum_1, frame_h_checksum_2) {
+                    return Err(LimboError::Corrupt(format!(
+                        "WAL frame checksum mismatch. Expected ({}, {}), Got ({}, {})",
+                        frame_h_checksum_1,
+                        frame_h_checksum_2,
+                        calculated_frame_checksum.0,
+                        calculated_frame_checksum.1
+                    )));
+                }
+
+                cumulative_checksum = calculated_frame_checksum;
+
+                wfs_data
+                    .frame_cache
+                    .lock()
+                    .entry(frame_h_page_number as u64)
+                    .or_default()
+                    .push(frame_idx);
+                wfs_data
+                    .pages_in_frames
+                    .lock()
+                    .push(frame_h_page_number as u64);
+
+                frame_idx += 1;
+                current_offset += WAL_FRAME_HEADER_SIZE + page_size;
+            }
 
             wfs_data
-                .frame_cache
-                .lock()
-                .entry(frame_h_page_number as u64)
-                .or_default()
-                .push(frame_idx);
-            wfs_data
-                .pages_in_frames
-                .lock()
-                .push(frame_h_page_number as u64);
-
-            frame_idx += 1;
-            current_offset += WAL_FRAME_HEADER_SIZE + page_size;
+                .max_frame
+                .store(frame_idx.saturating_sub(1), Ordering::SeqCst);
+            wfs_data.last_checksum = cumulative_checksum;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            *parse_error_for_closure.lock() = Some(e);
         }
-
-        wfs_data
-            .max_frame
-            .store(frame_idx.saturating_sub(1), Ordering::SeqCst);
-        wfs_data.last_checksum = cumulative_checksum;
+        // Always mark loaded so the caller's wait loop terminates regardless of
+        // whether parsing succeeded or recorded a corruption error.
         wfs_data.loaded.store(true, Ordering::SeqCst);
     });
     let c = Completion::Read(ReadCompletion::new(buf_for_pread, complete));
     file.pread(0, Arc::new(c))?;
 
-    Ok(wal_file_shared_ret)
+    Ok((wal_file_shared_ret, parse_error))
 }
 
 pub fn begin_read_wal_frame(

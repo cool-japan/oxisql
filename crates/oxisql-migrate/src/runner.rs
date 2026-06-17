@@ -582,8 +582,8 @@ impl MigrationRunner {
             // Swallow the release error if the run already failed so the
             // original error is surfaced to the caller.
             let release_result = lock.release().await;
-            if result.is_ok() {
-                return release_result.map(|_| result.unwrap());
+            if let Ok(v) = result {
+                return release_result.map(|_| v);
             }
         }
 

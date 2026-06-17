@@ -1,12 +1,12 @@
-use std::num::NonZero;
+use std::num::NonZeroUsize;
 
 pub const PARAM_PREFIX: &str = "__param_";
 
 #[derive(Clone, Debug)]
 pub enum Parameter {
-    Anonymous(NonZero<usize>),
-    Indexed(NonZero<usize>),
-    Named(String, NonZero<usize>),
+    Anonymous(NonZeroUsize),
+    Indexed(NonZeroUsize),
+    Named(String, NonZeroUsize),
 }
 
 impl PartialEq for Parameter {
@@ -16,7 +16,7 @@ impl PartialEq for Parameter {
 }
 
 impl Parameter {
-    pub fn index(&self) -> NonZero<usize> {
+    pub fn index(&self) -> NonZeroUsize {
         match self {
             Parameter::Anonymous(index) => *index,
             Parameter::Indexed(index) => *index,
@@ -27,7 +27,7 @@ impl Parameter {
 
 #[derive(Debug)]
 pub struct Parameters {
-    index: NonZero<usize>,
+    index: NonZeroUsize,
     pub list: Vec<Parameter>,
 }
 
@@ -39,8 +39,9 @@ impl Default for Parameters {
 
 impl Parameters {
     pub fn new() -> Self {
+        // SAFETY: 1 is non-zero
         Self {
-            index: 1.try_into().unwrap(),
+            index: unsafe { NonZeroUsize::new_unchecked(1) },
             list: vec![],
         }
     }
@@ -51,7 +52,7 @@ impl Parameters {
         params.len()
     }
 
-    pub fn name(&self, index: NonZero<usize>) -> Option<String> {
+    pub fn name(&self, index: NonZeroUsize) -> Option<String> {
         self.list.iter().find_map(|p| match p {
             Parameter::Anonymous(i) if *i == index => Some("?".to_string()),
             Parameter::Indexed(i) if *i == index => Some(format!("?{i}")),
@@ -60,7 +61,7 @@ impl Parameters {
         })
     }
 
-    pub fn index(&self, name: impl AsRef<str>) -> Option<NonZero<usize>> {
+    pub fn index(&self, name: impl AsRef<str>) -> Option<NonZeroUsize> {
         self.list
             .iter()
             .find_map(|p| match p {
@@ -70,24 +71,31 @@ impl Parameters {
             .copied()
     }
 
-    pub fn next_index(&mut self) -> NonZero<usize> {
+    pub fn next_index(&mut self) -> crate::Result<NonZeroUsize> {
         let index = self.index;
-        self.index = self.index.checked_add(1).unwrap();
-        index
+        self.index = NonZeroUsize::new(self.index.get().saturating_add(1)).ok_or_else(|| {
+            crate::LimboError::InternalError("parameter index overflow".to_string())
+        })?;
+        Ok(index)
     }
 
-    pub fn push(&mut self, name: impl AsRef<str>) -> NonZero<usize> {
+    pub fn push(&mut self, name: impl AsRef<str>) -> crate::Result<NonZeroUsize> {
         match name.as_ref() {
             param if param.is_empty() || param.starts_with(PARAM_PREFIX) => {
-                let index = self.next_index();
+                let index = self.next_index()?;
                 let use_idx = if let Some(idx) = param.strip_prefix(PARAM_PREFIX) {
-                    idx.parse().unwrap()
+                    idx.parse::<NonZeroUsize>().map_err(|e| {
+                        crate::LimboError::InternalError(format!(
+                            "failed to parse parameter index '{}': {}",
+                            idx, e
+                        ))
+                    })?
                 } else {
                     index
                 };
                 self.list.push(Parameter::Anonymous(use_idx));
                 tracing::trace!("anonymous parameter at {use_idx}");
-                use_idx
+                Ok(use_idx)
             }
             name if name.starts_with(['$', ':', '@', '#']) => {
                 match self
@@ -99,25 +107,32 @@ impl Parameters {
                         let index = t.index();
                         self.list.push(t.clone());
                         tracing::trace!("named parameter at {index} as {name}");
-                        index
+                        Ok(index)
                     }
                     None => {
-                        let index = self.next_index();
+                        let index = self.next_index()?;
                         self.list.push(Parameter::Named(name.to_owned(), index));
                         tracing::trace!("named parameter at {index} as {name}");
-                        index
+                        Ok(index)
                     }
                 }
             }
             index => {
-                // SAFETY: Guaranteed from parser that the index is bigger than 0.
-                let index: NonZero<usize> = index.parse().unwrap();
+                let index: NonZeroUsize = index.parse().map_err(|e| {
+                    crate::LimboError::InternalError(format!(
+                        "failed to parse parameter index '{}': {}",
+                        index, e
+                    ))
+                })?;
                 if index > self.index {
-                    self.index = index.checked_add(1).unwrap();
+                    self.index =
+                        NonZeroUsize::new(index.get().saturating_add(1)).ok_or_else(|| {
+                            crate::LimboError::InternalError("parameter index overflow".to_string())
+                        })?;
                 }
                 self.list.push(Parameter::Indexed(index));
                 tracing::trace!("indexed parameter at {index}");
-                index
+                Ok(index)
             }
         }
     }

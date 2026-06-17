@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "oxisqlite-core"
-version = "0.1.0"
+version.workspace = true
 authors = ["the Limbo authors"]
 autolib = false
 autobins = false
@@ -21,7 +21,7 @@ autotests = false
 autobenches = false
 description = "oxisqlite-core — core engine of the Pure-Rust SQLite-compatible oxisqlite fork (C-free)"
 readme = false
-license = "MIT"
+license.workspace = true
 repository = "https://github.com/cool-japan/oxisql"
 
 [lib]
@@ -47,6 +47,38 @@ harness = false
 name = "tpc_h_benchmark"
 path = "benches/tpc_h_benchmark.rs"
 harness = false
+
+[[test]]
+name = "durability"
+path = "tests/durability.rs"
+
+[[test]]
+name = "correlated"
+path = "tests/correlated.rs"
+
+[[test]]
+name = "conflict"
+path = "tests/conflict.rs"
+
+[[test]]
+name = "limit_params"
+path = "tests/limit_params.rs"
+
+[[test]]
+name = "in_null"
+path = "tests/in_null.rs"
+
+[[test]]
+name = "upsert"
+path = "tests/upsert.rs"
+
+[[test]]
+name = "schema_cookie"
+path = "tests/schema_cookie.rs"
+
+[[test]]
+name = "analyze"
+path = "tests/analyze.rs"
 
 [dependencies.bitflags]
 version = "2.9.0"
@@ -77,30 +109,30 @@ version = "0.2"
 
 [dependencies.limbo_ext]
 package = "oxisqlite-ext"
-version = "0.1.0"
+version = "0.2.0"
 path = "../oxisqlite-ext"
 features = ["core_only"]
 
 [dependencies.limbo_macros]
 package = "oxisqlite-macros"
-version = "0.1.0"
+version = "0.2.0"
 path = "../oxisqlite-macros"
 
 [dependencies.limbo_sqlite3_parser]
 package = "oxisqlite-sqlite3-parser"
-version = "0.1.0"
+version = "0.2.0"
 path = "../oxisqlite-sqlite3-parser"
 
 [dependencies.limbo_time]
 package = "oxisqlite-time"
-version = "0.1.0"
+version = "0.2.0"
 path = "../oxisqlite-time"
 features = ["static"]
 optional = true
 
 [dependencies.limbo_uuid]
 package = "oxisqlite-uuid"
-version = "0.1.0"
+version = "0.2.0"
 path = "../oxisqlite-uuid"
 features = ["static"]
 optional = true

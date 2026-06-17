@@ -1726,6 +1726,9 @@ pub type PragmaValue = Expr; // TODO
 #[strum(serialize_all = "snake_case")]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PragmaName {
+    /// `application_id` pragma — the 32-bit signed application identifier
+    /// stored at offset 68 of the database header.
+    ApplicationId,
     /// set the autovacuum mode
     AutoVacuum,
     /// `cache_size` pragma
@@ -1744,6 +1747,8 @@ pub enum PragmaName {
     PageSize,
     /// Returns schema version of the database file.
     SchemaVersion,
+    /// `synchronous` pragma — controls fsync durability level (OFF/NORMAL/FULL/EXTRA).
+    Synchronous,
     /// returns information about the columns of a table
     TableInfo,
     /// Returns the user version of the database file.

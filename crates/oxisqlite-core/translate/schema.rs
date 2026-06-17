@@ -51,7 +51,7 @@ pub fn translate_create_table(
         bail_parse_error!("Table {} already exists", tbl_name);
     }
 
-    let sql = create_table_body_to_str(&tbl_name, &body);
+    let sql = create_table_body_to_str(&tbl_name, &body)?;
 
     let parse_schema_label = program.allocate_label();
     // TODO: ReadCookie
@@ -105,7 +105,9 @@ pub fn translate_create_table(
         }
     }
 
-    let table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let table = schema
+        .get_btree_table(SQLITE_TABLEID)
+        .ok_or_else(|| LimboError::InternalError("sqlite_schema table not found".to_string()))?;
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -146,8 +148,7 @@ pub fn translate_create_table(
     }
 
     program.resolve_label(parse_schema_label, program.offset());
-    // TODO: SetCookie
-    //
+    program.emit_schema_change();
     // TODO: remove format, it sucks for performance but is convenient
     let parse_schema_where_clause = format!("tbl_name = '{}' AND type != 'trigger'", tbl_name);
     program.emit_insn(Insn::ParseSchema {
@@ -401,7 +402,7 @@ fn check_automatic_pk_index_required(
                             .iter()
                             .any(|set| set.len() == 1 && set.contains(column));
                         let is_integer =
-                            typename.is_some() && typename.unwrap().eq_ignore_ascii_case("INTEGER"); // Should match on any case of INTEGER
+                            typename.is_some_and(|t| t.eq_ignore_ascii_case("INTEGER")); // Should match on any case of INTEGER
                         !is_integer || *is_descending
                     }
                     PrimaryKeyDefinitionType::Composite { columns } => {
@@ -443,15 +444,15 @@ enum PrimaryKeyDefinitionType<'a> {
     },
 }
 
-fn create_table_body_to_str(tbl_name: &ast::QualifiedName, body: &ast::CreateTableBody) -> String {
-    let mut sql = String::new();
-    sql.push_str(
-        format!(
-            "CREATE TABLE {} {}",
-            tbl_name.name.0,
-            body.format().unwrap()
-        )
-        .as_str(),
+fn create_table_body_to_str(
+    tbl_name: &ast::QualifiedName,
+    body: &ast::CreateTableBody,
+) -> Result<String> {
+    let sql = format!(
+        "CREATE TABLE {} {}",
+        tbl_name.name.0,
+        body.format()
+            .map_err(|e| LimboError::InternalError(e.to_string()))?
     );
     match body {
         ast::CreateTableBody::ColumnsAndConstraints {
@@ -461,7 +462,7 @@ fn create_table_body_to_str(tbl_name: &ast::QualifiedName, body: &ast::CreateTab
         } => {}
         ast::CreateTableBody::AsSelect(_select) => todo!("as select not yet supported"),
     }
-    sql
+    Ok(sql)
 }
 
 fn create_vtable_body_to_str(vtab: &CreateVirtualTable, module: Rc<VTabImpl>) -> String {
@@ -576,7 +577,9 @@ pub fn translate_create_virtual_table(
         table_name: table_name_reg,
         args_reg,
     });
-    let table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let table = schema
+        .get_btree_table(SQLITE_TABLEID)
+        .ok_or_else(|| LimboError::InternalError("sqlite_schema table not found".to_string()))?;
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -595,6 +598,7 @@ pub fn translate_create_virtual_table(
         Some(sql),
     );
 
+    program.emit_schema_change();
     let parse_schema_where_clause = format!("tbl_name = '{}' AND type != 'trigger'", table_name);
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
@@ -638,7 +642,7 @@ pub fn translate_drop_table(
         bail_parse_error!("No such table: {}", tbl_name.name.0.as_str());
     }
 
-    let table = table.unwrap(); // safe since we just checked for None
+    let table = table.ok_or_else(|| LimboError::InternalError("table not found".to_string()))?;
 
     let null_reg = program.alloc_register(); //  r1
     program.emit_null(null_reg, None);
@@ -649,7 +653,9 @@ pub fn translate_drop_table(
     program.mark_last_insn_constant();
     let row_id_reg = program.alloc_register(); //  r5
 
-    let schema_table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let schema_table = schema
+        .get_btree_table(SQLITE_TABLEID)
+        .ok_or_else(|| LimboError::InternalError("sqlite_schema table not found".to_string()))?;
     let sqlite_schema_cursor_id_0 = program.alloc_cursor_id(
         //  cursor 0
         CursorType::BTreeTable(schema_table.clone()),
@@ -919,6 +925,7 @@ pub fn translate_drop_table(
         //  End loop to copy over row id's from the ephemeral table and then re-insert into the schema table with the correct root page
     }
 
+    program.emit_schema_change();
     //  Drop the in-memory structures for the table
     program.emit_insn(Insn::DropTable {
         db: 0,
