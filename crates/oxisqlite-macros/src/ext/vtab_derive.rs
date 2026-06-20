@@ -34,7 +34,7 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                     Ok((schema, table)) => {
                         ::limbo_ext::VTabCreateResult {
                             code: ::limbo_ext::ResultCode::OK,
-                            schema: ::std::ffi::CString::new(schema).unwrap().into_raw(),
+                            schema: ::std::ffi::CString::new(schema).expect("vtab schema string must not contain interior nul bytes").into_raw(),
                             table: ::std::boxed::Box::into_raw(::std::boxed::Box::new(table)) as *const ::std::ffi::c_void,
                         }
                     },
@@ -91,7 +91,8 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 let idx_str = if idx_str.is_null() {
                     None
                 } else {
-                    Some((unsafe { ::std::ffi::CStr::from_ptr(idx_str).to_str().unwrap() }, idx_num))
+                    unsafe { ::std::ffi::CStr::from_ptr(idx_str).to_str().ok() }
+                        .map(|s| (s, idx_num))
                 };
                 <<#struct_name as ::limbo_ext::VTabModule>::Table as ::limbo_ext::VTable>::Cursor::filter(cursor, args, idx_str)
             }
@@ -147,12 +148,12 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 let table = &mut *(table as *mut <#struct_name as ::limbo_ext::VTabModule>::Table);
                 let args = ::std::slice::from_raw_parts(argv, argc as usize);
 
-                let old_rowid = match args.get(0).map(|v| v.value_type()) {
-                    Some(::limbo_ext::ValueType::Integer) => args.get(0).unwrap().to_integer(),
+                let old_rowid = match args.get(0) {
+                    Some(v) if v.value_type() == ::limbo_ext::ValueType::Integer => v.to_integer(),
                     _ => None,
                 };
-                let new_rowid = match args.get(1).map(|v| v.value_type()) {
-                    Some(::limbo_ext::ValueType::Integer) => args.get(1).unwrap().to_integer(),
+                let new_rowid = match args.get(1) {
+                    Some(v) if v.value_type() == ::limbo_ext::ValueType::Integer => v.to_integer(),
                     _ => None,
                 };
                 let columns = &args[2..];
@@ -233,7 +234,7 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 }
                 let api = &*api;
                 let name = <#struct_name as ::limbo_ext::VTabModule>::NAME;
-                let name_c = ::std::ffi::CString::new(name).unwrap().into_raw() as *const ::std::ffi::c_char;
+                let name_c = ::std::ffi::CString::new(name).expect("vtab module name must not contain interior nul bytes").into_raw() as *const ::std::ffi::c_char;
                 let module = ::limbo_ext::VTabModuleImpl {
                     name: name_c,
                     create: Self::#create_fn_name,

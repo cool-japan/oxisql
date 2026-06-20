@@ -70,7 +70,7 @@ pub use registry::{SqlType, TypeRegistry};
 pub use row::{FromValue, Row, RowSet};
 pub use schema::{ColumnInfo, ForeignKeyInfo, IndexInfo, TableInfo, TableType};
 pub use traits::{Connection, ToSqlValue, Transaction};
-pub use value::{ArrayElementType, Value};
+pub use value::{ArrayElementType, BorrowedValue, Value};
 pub use warning::{parse_warning_level, SqlWarning, SqlWarningLevel};
 
 // ── Tests ───────────────────────────────────────────────────────────────────

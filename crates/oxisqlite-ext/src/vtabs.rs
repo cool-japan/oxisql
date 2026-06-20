@@ -246,7 +246,8 @@ impl IndexInfo {
         let idx_str_len = self.idx_str.as_ref().map(|s| s.len()).unwrap_or(0);
         let c_idx_str = self
             .idx_str
-            .map(|s| std::ffi::CString::new(s).unwrap().into_raw())
+            .and_then(|s| std::ffi::CString::new(s).ok())
+            .map(|cs| cs.into_raw())
             .unwrap_or(std::ptr::null_mut());
         ExtIndexInfo {
             idx_num: self.idx_num,
@@ -648,7 +649,9 @@ impl Stmt {
         let slice = unsafe { std::slice::from_raw_parts(col_names, count_value as usize) };
         for x in slice {
             let name = unsafe { CStr::from_ptr(*x) };
-            names.push(name.to_str().unwrap().to_string());
+            if let Ok(s) = name.to_str() {
+                names.push(s.to_string());
+            }
         }
         unsafe { free_column_names(col_names, count_value) };
         names

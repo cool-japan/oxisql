@@ -72,7 +72,10 @@ logging / metrics / retry middleware. **No feature flags. Zero `unsafe`.**
   - **Files:** `src/traits.rs`
   - **Tests:** `Transaction::query_stream` yields the same rows as `Transaction::query` on an embedded/sqlite txn.
   - **Risk:** Low — additive default method. Object-safety is preserved (same pattern proven on Connection).
-- [ ] Optional borrowed `Value<'a>` to reduce allocation on large Text/Blob result sets
+- [x] Optional borrowed `Value<'a>` to reduce allocation on large Text/Blob result sets (done 2026-06-19)
+  - **Goal:** `BorrowedValue<'a>` zero-allocation view type with `Text(&'a str)` / `Blob(&'a [u8])` / `Json(&'a str)` / `Decimal(&'a str)` variants; all scalars copied inline; `to_owned()` → `Value`; `From<&'a Value> for BorrowedValue<'a>`; `Display`.
+  - **Files:** `src/value.rs` (added `BorrowedValue<'a>` + impl + 15 tests); `src/lib.rs` (re-exported `BorrowedValue`).
+  - **Tests:** 15 unit tests covering type_name, is_null, Text/Blob zero-alloc, scalar roundtrips, From<&Value>, Display, UUID format, roundtrip for all 12 non-Array variants.
 - [x] Tracing-based middleware variant alongside the `log`-based `LoggingConnection` (done 2026-06-10)
   - **Goal:** `TracingConnection<C>` emits `tracing` spans/events instead of `log` records; identical delegation to the existing `LoggingConnection`.
   - **Design:** Add `tracing` as an **optional** dep (`tracing = { workspace = true, optional = true }`) behind a new `tracing` feature (add to workspace Cargo.toml if not present, latest version). In `src/middleware.rs`, mirror `LoggingConnection`'s full `Connection + Transaction` delegation for `TracingConnection<C>`. Re-export from `src/lib.rs` behind `#[cfg(feature = "tracing")]`.

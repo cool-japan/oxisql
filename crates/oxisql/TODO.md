@@ -114,6 +114,6 @@ not here.
   - **Goal:** `vdbe/execute.rs` and every product module < 2000 lines; op_* handler dispatch intact.
   - **Files:** `crates/oxisqlite-core/vdbe/execute.rs` → new `vdbe/execute/` module tree
 
-- [~] **Slice 5: `splitrs` split `storage/btree.rs` (8715 lines → under 2000)** (planned 2026-06-16)
+- [x] **Slice 5: `splitrs` split `storage/btree.rs` (8864 lines → under 2000)** (done 2026-06-19)
   - **Goal:** `storage/btree.rs` and every product module < 2000 lines; BTreeCursor API intact.
-  - **Files:** `crates/oxisqlite-core/storage/btree.rs` → new `storage/btree/` module tree
+  - **Files:** `crates/oxisqlite-core/storage/btree.rs` → `btree/` module tree (6 files, all under 2000 ln except tests.rs at 2028 ln). 636 tests pass, 0 warnings.

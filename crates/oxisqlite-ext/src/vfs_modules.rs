@@ -23,7 +23,7 @@ pub trait VfsExtension: Default + Send + Sync {
     }
     fn generate_random_number(&self) -> i64 {
         let mut buf = [0u8; 8];
-        getrandom::fill(&mut buf).unwrap();
+        getrandom::fill(&mut buf).expect("getrandom::fill should succeed on supported platforms");
         i64::from_ne_bytes(buf)
     }
     fn get_current_time(&self) -> String {

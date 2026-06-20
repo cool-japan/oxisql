@@ -53,18 +53,40 @@ pub fn translate_create_table(
 
     let sql = create_table_body_to_str(&tbl_name, &body)?;
 
+    // Detect WITHOUT ROWID before any register/label allocation so we can pick
+    // the right B-Tree flags.  WITHOUT ROWID tables use an index-format B-Tree
+    // (the PK columns are the key; the full row is the record payload).
+    let is_without_rowid = matches!(
+        &body,
+        ast::CreateTableBody::ColumnsAndConstraints { options, .. }
+            if options.contains(ast::TableOptions::WITHOUT_ROWID)
+    );
+
+    // Validate WITHOUT ROWID constraints early (before any B-Tree allocations).
+    if is_without_rowid {
+        validate_without_rowid_table(&body, &tbl_name.name.0)?;
+    }
+
     let parse_schema_label = program.allocate_label();
     // TODO: ReadCookie
     // TODO: If
     // TODO: SetCookie
     // TODO: SetCookie
 
-    // Create the table B-tree
+    // Create the table B-tree.
+    // WITHOUT ROWID tables use an index-format B-Tree, so we must pass
+    // `new_index()` flags — the pager initialises the root page as an
+    // index-leaf page rather than a table-leaf page.
     let table_root_reg = program.alloc_register();
+    let btree_flags = if is_without_rowid {
+        CreateBTreeFlags::new_index()
+    } else {
+        CreateBTreeFlags::new_table()
+    };
     program.emit_insn(Insn::CreateBtree {
         db: 0,
         root: table_root_reg,
-        flags: CreateBTreeFlags::new_table(),
+        flags: btree_flags,
     });
 
     // Create an automatic index B-tree if needed
@@ -236,6 +258,97 @@ pub fn emit_schema_entry(
     });
 }
 
+/// Validate that a WITHOUT ROWID table declaration is well-formed for this engine.
+///
+/// Requirements:
+/// 1. The table must declare an explicit PRIMARY KEY.
+/// 2. For correct B-Tree key comparison, the PK column(s) must be the FIRST
+///    declared column(s) (positions 0..pk_count in declaration order).  This
+///    constraint comes from our storage format: the full row is the record
+///    payload, and key comparison uses the first `pk_count` values of the
+///    record.
+fn validate_without_rowid_table(body: &ast::CreateTableBody, tbl_name: &str) -> crate::Result<()> {
+    let ast::CreateTableBody::ColumnsAndConstraints {
+        columns,
+        constraints,
+        ..
+    } = body
+    else {
+        bail_parse_error!("WITHOUT ROWID is only valid for ColumnsAndConstraints tables");
+    };
+
+    // Collect PRIMARY KEY column names from table-level and column-level constraints.
+    let mut pk_names: Vec<String> = Vec::new();
+
+    // Table-level PRIMARY KEY clause.
+    if let Some(constraints) = constraints {
+        for c in constraints {
+            if let ast::TableConstraint::PrimaryKey {
+                columns: pk_cols, ..
+            } = &c.constraint
+            {
+                for col in pk_cols {
+                    if let ast::Expr::Id(id) = &col.expr {
+                        pk_names.push(crate::util::normalize_ident(&id.0));
+                    }
+                }
+            }
+        }
+    }
+
+    // Column-level PRIMARY KEY constraint.
+    for (col_name, col_def) in columns {
+        for constraint in &col_def.constraints {
+            if matches!(
+                constraint.constraint,
+                ast::ColumnConstraint::PrimaryKey { .. }
+            ) {
+                pk_names.push(crate::util::normalize_ident(&col_name.0));
+            }
+        }
+    }
+
+    if pk_names.is_empty() {
+        bail_parse_error!("WITHOUT ROWID table '{}' must have a PRIMARY KEY", tbl_name);
+    }
+
+    // Verify that PK columns are the first pk_count declared columns.
+    let pk_count = pk_names.len();
+    for (idx, pk_name) in pk_names.iter().enumerate() {
+        let col_pos = columns
+            .iter()
+            .position(|(k, _)| crate::util::normalize_ident(&k.0) == *pk_name);
+        match col_pos {
+            None => bail_parse_error!(
+                "WITHOUT ROWID table '{}': PRIMARY KEY column '{}' not found",
+                tbl_name,
+                pk_name
+            ),
+            Some(pos) if pos >= pk_count => bail_parse_error!(
+                "WITHOUT ROWID table '{}': PRIMARY KEY column '{}' must be declared \
+                 in the first {} column position(s) (found at position {})",
+                tbl_name,
+                pk_name,
+                pk_count,
+                pos
+            ),
+            Some(pos) if pos != idx => bail_parse_error!(
+                "WITHOUT ROWID table '{}': PRIMARY KEY column '{}' must appear \
+                 in PK declaration order as one of the first {} columns \
+                 (found at position {}; expected position {})",
+                tbl_name,
+                pk_name,
+                pk_count,
+                pos,
+                idx
+            ),
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug)]
 struct PrimaryKeyColumnInfo<'a> {
     name: &'a String,
@@ -382,9 +495,12 @@ fn check_automatic_pk_index_required(
                 }
             }
 
-            // Check if table has rowid
+            // WITHOUT ROWID tables use an index-format B-Tree whose implicit
+            // PK index IS the table itself — no separate auto-index entry is
+            // needed here.  Schema-level validation (PK required, PK columns
+            // first) happens in translate_create_table.
             if options.contains(ast::TableOptions::WITHOUT_ROWID) {
-                bail_parse_error!("WITHOUT ROWID tables are not supported yet");
+                return Ok(None);
             }
 
             unique_sets.dedup();

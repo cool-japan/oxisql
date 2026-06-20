@@ -176,7 +176,9 @@ impl Stmt {
                 if columns.is_none() {
                     return Ok(());
                 }
-                let columns = columns.as_ref().unwrap();
+                let columns = columns
+                    .as_ref()
+                    .expect("columns is Some after is_none() guard above");
                 match &*body {
                     InsertBody::Select(select, ..) => match select.body.select.column_count() {
                         ColumnCount::Fixed(n) if n != columns.len() => {

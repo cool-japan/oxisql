@@ -17,7 +17,7 @@ It contains:
 - the SQL **built-in functions**.
 
 - **Role:** engine core (interpreter, storage, translation, functions).
-- **Version:** 0.2.0 (2026-06-17).
+- **Version:** 0.2.1 (Unreleased).
 - **Tests:** 636 passing (all-features), 640 with `index_experimental`, 13 skipped.
 - **Approx LOC:** ~82,000 (after execute/ + schema/ module splits).
 - **Pure Rust / no C:** 100% Rust. No C allocator, no C parser generator, no

@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-20
+
+### Added
+
+#### WITHOUT ROWID table support (`oxisqlite-core`)
+- `CREATE TABLE … WITHOUT ROWID` now fully supported: uses an index-format B-Tree where the PRIMARY KEY columns are the B-Tree key and the full row is stored as the record payload.
+- `Index::synthetic_for_without_rowid(table)` in `schema/index.rs` builds a synthetic index object (PK columns + all table columns) used to open cursors as `CursorType::BTreeIndex` with `has_rowid = false`.
+- `translate_create_table` in `translate/schema.rs` detects `WITHOUT ROWID` and emits `CreateBtree` with `CreateBTreeFlags::new_index()` instead of `new_table()` — the pager initialises the root page as an index-leaf page.
+- `validate_without_rowid_table` enforces: (1) an explicit PRIMARY KEY is present; (2) the PK column(s) occupy the first declared positions — required for correct B-Tree key comparison.
+- `translate_insert_without_rowid` in `translate/insert.rs`: dedicated INSERT code path for WITHOUT ROWID tables; opens the cursor as `BTreeIndex`, populates all column registers, enforces NOT NULL on PK columns, emits `NoConflict` for the PK uniqueness check, supports `OR IGNORE` (skip) and `OR REPLACE` (delete + re-insert), then writes via `MakeRecord` + `IdxInsert`; multi-row (`VALUES(…),(…)`) and `INSERT … SELECT` use the standard coroutine path.
+- `translate/plan.rs` updated: for WITHOUT ROWID tables without an explicit index hint, `CursorType::BTreeIndex(synthetic)` is allocated automatically so that `SELECT` / full-scans use the correct B-Tree page format.
+- `crates/oxisqlite-core/tests/without_rowid.rs` — 397-line integration test suite (registered in `Cargo.toml` as the `without_rowid` test target) covering: CREATE success/failure, basic INSERT + SELECT round-trip, PK NOT NULL enforcement, PK uniqueness (ABORT / IGNORE / REPLACE), multi-row INSERT, text PK, composite PK, validation of missing PK, and validation of PK-column-not-first.
+
+#### `BorrowedValue<'a>` — zero-allocation borrowed view of SQL values (`oxisql-core`)
+- New `BorrowedValue<'a>` enum in `oxisql-core` provides a lifetime-parametric mirror of `Value` where `Text`, `Blob`, `Json`, and `Decimal` borrow from existing storage instead of owning heap allocations; all scalar variants (`Null`, `Bool`, `I64`, `F64`, `Timestamp`, `Date`, `Time`, `Uuid`) are copied inline.
+- `BorrowedValue::to_owned(&self) -> Value` converts back to an owned `Value` by cloning borrowed bytes.
+- `From<&'a Value> for BorrowedValue<'a>` allows zero-cost borrowing of any `Value`; `Array` / `TypedArray` fall back to `Null` (documented limitation, callers iterate `elems` manually).
+- `BorrowedValue` implements `Debug`, `Clone`, `PartialEq`, `Display` (UUID formatted as `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`), and `type_name() -> &'static str`.
+- Re-exported from `oxisql-core` root (`pub use value::{ArrayElementType, BorrowedValue, Value}`).
+- 15 unit tests in `borrowed_value_tests` module covering: type names, is_null, text/blob zero-allocation round-trips, scalar round-trips, `From<&Value>` for all variants, Display output, and full owned round-trip.
+
+### Fixed
+- `INSERT` into WITHOUT ROWID tables previously returned `"INSERT into WITHOUT ROWID table is not supported"` at parse time; now correctly routed to the index-format insert path.
+- `CHECK_automatic_pk_index_required` no longer returns an unsupported error for WITHOUT ROWID tables; instead returns `Ok(None)` (no separate auto-index needed — the table IS the index).
+
+[0.2.1]: https://github.com/cool-japan/oxisql/releases/tag/v0.2.1
+
 ## [0.2.0] - 2026-06-17
 
 ### Added
@@ -293,7 +320,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Statement cache infrastructure: 128-slot LRU cache keyed by rewritten SQL text is in
   place; activates once limbo fixes the `Statement::reset()` / `Program::n_change` bug.
 
-[Unreleased]: https://github.com/cool-japan/oxisql/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/cool-japan/oxisql/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/cool-japan/oxisql/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/cool-japan/oxisql/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/cool-japan/oxisql/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/cool-japan/oxisql/compare/v0.1.0...v0.1.1

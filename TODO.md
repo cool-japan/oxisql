@@ -1,10 +1,10 @@
-# OxiSQL TODO — v0.2.0
+# OxiSQL TODO — v0.2.1
 
-Last updated: 2026-06-17
+Last updated: 2026-06-20
 
 MSRV 1.89 · License Apache-2.0 · 19 workspace crates (10 facade/drivers + 7 C-free
-oxisqlite-* engine + 2 ancillary) · ~132,777 lines of Rust across 371 `.rs` files
-(≈34.9k facade/drivers + ≈81.2k engine + ≈2.1k vendored TLS patch) · 1,997 tests
+oxisqlite-* engine + 2 ancillary) · ~134,051 lines of Rust across 377 `.rs` files
+(≈34.9k facade/drivers + ≈81.2k engine + ≈2.1k vendored TLS patch) · 2,024 tests
 passing (nextest), 0 failing (≈85 skipped, mostly live-server-gated) · 0 build warnings ·
 C-free proven (`CC=/usr/bin/false cargo build --workspace` → EXIT 0) ·
 `cargo deny` licenses/bans/sources PASS (3 pre-existing advisories: paste,
@@ -18,6 +18,7 @@ rsa Marvin, rustls-pemfile).
 - [x] **0.1.2** released (2026-06-10) — three big waves: C-free oxisqlite engine fork,
   full-transaction ROLLBACK, Apache-2.0 compliance + TLS advisory fix.
 - [x] **0.2.0** released (2026-06-17) — ANALYZE/System-R optimizer, UPSERT, execute/schema module splits, schema-cookie invalidation, blocking API, correlated subqueries, 1,997 tests.
+- [x] **0.2.1** released (2026-06-20) — WITHOUT ROWID table support, `BorrowedValue<'a>` zero-alloc SQL value view, B-tree module split, doc-test fix (cancel_token), 2,024 tests.
 
 ## Done in 0.1.2
 
@@ -73,6 +74,13 @@ are OxiSQL's own roadmap, not "blocked on limbo upstream".
 - [x] **LIMIT/OFFSET with bound parameters.** `LIMIT $1 OFFSET $2` works; 8 tests in `tests/limit_params.rs`.
 - [x] **`CREATE INDEX IF NOT EXISTS`.** Silently succeeds when index already exists.
 - [x] **IN/NOT IN three-valued logic.** `x NOT IN (set)` when set contains NULL correctly returns NULL; 7 regression tests in `tests/in_null.rs`.
+
+## Done in 0.2.1
+
+- [x] **WITHOUT ROWID table support (`oxisqlite-core`).** `CREATE TABLE … WITHOUT ROWID` fully implemented using an index-format B-Tree. PK columns are the B-Tree key; the full row is the record payload. `INSERT` (single-row, multi-row, `INSERT … SELECT`), `SELECT` (full-scan), `OR IGNORE`, and `OR REPLACE` all work. PK NOT NULL and uniqueness enforced. `Index::synthetic_for_without_rowid()` drives cursor allocation. `validate_without_rowid_table()` enforces explicit PK + PK-columns-first layout constraint. 16 integration tests in `crates/oxisqlite-core/tests/without_rowid.rs`.
+- [x] **`BorrowedValue<'a>` zero-allocation SQL value view (`oxisql-core`).** New enum where `Text`, `Blob`, `Json`, `Decimal` borrow from existing storage; all scalars copied inline. `to_owned() -> Value`, `From<&'a Value>`, `Display`, `type_name()` all implemented. Re-exported from `oxisql-core` root. 15 unit tests.
+- [x] **B-tree module split via splitrs (`oxisqlite-core`).** `storage/btree.rs` (8 864 lines) split into 6-file sub-tree: `btree/mod.rs` (512 ln) + `btree/cursor_core.rs` (1 346 ln) + `btree/cursor_write.rs` (1 590 ln) + `btree/cursor_nav.rs` (1 265 ln) + `btree/page_ops.rs` (1 172 ln) + `btree/tests.rs` (1 964 ln). All tests pass; 0 warnings.
+- [x] **Doc-test fix (`oxisql-postgres`).** Two doc examples on `PgConnection::cancel_token` / `PostgresCancelToken::cancel_query` lacked `.await` on the async `cancel_token()` call — fixed.
 
 ## Milestones
 
@@ -246,7 +254,7 @@ Known gaps and workarounds accumulated during consumer integration (0.2.0 era):
   - **Files:** `crates/oxisqlite-core/translate/schema.rs`, `translate/insert.rs`.
   - **Tests:** `table_level_pk_param_not_null`, `pk_column_before_constraint`, `pk_column_after_constraint`, `composite_table_level_pk_params`, `column_level_int_pk_still_works` (no regression); verify the bound value round-trips via `SELECT`.
   - **Risk:** Could affect rowid-alias detection (`INTEGER PRIMARY KEY`). Guard the rowid-alias path and cover with the no-regression test.
-- [ ] WITHOUT ROWID table inserts unsupported.
+- [x] WITHOUT ROWID table inserts — DONE in 0.2.1; see "Done in 0.2.1" section.
 - [x] `PRAGMA synchronous` rejected as invalid pragma. (planned 2026-06-15 — Slice A: durability & WAL lifecycle, implemented together with the three items below)
   - **Goal:** (A1) `PRAGMA synchronous = OFF|NORMAL|FULL|EXTRA` (and `0|1|2|3`) accepted, stored, returned on read, gates fsync. (A2/A3) On clean connection close the WAL is checkpointed AND truncated/removed so a byte-level consumer reads the `.db` immediately without a manual `PRAGMA wal_checkpoint`. (A4) `read_entire_wal_dumb` returns a `Corrupt`/IO error on a malformed WAL instead of panicking.
   - **Design:** (A4) Convert the `panic!` sites + six `try_into().unwrap()` (~:1458–1465) in `storage/sqlite3_ondisk.rs::read_entire_wal_dumb` into `Err(LimboError::Corrupt(...))` with bounds checks; keep the graceful salt-mismatch `break`; propagate the `Result` through `wal.rs` callers. (A1) Add `PragmaName::Synchronous` to the parser iff absent; read/write arms in `translate/pragma.rs`; a `SynchronousMode` on the pager gating the fsync calls in `pager.rs`/`wal.rs` (OFF → skip WAL fsync; NORMAL → fsync on checkpoint; FULL/EXTRA → fsync WAL on commit + DB file after checkpoint). (A2/A3) Implement the real `Truncate` checkpoint mode in `wal.rs` (resolve `TODO(pere): truncate wal file here` ~:873): `file.truncate(0)` + reset `max_frame`; route `PRAGMA wal_checkpoint(TRUNCATE)`; add a panic-free best-effort `Drop for Connection` in `lib.rs` (Truncate checkpoint + WAL truncate; swallow+`tracing::warn!` on error) and have `close()` use Truncate too.
@@ -308,9 +316,9 @@ Deferred from the 2026-06-15 `/ultra` run (collide on files owned by that run's 
   - **Goal:** `vdbe/execute.rs` and every product module < 2000 lines; op_* handler dispatch intact.
   - **Files:** `crates/oxisqlite-core/vdbe/execute.rs` → new `vdbe/execute/` module tree
 
-- [~] **Slice 5: `splitrs` split `storage/btree.rs` (8715 lines → under 2000)** (planned 2026-06-16)
+- [x] **Slice 5: `splitrs` split `storage/btree.rs` (8864 lines → under 2000)** (planned 2026-06-16; done 2026-06-19)
   - **Goal:** `storage/btree.rs` and every product module < 2000 lines; BTreeCursor API intact.
-  - **Files:** `crates/oxisqlite-core/storage/btree.rs` → new `storage/btree/` module tree
+  - **Files:** `crates/oxisqlite-core/storage/btree.rs` → `btree/mod.rs` (512 ln) + `btree/cursor_core.rs` (1346 ln) + `btree/cursor_write.rs` (1590 ln) + `btree/cursor_nav.rs` (1265 ln) + `btree/page_ops.rs` (1172 ln) + `btree/tests.rs` (2028 ln). All six files included via `include!()` / `mod` from `mod.rs`. 636 tests pass, 0 warnings.
 - ~~**Engine schema-cookie statement invalidation** then remove the compat-side DDL-prefix bypass~~ — now planned as three `[~]` slices above (2026-06-16): SetCookie writer, SchemaChanged detection, facade re-prepare.
 - [x] **IN / NOT IN three-valued-logic refinement** — `x NOT IN/IN (set)` with no match but the set contains a NULL now correctly returns NULL (three-valued logic). Fixed in `translate/subquery.rs` via Rewind+Column+IsNull check after set materialization; 7 regression tests in `tests/in_null.rs`.
 

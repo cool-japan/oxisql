@@ -75,25 +75,67 @@ impl fmt::Display for Error {
         match *self {
             Self::Io(ref err) => err.fmt(f),
             Self::UnrecognizedToken(pos, _) => {
-                write!(f, "unrecognized token at {:?}", pos.unwrap())
+                if let Some(p) = pos {
+                    write!(f, "unrecognized token at {:?}", p)
+                } else {
+                    write!(f, "unrecognized token at unknown position")
+                }
             }
             Self::UnterminatedLiteral(pos, _) => {
-                write!(f, "non-terminated literal at {:?}", pos.unwrap())
+                if let Some(p) = pos {
+                    write!(f, "non-terminated literal at {:?}", p)
+                } else {
+                    write!(f, "non-terminated literal at unknown position")
+                }
             }
             Self::UnterminatedBracket(pos, _) => {
-                write!(f, "non-terminated bracket at {:?}", pos.unwrap())
+                if let Some(p) = pos {
+                    write!(f, "non-terminated bracket at {:?}", p)
+                } else {
+                    write!(f, "non-terminated bracket at unknown position")
+                }
             }
             Self::UnterminatedBlockComment(pos, _) => {
-                write!(f, "non-terminated block comment at {:?}", pos.unwrap())
+                if let Some(p) = pos {
+                    write!(f, "non-terminated block comment at {:?}", p)
+                } else {
+                    write!(f, "non-terminated block comment at unknown position")
+                }
             }
-            Self::BadVariableName(pos, _) => write!(f, "bad variable name at {:?}", pos.unwrap()),
-            Self::BadNumber(pos, _, _, _) => write!(f, "bad number at {:?}", pos.unwrap()),
-            Self::ExpectedEqualsSign(pos, _) => write!(f, "expected = sign at {:?}", pos.unwrap()),
+            Self::BadVariableName(pos, _) => {
+                if let Some(p) = pos {
+                    write!(f, "bad variable name at {:?}", p)
+                } else {
+                    write!(f, "bad variable name at unknown position")
+                }
+            }
+            Self::BadNumber(pos, _, _, _) => {
+                if let Some(p) = pos {
+                    write!(f, "bad number at {:?}", p)
+                } else {
+                    write!(f, "bad number at unknown position")
+                }
+            }
+            Self::ExpectedEqualsSign(pos, _) => {
+                if let Some(p) = pos {
+                    write!(f, "expected = sign at {:?}", p)
+                } else {
+                    write!(f, "expected = sign at unknown position")
+                }
+            }
             Self::MalformedBlobLiteral(pos, _) => {
-                write!(f, "malformed blob literal at {:?}", pos.unwrap())
+                if let Some(p) = pos {
+                    write!(f, "malformed blob literal at {:?}", p)
+                } else {
+                    write!(f, "malformed blob literal at unknown position")
+                }
             }
             Self::MalformedHexInteger(pos, _, _, _) => {
-                write!(f, "malformed hex integer at {:?}", pos.unwrap())
+                if let Some(p) = pos {
+                    write!(f, "malformed hex integer at {:?}", p)
+                } else {
+                    write!(f, "malformed hex integer at unknown position")
+                }
             }
             Self::ParserError(ref msg, Some(pos), _) => write!(f, "{msg} at {pos:?}"),
             Self::ParserError(ref msg, _, _) => write!(f, "{msg}"),

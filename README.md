@@ -28,9 +28,31 @@ CC=/usr/bin/false cargo build --workspace   # → exit 0
 cargo build --workspace                      # → 0 warnings
 ```
 
-**Version 0.2.0 — 2026-06-17.**
-19 workspace crates · 1,997 tests passing · 0 failing · 0 clippy warnings.
-~132,777 lines of Rust across 371 source files.
+**Version 0.2.1 — 2026-06-20.**
+19 workspace crates · 2,024 tests passing · 0 failing · 0 clippy warnings.
+~134,051 lines of Rust across 377 source files.
+
+---
+
+## What's new in 0.2.1
+
+- **WITHOUT ROWID table support.** `CREATE TABLE … WITHOUT ROWID` is now fully
+  implemented. The engine uses an index-format B-Tree where the PRIMARY KEY
+  columns are the B-Tree key and the full row is the stored record payload.
+  Supports `INSERT` (single-row, multi-row, `INSERT … SELECT`), `SELECT`
+  (full-scan), `OR IGNORE`, and `OR REPLACE` conflict resolution. PK NOT NULL and
+  uniqueness are enforced. A synthetic index object drives cursor allocation so the
+  execution layer automatically uses the correct B-Tree page format.
+  16 integration tests in `crates/oxisqlite-core/tests/without_rowid.rs`.
+- **`BorrowedValue<'a>` — zero-allocation SQL value view.** `oxisql-core` gains a
+  lifetime-parametric mirror of `Value` where `Text`, `Blob`, `Json`, and
+  `Decimal` borrow from existing storage instead of owning heap allocations. Scalar
+  variants are copied inline. `BorrowedValue::to_owned()` converts back to an
+  owned `Value`. Re-exported from `oxisql-core` root. 15 unit tests.
+- **B-tree split via splitrs (`oxisqlite-core`).** `storage/btree.rs` (8 864 lines)
+  replaced by a 6-module sub-tree: `btree/mod.rs`, `btree/cursor_core.rs`,
+  `btree/cursor_write.rs`, `btree/cursor_nav.rs`, `btree/page_ops.rs`,
+  `btree/tests.rs`. All existing tests pass; 0 warnings.
 
 ---
 
@@ -128,7 +150,7 @@ consumed by `oxisql-sqlite-compat` and not part of OxiSQL's public surface.
 | Crate | Status | Tests | Description |
 |-------|--------|-------|-------------|
 | `oxisqlite` | Internal | 5 | Top-level engine facade / connection entry point |
-| `oxisqlite-core` | Internal | 636 (+13 skipped) | Storage engine: B-tree, pager, WAL, VDBE, transactions, ROLLBACK, ANALYZE, System-R optimizer |
+| `oxisqlite-core` | Internal | 652 (+85 skipped) | Storage engine: B-tree (split), pager, WAL, VDBE, transactions, ROLLBACK, ANALYZE, System-R optimizer, WITHOUT ROWID |
 | `oxisqlite-ext` | Internal | — | Built-in extensions / virtual-table glue |
 | `oxisqlite-macros` | Internal | — | Procedural macros for the engine |
 | `oxisqlite-sqlite3-parser` | Internal | 208 (+6) | SQL parser (pre-generated, no `lemon` C generator) |
@@ -149,14 +171,14 @@ Add to your workspace's root `Cargo.toml`:
 ```toml
 # Workspace root Cargo.toml
 [workspace.dependencies]
-oxisql = { version = "0.2.0", features = ["embedded"] }
+oxisql = { version = "0.2.1", features = ["embedded"] }
 ```
 
 Or add to a single crate:
 
 ```toml
 [dependencies]
-oxisql = { version = "0.2.0", features = ["embedded", "postgres", "pool-embedded", "migrate"] }
+oxisql = { version = "0.2.1", features = ["embedded", "postgres", "pool-embedded", "migrate"] }
 ```
 
 ---
@@ -395,26 +417,26 @@ cross-backend OLAP queries (filter / projection / limit pushdown).
 
 ```toml
 # In-memory only
-oxisql = { version = "0.2.0", features = ["embedded"] }
+oxisql = { version = "0.2.1", features = ["embedded"] }
 
 # PostgreSQL + pooling
-oxisql = { version = "0.2.0", features = ["postgres", "pool-postgres"] }
+oxisql = { version = "0.2.1", features = ["postgres", "pool-postgres"] }
 
 # MySQL + migrations
-oxisql = { version = "0.2.0", features = ["mysql", "pool-mysql", "migrate"] }
+oxisql = { version = "0.2.1", features = ["mysql", "pool-mysql", "migrate"] }
 
 # C-free SQLite + pooling
-oxisql = { version = "0.2.0", features = ["sqlite", "pool-sqlite-compat"] }
+oxisql = { version = "0.2.1", features = ["sqlite", "pool-sqlite-compat"] }
 
 # All OLTP backends + pooling + migrations
-oxisql = { version = "0.2.0", features = [
+oxisql = { version = "0.2.1", features = [
     "embedded", "postgres", "mysql", "sqlite",
     "pool-embedded", "pool-postgres", "pool-mysql", "pool-sqlite-compat",
     "migrate",
 ] }
 
 # Full stack including DataFusion OLAP and the REPL
-oxisql = { version = "0.2.0", features = [
+oxisql = { version = "0.2.1", features = [
     "embedded", "postgres", "mysql", "sqlite", "datafusion",
     "pool-embedded", "pool-postgres", "pool-mysql",
     "migrate", "repl",
@@ -471,7 +493,8 @@ oxisql (facade crate)
 ### Value type system
 
 The `Value` enum (in `oxisql-core`) has 13 variants covering the full type
-surface of all supported backends:
+surface of all supported backends. A companion `BorrowedValue<'a>` type provides
+a zero-allocation borrowed view for high-throughput row iteration.
 
 | Variant | SQL types |
 |---------|-----------|

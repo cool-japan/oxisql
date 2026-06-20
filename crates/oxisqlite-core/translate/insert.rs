@@ -263,8 +263,19 @@ pub fn translate_insert(
     let Some(btree_table) = table.btree() else {
         crate::bail_parse_error!("no such table: {}", table_name);
     };
+
+    // Route WITHOUT ROWID tables to the index-format INSERT path.
     if !btree_table.has_rowid {
-        crate::bail_parse_error!("INSERT into WITHOUT ROWID table is not supported");
+        return translate_insert_without_rowid(
+            program,
+            schema,
+            &btree_table,
+            columns,
+            body,
+            on_conflict,
+            &mut resolver,
+            on_conflict_needs_savepoint,
+        );
     }
 
     let root_page = btree_table.root_page;
@@ -1491,6 +1502,300 @@ fn translate_virtual_table_insert(
 
     let halt_label = program.allocate_label();
     program.resolve_label(halt_label, program.offset());
+
+    Ok(program)
+}
+
+/// Translate an INSERT into a WITHOUT ROWID table.
+///
+/// WITHOUT ROWID tables use an index-format B-Tree where:
+/// - The key is the PRIMARY KEY columns packed into an index record (no trailing rowid).
+/// - The payload/record is the FULL row stored in column declaration order.
+///
+/// Constraint (validated at CREATE TABLE time): PK column(s) must be the first
+/// declared column(s) so that key comparison (on the first pk_count values of the
+/// record) works correctly.
+///
+/// Implementation:
+/// 1. Open the table cursor as `CursorType::BTreeIndex` with a synthetic index
+///    whose columns = the PK columns and `has_rowid = false`.
+/// 2. Populate column registers with the provided values (same as the regular path).
+/// 3. Check uniqueness: `NoConflict` on the PK columns (like a unique index check).
+/// 4. Write: `MakeRecord` of ALL columns, then `IdxInsert`.
+#[allow(clippy::too_many_arguments)]
+fn translate_insert_without_rowid(
+    mut program: ProgramBuilder,
+    schema: &Schema,
+    btree_table: &Rc<BTreeTable>,
+    columns: Option<DistinctNames>,
+    mut body: InsertBody,
+    on_conflict: Option<ResolveType>,
+    resolver: &mut Resolver,
+    on_conflict_needs_savepoint: bool,
+) -> Result<ProgramBuilder> {
+    use crate::schema::Index;
+
+    let on_conflict_ignore = matches!(on_conflict, Some(ResolveType::Ignore));
+    let on_conflict_replace = matches!(on_conflict, Some(ResolveType::Replace));
+    let table_name = btree_table.name.clone();
+
+    // Build the synthetic "PK index" whose columns = PK columns, has_rowid = false.
+    // This is the same representation used at read time so the cursor initialises the
+    // right IndexKeyInfo (sort order, num_cols = pk_count, has_rowid = false).
+    let synthetic_idx = Index::synthetic_for_without_rowid(btree_table);
+    let root_page = btree_table.root_page;
+    // `synthetic_idx.columns` contains ALL table columns (needed for emit_column lookup),
+    // so we must derive the PK count from the table's primary_key_columns list, not from
+    // the synthetic index's column count.
+    let num_pk_cols = btree_table.primary_key_columns.len();
+    let num_cols = btree_table.columns.len();
+
+    // Primary-key column names (normalised) for NOT NULL enforcement.
+    let primary_key_columns: Vec<String> = btree_table
+        .primary_key_columns
+        .iter()
+        .map(|(name, _)| normalize_ident(name))
+        .collect();
+
+    // Determine num_values from the body before any mutation.
+    let num_values_hint = match &body {
+        InsertBody::Select(sel, _) => match sel.body.select.as_ref() {
+            OneSelect::Values(vals) if !vals.is_empty() => vals[0].len(),
+            _ => num_cols,
+        },
+        InsertBody::DefaultValues => 0,
+    };
+
+    // Resolve INSERT columns → table column mapping (same helper as the rowid path).
+    let table_ref = crate::schema::Table::BTree(btree_table.clone());
+    let column_mappings = resolve_columns_for_insert(&table_ref, &columns, num_values_hint)?;
+
+    // Detect single vs multi-row and extract values for the single-row case.
+    let mut values: Option<Vec<Expr>> = None;
+    let inserting_multiple_rows = match &mut body {
+        InsertBody::Select(select, _) => match select.body.select.as_mut() {
+            OneSelect::Values(values_expr) if values_expr.len() <= 1 => {
+                if values_expr.is_empty() {
+                    crate::bail_parse_error!("no values to insert");
+                }
+                let mut param_idx = 1;
+                for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
+                    super::optimizer::rewrite_expr(expr, &mut param_idx)?;
+                }
+                values = values_expr.pop();
+                false
+            }
+            _ => true,
+        },
+        InsertBody::DefaultValues => false,
+    };
+    let needs_stmt_savepoint = on_conflict_needs_savepoint && inserting_multiple_rows;
+
+    // --- Open the cursor as BTreeIndex ---
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(synthetic_idx.clone()));
+
+    let halt_label = program.allocate_label();
+    let loop_start_label = program.allocate_label();
+
+    // Allocate column registers.  For WITHOUT ROWID, all columns share consecutive
+    // registers starting at `col_regs_start`.  There is no separate rowid register.
+    let col_regs_start = program.alloc_registers(num_cols);
+
+    // Multi-row path: emit the coroutine that yields rows, then open cursor.
+    let yield_reg_opt: Option<usize> = if inserting_multiple_rows {
+        let InsertBody::Select(select, _) = body else {
+            unreachable!("inserting_multiple_rows is only true for Select body");
+        };
+        let yield_reg = program.alloc_register();
+        let jump_on_definition_label = program.allocate_label();
+        let start_offset_label = program.allocate_label();
+        program.emit_insn(Insn::InitCoroutine {
+            yield_reg,
+            jump_on_definition: jump_on_definition_label,
+            start_offset: start_offset_label,
+        });
+        program.preassign_label_to_next_insn(start_offset_label);
+        let query_destination = QueryDestination::CoroutineYield {
+            yield_reg,
+            coroutine_implementation_start: halt_label,
+        };
+        program.incr_nesting();
+        let result = translate_select(
+            QueryMode::Normal,
+            schema,
+            *select,
+            resolver.symbol_table,
+            program,
+            query_destination,
+        )?;
+        program = result.program;
+        program.decr_nesting();
+        program.emit_insn(Insn::EndCoroutine { yield_reg });
+        program.preassign_label_to_next_insn(jump_on_definition_label);
+        if needs_stmt_savepoint {
+            program.emit_insn(Insn::Savepoint {
+                op: SavepointOp::Begin,
+                name: "_stmt".to_string(),
+            });
+        }
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id,
+            root_page: RegisterOrLiteral::Literal(root_page),
+            name: table_name.clone(),
+        });
+        program.preassign_label_to_next_insn(loop_start_label);
+        program.emit_insn(Insn::Yield {
+            yield_reg,
+            end_offset: halt_label,
+        });
+        Some(yield_reg)
+    } else {
+        // Single-row path: open cursor first.
+        if needs_stmt_savepoint {
+            program.emit_insn(Insn::Savepoint {
+                op: SavepointOp::Begin,
+                name: "_stmt".to_string(),
+            });
+        }
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id,
+            root_page: RegisterOrLiteral::Literal(root_page),
+            name: table_name.clone(),
+        });
+        None
+    };
+
+    // Populate column registers.
+    if let Some(yield_reg) = yield_reg_opt {
+        // Multi-row: copy values from the coroutine's yield registers.
+        populate_columns_multiple_rows(
+            &mut program,
+            &column_mappings,
+            col_regs_start,
+            yield_reg + 1,
+            resolver,
+            &None,
+            &primary_key_columns,
+        )?;
+    } else {
+        // Single-row: evaluate expressions directly.
+        // `rowid_reg` is unused for WITHOUT ROWID; pass `col_regs_start` as a dummy.
+        populate_column_registers(
+            &mut program,
+            &values.unwrap_or_default(),
+            &column_mappings,
+            col_regs_start,
+            col_regs_start,
+            resolver,
+            &primary_key_columns,
+        )?;
+    }
+
+    // NOT NULL enforcement: PK columns in WITHOUT ROWID tables are implicitly NOT NULL.
+    for (idx, col) in btree_table.columns.iter().enumerate() {
+        let col_name = col.name.as_deref().unwrap_or("");
+        let is_pk_col = primary_key_columns
+            .iter()
+            .any(|pk| pk == &normalize_ident(col_name));
+        let is_notnull = col.notnull || is_pk_col;
+        if is_notnull && !col.is_rowid_alias {
+            program.emit_insn(Insn::HaltIfNull {
+                target_reg: col_regs_start + idx,
+                err_code: SQLITE_CONSTRAINT_NOTNULL,
+                description: format!("{}.{}", table_name, col_name),
+            });
+        }
+    }
+
+    // --- Conflict check: NoConflict on PK columns ---
+    // `NoConflict` jumps to `no_conflict_label` when there is NO conflict
+    // (or any PK column is NULL — impossible due to the NOT NULL check above,
+    // but the instruction handles it gracefully by jumping).
+    let no_conflict_label = program.allocate_label();
+    program.emit_insn(Insn::NoConflict {
+        cursor_id,
+        target_pc: no_conflict_label,
+        record_reg: col_regs_start,
+        num_regs: num_pk_cols,
+    });
+
+    // A conflict was found — handle according to on_conflict policy.
+    let next_record_label = program.allocate_label();
+    if on_conflict_ignore {
+        program.emit_insn(Insn::Goto {
+            target_pc: next_record_label,
+        });
+    } else if on_conflict_replace {
+        // Delete the conflicting row (cursor is positioned on it by NoConflict fall-through).
+        program.emit_insn(Insn::Delete { cursor_id });
+        // The cursor is now invalidated; re-seek so IdxInsert starts from the right position.
+        let reseek_label = program.allocate_label();
+        program.emit_insn(Insn::SeekGE {
+            is_index: true,
+            cursor_id,
+            start_reg: col_regs_start,
+            num_regs: num_pk_cols,
+            target_pc: reseek_label,
+            eq_only: false,
+        });
+        program.preassign_label_to_next_insn(reseek_label);
+    } else {
+        // ABORT / FAIL / ROLLBACK: halt with PRIMARY KEY constraint error.
+        if needs_stmt_savepoint {
+            program.emit_insn(Insn::Savepoint {
+                op: SavepointOp::RollbackTo,
+                name: "_stmt".to_string(),
+            });
+        }
+        let pk_desc = btree_table
+            .primary_key_columns
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+            description: format!("{}.{}", table_name, pk_desc),
+        });
+    }
+    program.preassign_label_to_next_insn(no_conflict_label);
+
+    // --- Build the full-row record and insert ---
+    // The record contains ALL table columns in declaration order (PK cols first
+    // per the validation constraint, then remaining cols).
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: col_regs_start,
+        count: num_cols,
+        dest_reg: record_reg,
+        index_name: Some(format!("__without_rowid_pk_{}", table_name)),
+    });
+    program.emit_insn(Insn::IdxInsert {
+        cursor_id,
+        record_reg,
+        unpacked_start: Some(col_regs_start),
+        unpacked_count: Some(num_cols as u16),
+        flags: IdxInsertFlags::new(),
+    });
+
+    // IGNORE lands here after skipping the insert.
+    program.preassign_label_to_next_insn(next_record_label);
+
+    if inserting_multiple_rows {
+        // Loop back to yield the next row from the coroutine.
+        program.emit_insn(Insn::Goto {
+            target_pc: loop_start_label,
+        });
+    }
+
+    program.resolve_label(halt_label, program.offset());
+    if needs_stmt_savepoint {
+        program.emit_insn(Insn::Savepoint {
+            op: SavepointOp::Release,
+            name: "_stmt".to_string(),
+        });
+    }
+    program.epilogue(super::emitter::TransactionMode::Write);
 
     Ok(program)
 }

@@ -987,7 +987,10 @@ impl ToTokens for OneSelect {
 
 impl ToTokens for FromClause {
     fn to_tokens<S: TokenStream>(&self, s: &mut S) -> Result<(), S::Error> {
-        self.select.as_ref().unwrap().to_tokens(s)?;
+        self.select
+            .as_ref()
+            .expect("FromClause select is mandatory per AST invariant")
+            .to_tokens(s)?;
         if let Some(ref joins) = self.joins {
             for join in joins {
                 join.to_tokens(s)?;

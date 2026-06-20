@@ -24,7 +24,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
         pub unsafe extern "C" fn #register_static() -> *const ::limbo_ext::VfsImpl {
             let ctx = #struct_name::default();
             let ctx = ::std::boxed::Box::into_raw(::std::boxed::Box::new(ctx)) as *const ::std::ffi::c_void;
-            let name = ::std::ffi::CString::new(<#struct_name as ::limbo_ext::VfsExtension>::NAME).unwrap().into_raw();
+            let name = ::std::ffi::CString::new(<#struct_name as ::limbo_ext::VfsExtension>::NAME).expect("VFS extension NAME must not contain interior nul bytes").into_raw();
             let vfs_mod = ::limbo_ext::VfsImpl {
                 vfs: ctx,
                 name,
@@ -47,7 +47,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
         pub unsafe extern "C" fn #register_fn_name(api: &::limbo_ext::ExtensionApi) -> ::limbo_ext::ResultCode {
             let ctx = #struct_name::default();
             let ctx = ::std::boxed::Box::into_raw(::std::boxed::Box::new(ctx)) as *const ::std::ffi::c_void;
-            let name = ::std::ffi::CString::new(<#struct_name as ::limbo_ext::VfsExtension>::NAME).unwrap().into_raw();
+            let name = ::std::ffi::CString::new(<#struct_name as ::limbo_ext::VfsExtension>::NAME).expect("VFS extension NAME must not contain interior nul bytes").into_raw();
             let vfs_mod = ::limbo_ext::VfsImpl {
                 vfs: ctx,
                 name,
@@ -210,7 +210,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
             let obj = #struct_name::default();
             let time = <#struct_name as ::limbo_ext::VfsExtension>::get_current_time(&obj);
             // release ownership of the string to core
-            ::std::ffi::CString::new(time).unwrap().into_raw() as *const ::std::ffi::c_char
+            ::std::ffi::CString::new(time).expect("get_current_time must not return a string containing interior nul bytes").into_raw() as *const ::std::ffi::c_char
         }
     };
 

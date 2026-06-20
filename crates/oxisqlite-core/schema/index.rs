@@ -239,6 +239,76 @@ impl Index {
             .iter()
             .position(|c| c.pos_in_table == table_pos)
     }
+
+    /// Create a synthetic `Index` representing the implicit PK index of a WITHOUT ROWID table.
+    ///
+    /// WITHOUT ROWID tables store their data in an index-format B-Tree where the primary-key
+    /// columns are the key and the full row (all columns) is the record payload.  No separate
+    /// sqlite_schema entry is written for this implicit index.  The synthetic object is used
+    /// to open cursors with `CursorType::BTreeIndex` so the execution layer uses index-format
+    /// B-Tree access (seek by PK, read all columns from the stored record).
+    ///
+    /// Constraint: PK column(s) must appear first in the table's column list (position 0, 1, …
+    /// in declaration order equals physical position in the stored record).  This matches the
+    /// SQLite recommendation for WITHOUT ROWID tables and is the only layout we support.
+    ///
+    /// **All table columns are included** in the synthetic index's `columns` list (in
+    /// declaration order) so that helpers like `emit_column` can look up default values
+    /// for every column by its position in the table.  The first `pk_count` columns are
+    /// the primary-key columns; the B-Tree cursor's key comparison uses only the first
+    /// `num_cols` values of the stored record (where `num_cols = index.columns.len()` —
+    /// i.e. all columns — when `has_rowid = false`).
+    ///
+    /// For **seek operations** (e.g. `NoConflict`), the caller supplies `num_regs =
+    /// pk_count` so that `indexbtree_move_to` compares only the first `pk_count` values,
+    /// which is the PK key.  Full-scan reads (Rewind / Next / Column) naturally access
+    /// all values because the record payload contains the full row.
+    pub fn synthetic_for_without_rowid(table: &BTreeTable) -> std::sync::Arc<Index> {
+        // All columns in declaration order, using the declaration index as `pos_in_table`.
+        // PK columns must already be at the front (validated at CREATE TABLE time).
+        let all_columns: Vec<IndexColumn> = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(pos_in_table, column)| {
+                // Determine sort order: use the order from primary_key_columns if this
+                // column is part of the PK, otherwise default to Asc.
+                let order = table
+                    .primary_key_columns
+                    .iter()
+                    .find(|(pk_name, _)| {
+                        column
+                            .name
+                            .as_ref()
+                            .is_some_and(|n| normalize_ident(n) == normalize_ident(pk_name))
+                    })
+                    .map(|(_, ord)| *ord)
+                    .unwrap_or(limbo_sqlite3_parser::ast::SortOrder::Asc);
+                IndexColumn {
+                    name: column
+                        .name
+                        .as_deref()
+                        .map(normalize_ident)
+                        .unwrap_or_default(),
+                    order,
+                    pos_in_table,
+                    collation: column.collation,
+                    default: column.default.clone(),
+                }
+            })
+            .collect();
+        std::sync::Arc::new(Index {
+            // Use a synthetic name that cannot collide with user-created objects.
+            name: format!("__without_rowid_pk_{}", table.name),
+            table_name: table.name.clone(),
+            // The synthetic index shares the table's root page — it IS the table.
+            root_page: table.root_page,
+            columns: all_columns,
+            unique: true,
+            ephemeral: false,
+            has_rowid: false,
+        })
+    }
 }
 #[allow(dead_code)]
 #[derive(Debug, Clone)]

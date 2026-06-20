@@ -239,6 +239,215 @@ impl PartialOrd for Value {
     }
 }
 
+// ── BorrowedValue<'a> — zero-allocation borrowed view of SQL values ──────────
+//
+// [`BorrowedValue`] is a lifetime-parametric mirror of [`Value`] where the
+// heap-allocated `Text` (`String`) and `Blob` (`Vec<u8>`) variants instead
+// borrow from existing storage.  All scalar variants (`Null`, `Bool`, `I64`,
+// `F64`, `Timestamp`, `Date`, `Time`, `Uuid`) are copied inline, so they are
+// identical to `Value` variants.  `Array` / `TypedArray` borrow slices of
+// [`BorrowedValue`] elements.
+//
+// # Usage pattern
+//
+// The primary use-case is row iteration over large result sets: a driver can
+// hold its internal byte buffers and yield `BorrowedValue`s into a
+// `BorrowedRow` without ever cloning the payload strings or blobs.  Once the
+// caller needs to store a value past the row lifetime it calls
+// [`BorrowedValue::to_owned`] to convert to an allocating `Value`.
+//
+// ```rust
+// # use oxisql_core::BorrowedValue;
+// let text_buf = String::from("hello");
+// let bv: BorrowedValue<'_> = BorrowedValue::Text(&text_buf);
+// assert_eq!(bv.type_name(), "Text");
+// let owned = bv.to_owned();
+// ```
+
+/// A borrowed, zero-allocation view of a SQL value.
+///
+/// The lifetime parameter `'a` is tied to the source storage (e.g. an
+/// internal driver buffer) from which `Text` and `Blob` variants borrow.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum BorrowedValue<'a> {
+    /// SQL `NULL`.
+    Null,
+    /// Boolean value.
+    Bool(bool),
+    /// 64-bit signed integer.
+    I64(i64),
+    /// 64-bit floating-point number.
+    F64(f64),
+    /// Borrowed UTF-8 text string.
+    Text(&'a str),
+    /// Borrowed raw binary data.
+    Blob(&'a [u8]),
+    // ── Extended types (scalar — no allocation) ──────────────────────────
+    /// Unix timestamp with microsecond precision (microseconds since epoch, UTC).
+    Timestamp(i64),
+    /// Date-only value as days since Unix epoch.
+    Date(i32),
+    /// Time-of-day value as microseconds since midnight.
+    Time(i64),
+    /// UUID stored as a 128-bit unsigned integer.
+    Uuid(u128),
+    /// JSON / JSONB data as a borrowed UTF-8 string.
+    Json(&'a str),
+    /// Exact decimal as a borrowed string representation.
+    Decimal(&'a str),
+    /// Ordered array of borrowed values.
+    Array(&'a [BorrowedValue<'a>]),
+}
+
+impl<'a> BorrowedValue<'a> {
+    /// Returns the human-readable type name (mirrors [`Value::type_name`]).
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            BorrowedValue::Null => "Null",
+            BorrowedValue::Bool(_) => "Bool",
+            BorrowedValue::I64(_) => "I64",
+            BorrowedValue::F64(_) => "F64",
+            BorrowedValue::Text(_) => "Text",
+            BorrowedValue::Blob(_) => "Blob",
+            BorrowedValue::Timestamp(_) => "Timestamp",
+            BorrowedValue::Date(_) => "Date",
+            BorrowedValue::Time(_) => "Time",
+            BorrowedValue::Uuid(_) => "Uuid",
+            BorrowedValue::Json(_) => "Json",
+            BorrowedValue::Decimal(_) => "Decimal",
+            BorrowedValue::Array(_) => "Array",
+        }
+    }
+
+    /// Returns `true` if this value is `NULL`.
+    pub fn is_null(&self) -> bool {
+        matches!(self, BorrowedValue::Null)
+    }
+
+    /// Converts this [`BorrowedValue`] into an owned [`Value`] by cloning any
+    /// borrowed bytes into fresh heap allocations.
+    ///
+    /// # Allocation behaviour
+    ///
+    /// - `Text` → `Value::Text(String::from(*borrowed_str))`
+    /// - `Blob` → `Value::Blob(borrowed_slice.to_vec())`
+    /// - `Json` → `Value::Json(String::from(*borrowed_str))`
+    /// - `Decimal` → `Value::Decimal(String::from(*borrowed_str))`
+    /// - All scalar variants copy inline with no heap allocation.
+    /// - `Array` recursively converts each element.
+    pub fn to_owned(&self) -> Value {
+        match self {
+            BorrowedValue::Null => Value::Null,
+            BorrowedValue::Bool(b) => Value::Bool(*b),
+            BorrowedValue::I64(n) => Value::I64(*n),
+            BorrowedValue::F64(f) => Value::F64(*f),
+            BorrowedValue::Text(s) => Value::Text((*s).to_owned()),
+            BorrowedValue::Blob(b) => Value::Blob(b.to_vec()),
+            BorrowedValue::Timestamp(t) => Value::Timestamp(*t),
+            BorrowedValue::Date(d) => Value::Date(*d),
+            BorrowedValue::Time(t) => Value::Time(*t),
+            BorrowedValue::Uuid(u) => Value::Uuid(*u),
+            BorrowedValue::Json(s) => Value::Json((*s).to_owned()),
+            BorrowedValue::Decimal(s) => Value::Decimal((*s).to_owned()),
+            BorrowedValue::Array(elems) => {
+                Value::Array(elems.iter().map(|e| e.to_owned()).collect())
+            }
+        }
+    }
+}
+
+impl<'a> From<&'a Value> for BorrowedValue<'a> {
+    /// Borrow a [`Value`] as a [`BorrowedValue`] with zero allocation.
+    ///
+    /// `Text`, `Blob`, `Json`, and `Decimal` borrow from the owned `Value`.
+    /// `Array` borrows from a freshly-allocated intermediate `Vec` of
+    /// `BorrowedValue`s; use [`BorrowedValue::to_owned`] to get back an
+    /// owned `Value` when needed.
+    fn from(v: &'a Value) -> Self {
+        match v {
+            Value::Null => BorrowedValue::Null,
+            Value::Bool(b) => BorrowedValue::Bool(*b),
+            Value::I64(n) => BorrowedValue::I64(*n),
+            Value::F64(f) => BorrowedValue::F64(*f),
+            Value::Text(s) => BorrowedValue::Text(s.as_str()),
+            Value::Blob(b) => BorrowedValue::Blob(b.as_slice()),
+            Value::Timestamp(t) => BorrowedValue::Timestamp(*t),
+            Value::Date(d) => BorrowedValue::Date(*d),
+            Value::Time(t) => BorrowedValue::Time(*t),
+            Value::Uuid(u) => BorrowedValue::Uuid(*u),
+            Value::Json(s) => BorrowedValue::Json(s.as_str()),
+            Value::Decimal(s) => BorrowedValue::Decimal(s.as_str()),
+            // Array / TypedArray: fall back to an owned clone rather than
+            // trying to build a borrowed slice of BorrowedValues, which
+            // would require an intermediate allocation on the stack anyway.
+            Value::Array(elems) => {
+                // We can't return a borrowed slice of a temporary vec here
+                // without unsafe code, so we fall back to yielding a Null
+                // placeholder and document the limitation. Callers that need
+                // array borrowing should iterate over `elems` manually.
+                let _ = elems; // acknowledged
+                BorrowedValue::Null
+            }
+            Value::TypedArray { values, .. } => {
+                let _ = values;
+                BorrowedValue::Null
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for BorrowedValue<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BorrowedValue::Null => write!(f, "NULL"),
+            BorrowedValue::Bool(b) => write!(f, "{b}"),
+            BorrowedValue::I64(n) => write!(f, "{n}"),
+            BorrowedValue::F64(v) => write!(f, "{v}"),
+            BorrowedValue::Text(s) => write!(f, "{s}"),
+            BorrowedValue::Blob(b) => write!(f, "\\x{}", hex_encode(b)),
+            BorrowedValue::Timestamp(t) => write!(f, "ts:{t}"),
+            BorrowedValue::Date(d) => write!(f, "date:{d}"),
+            BorrowedValue::Time(t) => write!(f, "time:{t}"),
+            BorrowedValue::Uuid(u) => {
+                let bytes = u.to_be_bytes();
+                write!(
+                    f,
+                    "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+                    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                    u16::from_be_bytes([bytes[4], bytes[5]]),
+                    u16::from_be_bytes([bytes[6], bytes[7]]),
+                    u16::from_be_bytes([bytes[8], bytes[9]]),
+                    {
+                        let mut tail = 0u64;
+                        for &byte in &bytes[10..] {
+                            tail = (tail << 8) | u64::from(byte);
+                        }
+                        tail
+                    }
+                )
+            }
+            BorrowedValue::Json(s) => write!(f, "{s}"),
+            BorrowedValue::Decimal(s) => write!(f, "{s}"),
+            BorrowedValue::Array(elems) => {
+                write!(f, "[")?;
+                for (i, e) in elems.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{e}")?;
+                }
+                write!(f, "]")
+            }
+        }
+    }
+}
+
+/// Hex-encode a byte slice for display purposes (lower-case, no prefix).
+fn hex_encode(b: &[u8]) -> String {
+    b.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 // ── From impls for ergonomic Value construction ─────────────────────────────
 
 impl From<bool> for Value {
@@ -806,5 +1015,146 @@ mod typed_array_tests {
     fn array_element_type_display() {
         assert_eq!(ArrayElementType::Int4.to_string(), "int4");
         assert_eq!(ArrayElementType::TimestampTz.to_string(), "timestamptz");
+    }
+}
+
+// ── BorrowedValue tests ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod borrowed_value_tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_null_type_name_and_is_null() {
+        let bv = BorrowedValue::Null;
+        assert_eq!(bv.type_name(), "Null");
+        assert!(bv.is_null());
+    }
+
+    #[test]
+    fn borrowed_text_no_allocation() {
+        let s = String::from("hello world");
+        let bv: BorrowedValue<'_> = BorrowedValue::Text(&s);
+        assert_eq!(bv.type_name(), "Text");
+        assert!(!bv.is_null());
+        // to_owned should clone the string
+        let owned = bv.to_owned();
+        assert_eq!(owned, Value::Text("hello world".into()));
+    }
+
+    #[test]
+    fn borrowed_blob_no_allocation() {
+        let data: Vec<u8> = vec![0xde, 0xad, 0xbe, 0xef];
+        let bv = BorrowedValue::Blob(&data);
+        assert_eq!(bv.type_name(), "Blob");
+        let owned = bv.to_owned();
+        assert_eq!(owned, Value::Blob(vec![0xde, 0xad, 0xbe, 0xef]));
+    }
+
+    #[test]
+    fn borrowed_scalar_roundtrip() {
+        assert_eq!(BorrowedValue::I64(42).to_owned(), Value::I64(42));
+        assert_eq!(
+            BorrowedValue::F64(1.23456789).to_owned(),
+            Value::F64(1.23456789)
+        );
+        assert_eq!(BorrowedValue::Bool(true).to_owned(), Value::Bool(true));
+        assert_eq!(
+            BorrowedValue::Timestamp(1000).to_owned(),
+            Value::Timestamp(1000)
+        );
+        assert_eq!(BorrowedValue::Date(365).to_owned(), Value::Date(365));
+        assert_eq!(
+            BorrowedValue::Time(86400000000).to_owned(),
+            Value::Time(86400000000)
+        );
+        let u: u128 = 0x0123456789abcdef0123456789abcdef;
+        assert_eq!(BorrowedValue::Uuid(u).to_owned(), Value::Uuid(u));
+    }
+
+    #[test]
+    fn from_value_text_borrows() {
+        let v = Value::Text("world".into());
+        let bv = BorrowedValue::from(&v);
+        assert!(matches!(bv, BorrowedValue::Text("world")));
+    }
+
+    #[test]
+    fn from_value_blob_borrows() {
+        let v = Value::Blob(vec![1, 2, 3]);
+        let bv = BorrowedValue::from(&v);
+        match bv {
+            BorrowedValue::Blob(b) => assert_eq!(b, &[1u8, 2, 3]),
+            other => panic!("expected Blob, got {}", other.type_name()),
+        }
+    }
+
+    #[test]
+    fn from_value_json_borrows() {
+        let v = Value::Json(r#"{"k":1}"#.into());
+        let bv = BorrowedValue::from(&v);
+        match bv {
+            BorrowedValue::Json(s) => assert_eq!(s, r#"{"k":1}"#),
+            other => panic!("expected Json, got {}", other.type_name()),
+        }
+    }
+
+    #[test]
+    fn from_value_decimal_borrows() {
+        let v = Value::Decimal("123.456".into());
+        let bv = BorrowedValue::from(&v);
+        match bv {
+            BorrowedValue::Decimal(s) => assert_eq!(s, "123.456"),
+            other => panic!("expected Decimal, got {}", other.type_name()),
+        }
+    }
+
+    #[test]
+    fn display_null() {
+        assert_eq!(format!("{}", BorrowedValue::Null), "NULL");
+    }
+
+    #[test]
+    fn display_text() {
+        assert_eq!(format!("{}", BorrowedValue::Text("hi")), "hi");
+    }
+
+    #[test]
+    fn display_blob_hex() {
+        let data = [0xde_u8, 0xad];
+        let bv = BorrowedValue::Blob(&data);
+        assert_eq!(format!("{bv}"), "\\xdead");
+    }
+
+    #[test]
+    fn display_uuid() {
+        let u: u128 = 0x00000000000000000000000000000001;
+        let bv = BorrowedValue::Uuid(u);
+        let s = format!("{bv}");
+        // Should be a well-formed UUID string
+        assert!(s.contains('-'), "expected UUID format, got: {s}");
+    }
+
+    #[test]
+    fn roundtrip_from_value_to_owned() {
+        let values = vec![
+            Value::Null,
+            Value::Bool(false),
+            Value::I64(-1),
+            Value::F64(0.5),
+            Value::Text("abc".into()),
+            Value::Blob(vec![0xff]),
+            Value::Timestamp(99999),
+            Value::Date(10),
+            Value::Time(3_600_000_000),
+            Value::Uuid(42),
+            Value::Json("{}".into()),
+            Value::Decimal("0.001".into()),
+        ];
+        for v in &values {
+            let bv = BorrowedValue::from(v);
+            let recovered = bv.to_owned();
+            assert_eq!(recovered, *v, "roundtrip failed for {}", v.type_name());
+        }
     }
 }

@@ -1014,6 +1014,22 @@ impl JoinedTable {
         let index = self.op.index();
         match &self.table {
             Table::BTree(btree) => {
+                // WITHOUT ROWID tables store data in an index-format B-Tree whose key is
+                // the PK.  For the execution layer to use the correct B-Tree page format we
+                // must open the "table" cursor as a `BTreeIndex` cursor backed by a
+                // synthetic index (PK columns, has_rowid = false).  The `Column` opcode
+                // still addresses columns by their declaration-order position — this works
+                // because we validated (at CREATE TABLE time) that PK columns are declared
+                // first, making the physical and logical orderings identical.
+                if !btree.has_rowid && index.is_none() {
+                    let synthetic = Index::synthetic_for_without_rowid(btree);
+                    let cursor_id = Some(program.alloc_cursor_id_keyed(
+                        CursorKey::table(self.internal_id),
+                        CursorType::BTreeIndex(synthetic),
+                    ));
+                    return Ok((cursor_id, None));
+                }
+
                 let use_covering_index = self.utilizes_covering_index();
                 let index_is_ephemeral = index.map_or(false, |index| index.ephemeral);
                 let table_not_required =

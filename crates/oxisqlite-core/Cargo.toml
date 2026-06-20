@@ -80,6 +80,10 @@ path = "tests/schema_cookie.rs"
 name = "analyze"
 path = "tests/analyze.rs"
 
+[[test]]
+name = "without_rowid"
+path = "tests/without_rowid.rs"
+
 [dependencies.bitflags]
 version = "2.9.0"
 

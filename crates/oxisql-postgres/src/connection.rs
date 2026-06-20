@@ -418,7 +418,7 @@ impl PgConnection {
     /// use oxisql_postgres::{PgConnection, TlsMode};
     ///
     /// let conn = PgConnection::connect("host=localhost user=postgres", TlsMode::Disabled).await?;
-    /// let token = conn.cancel_token();
+    /// let token = conn.cancel_token().await;
     /// // Spawn a task that cancels after a short delay:
     /// tokio::spawn(async move {
     ///     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1140,7 +1140,7 @@ impl PostgresCancelToken {
     /// use oxisql_postgres::{PgConnection, TlsMode};
     ///
     /// let conn = PgConnection::connect("host=localhost user=postgres", TlsMode::Disabled).await?;
-    /// let token = conn.cancel_token();
+    /// let token = conn.cancel_token().await;
     /// // In another task:
     /// token.cancel_query(tokio_postgres::NoTls).await?;
     /// # Ok(())

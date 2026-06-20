@@ -140,7 +140,9 @@ fn generate_get_description(
      }}",
         enum_name, all_enum_arms
     );
-    enum_impl.parse().unwrap()
+    enum_impl
+        .parse()
+        .expect("generated enum impl should be valid Rust token stream")
 }
 
 /// Register your extension with 'core' by providing the relevant functions
