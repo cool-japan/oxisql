@@ -1,16 +1,26 @@
+#[cfg(feature = "load-extension")]
+use crate::Connection;
 use crate::{
     ext::{register_aggregate_function, register_scalar_function, register_vtab_module},
-    Connection, LimboError,
+    LimboError,
 };
+#[cfg(feature = "load-extension")]
 use libloading::{Library, Symbol};
-use limbo_ext::{ExtensionApi, ExtensionApiRef, ExtensionEntryPoint, ResultCode, VfsImpl};
+use limbo_ext::{ExtensionApi, ResultCode, VfsImpl};
+#[cfg(feature = "load-extension")]
+use limbo_ext::{ExtensionApiRef, ExtensionEntryPoint};
 use std::{
     ffi::{c_char, CString},
     sync::{Arc, Mutex, OnceLock},
 };
 
+// The dynamic (dlopen) extension store is only built when `load-extension` is
+// enabled; the default build keeps `libloading` out of its dependency closure.
+#[cfg(feature = "load-extension")]
 type ExtensionStore = Vec<(Arc<Library>, ExtensionApiRef)>;
+#[cfg(feature = "load-extension")]
 static EXTENSIONS: OnceLock<Arc<Mutex<ExtensionStore>>> = OnceLock::new();
+#[cfg(feature = "load-extension")]
 pub fn get_extension_libraries() -> Arc<Mutex<ExtensionStore>> {
     EXTENSIONS
         .get_or_init(|| Arc::new(Mutex::new(Vec::new())))
@@ -28,13 +38,12 @@ pub struct VfsMod {
 unsafe impl Send for VfsMod {}
 unsafe impl Sync for VfsMod {}
 
+#[cfg(feature = "load-extension")]
 impl Connection {
-    pub fn load_extension<P: AsRef<std::ffi::OsStr>>(
+    pub fn load_extension<P: AsRef<std::ffi::OsStr> + libloading::AsFilename>(
         self: &Arc<Connection>,
         path: P,
     ) -> crate::Result<()> {
-        use limbo_ext::ExtensionApiRef;
-
         let api = Box::new(self.build_limbo_ext());
         let lib =
             unsafe { Library::new(path).map_err(|e| LimboError::ExtensionError(e.to_string()))? };

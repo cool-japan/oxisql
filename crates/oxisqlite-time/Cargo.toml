@@ -34,22 +34,22 @@ crate-type = [
 path = "src/lib.rs"
 
 [dependencies.chrono]
-version = "0.4.39"
+version = "0.4.45"
 
 [dependencies.limbo_ext]
 package = "oxisqlite-ext"
-version = "0.2.0"
+version = "0.3"
 path = "../oxisqlite-ext"
 features = ["static"]
 
 [dependencies.strum]
-version = "0.26.3"
+version = "0.28.0"
 
 [dependencies.strum_macros]
-version = "0.26.3"
+version = "0.28.0"
 
 [dependencies.thiserror]
-version = "2.0.11"
+version = "2.0.18"
 
 [features]
 static = ["limbo_ext/static"]

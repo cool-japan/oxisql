@@ -5,7 +5,7 @@ use crate::function::AlterTableFunc;
 use crate::info;
 use crate::types::Text;
 use crate::util::normalize_ident;
-use crate::{bail_constraint_error, resolve_ext_path, MvStore, Pager, Result, DATABASE_VERSION};
+use crate::{bail_constraint_error, MvStore, Pager, Result, DATABASE_VERSION};
 use crate::{
     error::LimboError,
     ext::ExtValue,
@@ -881,9 +881,19 @@ pub fn op_function(
             }
             #[cfg(feature = "fs")]
             ScalarFunc::LoadExtension => {
-                let extension = &state.registers[*start_reg];
-                let ext = resolve_ext_path(&extension.get_owned_value().to_string())?;
-                program.connection.load_extension(ext)?;
+                #[cfg(feature = "load-extension")]
+                {
+                    let extension = &state.registers[*start_reg];
+                    let ext = crate::resolve_ext_path(&extension.get_owned_value().to_string())?;
+                    program.connection.load_extension(ext)?;
+                }
+                #[cfg(not(feature = "load-extension"))]
+                {
+                    return Err(crate::LimboError::ExtensionError(
+                        "load_extension() requires the `load-extension` feature to be enabled"
+                            .to_string(),
+                    ));
+                }
             }
             ScalarFunc::StrfTime => {
                 let result = exec_strftime(&state.registers[*start_reg..*start_reg + arg_count]);

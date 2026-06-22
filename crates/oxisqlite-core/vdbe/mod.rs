@@ -46,7 +46,7 @@ use builder::CursorKey;
 use execute::{InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState};
 
 use rand::{
-    distributions::{Distribution, Uniform},
+    distr::{Distribution, Uniform},
     Rng,
 };
 use regex::Regex;
@@ -501,7 +501,7 @@ fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut rng: R) -> Result<CursorR
         CursorResult::IO => return Ok(CursorResult::IO),
     };
     if rowid > i64::MAX.try_into().unwrap() {
-        let distribution = Uniform::from(1..=i64::MAX);
+        let distribution = Uniform::new_inclusive(1_i64, i64::MAX).expect("valid range");
         let max_attempts = 100;
         for count in 0..max_attempts {
             rowid = distribution.sample(&mut rng).try_into().unwrap();

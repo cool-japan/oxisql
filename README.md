@@ -17,7 +17,7 @@ path. OxiSQL collapses these into one facade, defaults to Pure Rust drivers
 and routes all TLS through OxiTLS with the rustcrypto provider (no `ring`, no
 `openssl-sys`).
 
-As of 0.2.0 the SQLite path is **genuinely C-free**. It is served by an in-tree
+As of 0.3.0 the default workspace build is additionally **`objc2`-free on macOS**: `objc2-system-configuration` (previously pulled in transitively by `whoami`) has been excised via a vendored `whoami-patched` crate. As of 0.2.0 the SQLite path is **genuinely C-free**. It is served by an in-tree
 fork of the limbo engine (`oxisqlite-*`) from which every C touchpoint has been
 removed — no `libsqlite3`, no `mimalloc`, no `lemon` parser generator. The
 default build of the entire workspace compiles cleanly with the C compiler
@@ -28,9 +28,29 @@ CC=/usr/bin/false cargo build --workspace   # → exit 0
 cargo build --workspace                      # → 0 warnings
 ```
 
-**Version 0.2.1 — 2026-06-20.**
-19 workspace crates · 2,024 tests passing · 0 failing · 0 clippy warnings.
+**Version 0.3.0 — 2026-06-22.**
+20 workspace crates · 2,024 tests passing · 0 failing · 0 clippy warnings.
 ~134,051 lines of Rust across 377 source files.
+
+---
+
+## What's new in 0.3.0
+
+- **`objc2-system-configuration` removed from default dep closure.** The macOS
+  `SCDynamicStore` C/ObjC binding previously pulled in transitively by `whoami`'s
+  `std` feature has been excised. The default `cargo build --workspace` is now
+  100 % `objc2`-free on macOS, closing the last non-pure-Rust gap on Apple
+  platforms under COOLJAPAN Pure Rust Policy v2 §3 (Role-A compliance restored).
+- **`whoami-patched` vendored crate.** A Pure-Rust patch of `whoami` 2.1.2 drops
+  `objc2-system-configuration` from the macOS code path; wired in via
+  `[patch.crates-io]` in the workspace `Cargo.toml`. Not published to crates.io
+  (vendored only).
+- **`oxisqlite-core` pure-Rust I/O backend by default.** The native epoll/kqueue
+  event-loop is now gated behind the `native-io` feature (opt-in). The
+  `load-extension` feature (which pulls `libloading`) is likewise opt-in.
+  Default builds remain 100 % C-free.
+- **`oxitls` dependency bumped to `^0.2.0`.** Resolves the `PENDING-REPUBLISH`
+  dependency block now that `oxitls 0.2.0` has been published to crates.io.
 
 ---
 
@@ -124,8 +144,8 @@ cargo build --workspace                      # → 0 warnings
 
 ## Crate Status
 
-OxiSQL ships as **19 workspace crates**: 10 facade/driver crates, a 7-crate,
-C-free `oxisqlite-*` engine, plus a `perf` benchmark crate and a vendored `rustls-rustcrypto-patched` TLS patch.
+OxiSQL ships as **20 workspace crates**: 10 facade/driver crates, a 7-crate,
+C-free `oxisqlite-*` engine, plus a `perf` benchmark crate, a vendored `rustls-rustcrypto-patched` TLS patch, and a vendored `whoami-patched` crate (Pure-Rust macOS path, `objc2`-free).
 
 ### Facade & drivers (10)
 
@@ -157,9 +177,11 @@ consumed by `oxisql-sqlite-compat` and not part of OxiSQL's public surface.
 | `oxisqlite-time` | Internal | — | Pure-Rust date/time helpers (chrono-based) |
 | `oxisqlite-uuid` | Internal | — | Pure-Rust UUID support |
 
-> A vendored crate, `rustls-rustcrypto-patched`, is applied via
-> `[patch.crates-io]` to fix RUSTSEC-2026-0104. It is **not** a workspace member
-> — see [The C-free oxisqlite engine](#the-c-free-oxisqlite-engine) and
+> Two vendored crates are applied via `[patch.crates-io]`: `rustls-rustcrypto-patched`
+> (fixes RUSTSEC-2026-0104) and `whoami-patched` (drops `objc2-system-configuration`
+> from the macOS code path, restoring Pure Rust Policy v2 §3 compliance). Neither is
+> a workspace member nor published to crates.io — see
+> [The C-free oxisqlite engine](#the-c-free-oxisqlite-engine) and
 > [Pure Rust — FFI eliminated](#pure-rust--ffi-eliminated).
 
 ---
@@ -171,14 +193,14 @@ Add to your workspace's root `Cargo.toml`:
 ```toml
 # Workspace root Cargo.toml
 [workspace.dependencies]
-oxisql = { version = "0.2.1", features = ["embedded"] }
+oxisql = { version = "0.3.0", features = ["embedded"] }
 ```
 
 Or add to a single crate:
 
 ```toml
 [dependencies]
-oxisql = { version = "0.2.1", features = ["embedded", "postgres", "pool-embedded", "migrate"] }
+oxisql = { version = "0.3.0", features = ["embedded", "postgres", "pool-embedded", "migrate"] }
 ```
 
 ---
@@ -417,26 +439,26 @@ cross-backend OLAP queries (filter / projection / limit pushdown).
 
 ```toml
 # In-memory only
-oxisql = { version = "0.2.1", features = ["embedded"] }
+oxisql = { version = "0.3.0", features = ["embedded"] }
 
 # PostgreSQL + pooling
-oxisql = { version = "0.2.1", features = ["postgres", "pool-postgres"] }
+oxisql = { version = "0.3.0", features = ["postgres", "pool-postgres"] }
 
 # MySQL + migrations
-oxisql = { version = "0.2.1", features = ["mysql", "pool-mysql", "migrate"] }
+oxisql = { version = "0.3.0", features = ["mysql", "pool-mysql", "migrate"] }
 
 # C-free SQLite + pooling
-oxisql = { version = "0.2.1", features = ["sqlite", "pool-sqlite-compat"] }
+oxisql = { version = "0.3.0", features = ["sqlite", "pool-sqlite-compat"] }
 
 # All OLTP backends + pooling + migrations
-oxisql = { version = "0.2.1", features = [
+oxisql = { version = "0.3.0", features = [
     "embedded", "postgres", "mysql", "sqlite",
     "pool-embedded", "pool-postgres", "pool-mysql", "pool-sqlite-compat",
     "migrate",
 ] }
 
 # Full stack including DataFusion OLAP and the REPL
-oxisql = { version = "0.2.1", features = [
+oxisql = { version = "0.3.0", features = [
     "embedded", "postgres", "mysql", "sqlite", "datafusion",
     "pool-embedded", "pool-postgres", "pool-mysql",
     "migrate", "repl",

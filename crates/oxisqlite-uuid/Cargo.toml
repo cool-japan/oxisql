@@ -35,12 +35,12 @@ path = "src/lib.rs"
 
 [dependencies.limbo_ext]
 package = "oxisqlite-ext"
-version = "0.2.0"
+version = "0.3"
 path = "../oxisqlite-ext"
 features = ["static"]
 
 [dependencies.uuid]
-version = "1.11.0"
+version = "1.23.3"
 features = [
     "v4",
     "v7",

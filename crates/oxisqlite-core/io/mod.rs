@@ -214,40 +214,41 @@ impl Buffer {
     }
 }
 
+// ---- I/O backend selection -------------------------------------------------
+//
+// By DEFAULT the engine uses the pure, std-blocking `generic` backend
+// (`std::fs` pread/pwrite/sync + `getrandom`; no polling/rustix/libloading), so
+// the default dependency closure stays free of `-sys` / FFI crates.
+//
+// The off-by-default `native-io` feature re-enables the native epoll/kqueue
+// event-loop backend (`unix`, via polling + rustix) on Linux/macOS — a
+// throughput-oriented path that pulls platform `-sys` crates (e.g.
+// linux-raw-sys on Linux). `io_uring` implies `native-io`. Prefer the default
+// pure backend unless you specifically need the async event loop (perf
+// trade-off).
+
+// Linux io_uring backend (opt-in; `io_uring` implies `native-io`).
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
 mod io_uring;
 #[cfg(all(target_os = "linux", feature = "io_uring", feature = "fs"))]
 pub use io_uring::UringIO;
-#[cfg(all(target_os = "linux", feature = "io_uring"))]
-mod unix;
-#[cfg(all(target_os = "linux", feature = "io_uring", feature = "fs"))]
-pub use unix::UnixIO;
-#[cfg(all(target_os = "linux", feature = "io_uring"))]
-pub use unix::UnixIO as SyscallIO;
-#[cfg(all(target_os = "linux", feature = "io_uring"))]
-pub use unix::UnixIO as PlatformIO;
 
-#[cfg(any(
-    all(target_os = "linux", not(feature = "io_uring")),
-    target_os = "macos"
-))]
+// Native epoll/kqueue event-loop backend — compiled only when `native-io`
+// is enabled (and on Linux/macOS).
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "native-io"))]
 mod unix;
-#[cfg(any(
-    all(target_os = "linux", not(feature = "io_uring"), feature = "fs"),
-    all(target_os = "macos", feature = "fs")
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "native-io",
+    feature = "fs"
 ))]
 pub use unix::UnixIO;
-#[cfg(any(
-    all(target_os = "linux", not(feature = "io_uring")),
-    target_os = "macos"
-))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "native-io"))]
 pub use unix::UnixIO as PlatformIO;
-#[cfg(any(
-    all(target_os = "linux", not(feature = "io_uring")),
-    target_os = "macos"
-))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "native-io"))]
 pub use PlatformIO as SyscallIO;
 
+// Windows native backend (unchanged).
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
@@ -255,11 +256,31 @@ pub use windows::WindowsIO as PlatformIO;
 #[cfg(target_os = "windows")]
 pub use PlatformIO as SyscallIO;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+// Pure std-blocking DEFAULT backend: used on every non-Windows target without
+// `native-io`, and on any target outside linux/macos/windows.
+#[cfg(any(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    all(
+        any(target_os = "linux", target_os = "macos"),
+        not(feature = "native-io")
+    )
+))]
 mod generic;
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(any(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    all(
+        any(target_os = "linux", target_os = "macos"),
+        not(feature = "native-io")
+    )
+))]
 pub use generic::GenericIO as PlatformIO;
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(any(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    all(
+        any(target_os = "linux", target_os = "macos"),
+        not(feature = "native-io")
+    )
+))]
 pub use PlatformIO as SyscallIO;
 
 mod memory;
@@ -267,5 +288,9 @@ mod memory;
 mod vfs;
 pub use memory::MemoryIO;
 pub mod clock;
+// `common` (file-lock env knob + cross-process lock test helpers) is only used
+// by the native `unix` / `io_uring` backends, so it is gated with them to keep
+// the pure default build free of dead code.
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "native-io"))]
 mod common;
 pub use clock::Clock;

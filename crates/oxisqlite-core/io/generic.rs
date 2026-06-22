@@ -31,7 +31,6 @@ impl IO for GenericIO {
         let file = file.open(path)?;
         Ok(Arc::new(GenericFile {
             file: RefCell::new(file),
-            memory_io: Arc::new(MemoryIO::new()),
         }))
     }
 
@@ -48,7 +47,7 @@ impl IO for GenericIO {
 
     fn generate_random_number(&self) -> i64 {
         let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).expect("getrandom failed");
+        getrandom::fill(&mut buf).expect("getrandom failed");
         i64::from_ne_bytes(buf)
     }
 
@@ -69,7 +68,6 @@ impl Clock for GenericIO {
 
 pub struct GenericFile {
     file: RefCell<std::fs::File>,
-    memory_io: Arc<MemoryIO>,
 }
 
 unsafe impl Send for GenericFile {}
@@ -118,8 +116,8 @@ impl File for GenericFile {
     }
 
     fn sync(&self, c: Arc<Completion>) -> Result<()> {
-        let mut file = self.file.borrow_mut();
-        file.sync_all().map_err(|err| LimboError::IOError(err))?;
+        let file = self.file.borrow_mut();
+        file.sync_all().map_err(LimboError::IOError)?;
         c.complete(0);
         Ok(())
     }

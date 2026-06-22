@@ -26,8 +26,9 @@ oxisql-mysql          = { workspace = true, optional = true }
 oxisql-postgres       = { workspace = true, optional = true }
 oxisql-sqlite-compat  = { workspace = true, optional = true }
 oxistore-columnar     = { workspace = true, optional = true }
-datafusion  = { workspace = true }
-arrow       = { workspace = true }
+datafusion            = { workspace = true }
+datafusion-datasource = { workspace = true }
+arrow                 = { workspace = true }
 tokio       = { workspace = true }
 async-trait = { workspace = true }
 thiserror   = { workspace = true }

@@ -57,25 +57,25 @@ name = "keyword"
 path = "benches/keyword.rs"
 
 [dependencies.bitflags]
-version = "2.0"
+version = "2.13"
 
 [dependencies.fallible-iterator]
 version = "0.3"
 
 [dependencies.indexmap]
-version = "2.0"
+version = "2.14"
 
 [dependencies.log]
-version = "0.4.22"
+version = "0.4.33"
 
 [dependencies.memchr]
-version = "2.0"
+version = "2.8"
 
 [dependencies.miette]
-version = "7.4.0"
+version = "7.6.0"
 
 [dependencies.phf]
-version = "0.11"
+version = "0.14"
 features = ["uncased"]
 
 [dependencies.serde]
@@ -84,11 +84,11 @@ features = ["derive"]
 optional = true
 
 [dependencies.strum]
-version = "0.26"
+version = "0.28"
 features = ["derive"]
 
 [dependencies.strum_macros]
-version = "0.26"
+version = "0.28"
 
 [dependencies.uncased]
 version = "0.9.10"

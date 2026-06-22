@@ -14,7 +14,6 @@ use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::stats::{ColumnStatistics, Precision};
 use datafusion::common::Statistics;
-use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{
@@ -22,6 +21,7 @@ use datafusion::logical_expr::{
 };
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::scalar::ScalarValue;
+use datafusion_datasource::memory::MemorySourceConfig;
 use oxisql_core::{Row, Value};
 
 use crate::error::OxiSqlFusionError;

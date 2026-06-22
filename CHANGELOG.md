@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-22
+
+### Removed
+
+- **`objc2-system-configuration` removed from default dependency closure** (`oxisqlite-core`): The
+  macOS `SCDynamicStore` C binding previously pulled in transitively by `whoami`'s `std` feature
+  has been excised. The default `cargo build --workspace` is now 100 % `objc2`-free on macOS.
+
+### Added
+
+- **`whoami-patched` vendored crate** (`crates/whoami-patched/`): Pure-Rust patch of `whoami`
+  2.1.2 that drops `objc2-system-configuration` from the macOS code path; wired in via
+  `[patch.crates-io]` in the workspace `Cargo.toml`. Not published to crates.io (vendored only).
+
+### Changed
+
+- **`oxisqlite-core` default I/O backend is now pure-Rust generic**: The native epoll/kqueue
+  event-loop is now gated behind the `native-io` feature (opt-in). The `load-extension` feature
+  (which pulls `libloading`) is likewise opt-in. Default builds remain 100 % C-free.
+- **`oxitls` dependency bumped to `^0.2.0`**: Resolves the `PENDING-REPUBLISH` dependency block
+  now that `oxitls 0.2.0` has been published to crates.io.
+
+### Security
+
+- Clears `PENDING-REPUBLISH` status: `objc2-system-configuration` (a macOS C/ObjC binding) no
+  longer appears in the `--all-features` dependency closure. COOLJAPAN Pure Rust Policy v2 §3
+  Role-A compliance restored for the macOS target.
+
 ## [0.2.1] - 2026-06-20
 
 ### Added
@@ -320,7 +348,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Statement cache infrastructure: 128-slot LRU cache keyed by rewritten SQL text is in
   place; activates once limbo fixes the `Statement::reset()` / `Program::n_change` bug.
 
-[Unreleased]: https://github.com/cool-japan/oxisql/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/cool-japan/oxisql/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/cool-japan/oxisql/releases/tag/v0.3.0
 [0.2.1]: https://github.com/cool-japan/oxisql/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/cool-japan/oxisql/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/cool-japan/oxisql/compare/v0.1.1...v0.1.2

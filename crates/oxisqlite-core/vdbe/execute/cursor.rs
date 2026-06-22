@@ -19,7 +19,7 @@ use crate::{
     vdbe::{builder::CursorType, insn::Insn},
 };
 use parking_lot::RwLock;
-use rand::thread_rng;
+use rand::rng as thread_rng;
 use std::cell::RefCell;
 use std::{rc::Rc, sync::Arc};
 

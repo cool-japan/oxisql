@@ -167,7 +167,7 @@ impl Value {
     }
     pub fn exec_random() -> Self {
         let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).unwrap();
+        getrandom::fill(&mut buf).unwrap();
         let random_number = i64::from_ne_bytes(buf);
         Value::Integer(random_number)
     }
@@ -180,7 +180,7 @@ impl Value {
         }
         .max(1) as usize;
         let mut blob: Vec<u8> = vec![0; length];
-        getrandom::getrandom(&mut blob).expect("Failed to generate random blob");
+        getrandom::fill(&mut blob).expect("Failed to generate random blob");
         Value::Blob(blob)
     }
     pub fn exec_quote(&self) -> Self {

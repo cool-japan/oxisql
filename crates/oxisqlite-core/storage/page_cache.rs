@@ -590,10 +590,8 @@ mod tests {
     use std::{cell::RefCell, num::NonZeroUsize, pin::Pin, rc::Rc, sync::Arc};
 
     use lru::LruCache;
-    use rand_chacha::{
-        rand_core::{RngCore, SeedableRng},
-        ChaCha8Rng,
-    };
+    use rand::Rng;
+    use rand_chacha::{rand_core::SeedableRng, ChaCha8Rng};
 
     fn create_key(id: usize) -> PageCacheKey {
         PageCacheKey::new(id)

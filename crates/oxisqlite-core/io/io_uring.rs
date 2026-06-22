@@ -207,7 +207,7 @@ impl IO for UringIO {
 
     fn generate_random_number(&self) -> i64 {
         let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).expect("getrandom failed");
+        getrandom::fill(&mut buf).expect("getrandom failed");
         i64::from_ne_bytes(buf)
     }
 

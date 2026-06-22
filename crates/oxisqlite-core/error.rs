@@ -28,7 +28,7 @@ pub enum LimboError {
     UringIOError(String),
     #[error("Locking error: {0}")]
     LockingError(String),
-    #[cfg(target_family = "unix")]
+    #[cfg(all(target_family = "unix", feature = "native-io"))]
     #[error("I/O error: {0}")]
     RustixIOError(#[from] rustix::io::Errno),
     #[error("Parse error: {0}")]

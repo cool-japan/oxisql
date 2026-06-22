@@ -31,7 +31,7 @@ path = "src/lib.rs"
 
 [dependencies.limbo_macros]
 package = "oxisqlite-macros"
-version = "0.2.0"
+version = "0.3"
 path = "../oxisqlite-macros"
 
 [features]
@@ -40,7 +40,7 @@ static = []
 vfs = []
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies.chrono]
-version = "0.4.40"
+version = "0.4.45"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies.getrandom]
-version = "0.3.1"
+version = "0.4.3"

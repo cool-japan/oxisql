@@ -39,11 +39,8 @@ mod tests_2 {
         types::Value,
         Database, Page, Pager, PlatformIO,
     };
-    use rand::{thread_rng, Rng};
-    use rand_chacha::{
-        rand_core::{RngCore, SeedableRng},
-        ChaCha8Rng,
-    };
+    use rand::{rng as thread_rng, Rng};
+    use rand_chacha::{rand_core::SeedableRng, ChaCha8Rng};
     use sorted_vec::SortedVec;
     use std::{
         cell::RefCell, collections::HashSet, mem::transmute, ops::Deref, panic, rc::Rc, sync::Arc,

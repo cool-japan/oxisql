@@ -37,21 +37,30 @@ path = "examples/example.rs"
 name = "integration_tests"
 path = "tests/integration_tests.rs"
 
+# Use oxisqlite-core's pure, std-blocking default I/O backend so the default
+# dependency closure stays free of `-sys` crates. The native event-loop /
+# io_uring backends are opt-in via the forwarding features below.
 [dependencies.limbo_core]
 package = "oxisqlite-core"
-version = "0.2.0"
+version = "0.3"
 path = "../oxisqlite-core"
-features = ["io_uring"]
 
 [dependencies.thiserror]
-version = "2.0.9"
+version = "2.0.18"
 
 [dev-dependencies.tempfile]
-version = "3.20.0"
+version = "3.27.0"
 
 [dev-dependencies.tokio]
-version = "1.29.1"
+version = "1.52.3"
 features = ["full"]
 
 [features]
 index_experimental = ["limbo_core/index_experimental"]
+# Opt-in: native epoll/kqueue event-loop I/O backend (pulls platform `-sys`
+# crates, e.g. linux-raw-sys; see oxisqlite-core). Off by default.
+native-io = ["limbo_core/native-io"]
+# Opt-in: Linux io_uring backend (implies native-io). Off by default.
+io_uring = ["limbo_core/io_uring"]
+# Opt-in: dynamic (dlopen) SQL extension loading. Off by default.
+load-extension = ["limbo_core/load-extension"]

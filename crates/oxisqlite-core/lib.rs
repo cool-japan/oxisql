@@ -116,7 +116,7 @@ use core::str;
 pub use error::LimboError;
 use fallible_iterator::FallibleIterator;
 pub use io::clock::{Clock, Instant};
-#[cfg(all(feature = "fs", target_family = "unix"))]
+#[cfg(all(feature = "fs", target_family = "unix", feature = "native-io"))]
 pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring"))]
 pub use io::UringIO;
