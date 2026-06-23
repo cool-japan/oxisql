@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.89"
 authors = ["COOLJAPAN OU (Team Kitasan)"]
@@ -42,9 +42,14 @@ oxisql-migrate        = { path = "crates/oxisql-migrate",        version = "0.3"
 oxisql-sqlite-compat  = { path = "crates/oxisql-sqlite-compat",  version = "0.3" }
 
 # DataFusion backend — default-features=false avoids parquet/compression *-sys crates
+# arrow must match the version datafusion 54 (latest release) re-exports: 58.3.0.
+# This forces oxistore-columnar to stay on the 0.1.x line (0.1.3): its 0.2.0 moved
+# to arrow/parquet 59.0.0, which conflicts with datafusion 54 (two arrow versions →
+# E0308 in oxisql-datafusion). Do NOT bump oxistore-columnar to 0.2.x until a
+# datafusion release built on arrow 59 exists.
 datafusion            = { version = "54.0.0", default-features = false, features = ["sql"] }
 datafusion-datasource = { version = "54.0.0", default-features = false }
-arrow                 = { version = "59.0.0" }
+arrow                 = { version = "58.3.0" }
 thiserror  = { version = "2.0.18" }
 
 async-trait = { version = "0.1.89" }
@@ -112,6 +117,7 @@ proptest  = { version = "1.11.0", default-features = false, features = ["std"] }
 serde_json = { version = "1" }
 
 # OxiStore columnar Parquet backend (Pure Rust, optional)
+# Pinned to the 0.1.x line — see the arrow/datafusion note above before bumping to 0.2.x.
 oxistore-columnar = { version = "0.1.3" }
 
 # ── Security patches ───────────────────────────────────────────────────────────

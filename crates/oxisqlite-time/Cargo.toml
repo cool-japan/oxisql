@@ -27,10 +27,7 @@ repository = "https://github.com/cool-japan/oxisql"
 
 [lib]
 name = "limbo_time"
-crate-type = [
-    "cdylib",
-    "lib",
-]
+crate-type = ["lib"]
 path = "src/lib.rs"
 
 [dependencies.chrono]

@@ -28,9 +28,27 @@ CC=/usr/bin/false cargo build --workspace   # → exit 0
 cargo build --workspace                      # → 0 warnings
 ```
 
-**Version 0.3.0 — 2026-06-22.**
+**Version 0.3.1 — 2026-06-23.**
 20 workspace crates · 2,024 tests passing · 0 failing · 0 clippy warnings.
-~134,051 lines of Rust across 377 source files.
+~136,360 lines of Rust across 397 source files.
+
+---
+
+## What's new in 0.3.1
+
+- **DataFusion 54 compatibility (`oxisql-datafusion`).** Removed `as_any()`
+  overrides from `TableProvider` and `ExecutionPlan` impls in `parquet.rs`,
+  `provider.rs`, and `stream.rs` — the method was removed from both traits in
+  DataFusion 54, so the overrides were dead code. `arrow` pinned to `58.3.0` to
+  match DataFusion 54's re-exported version (`oxistore-columnar` also pins
+  `58.3.0`; arrow 59 has no compatible DataFusion 54 release).
+- **`oxistore-columnar` updated to `0.2.0`.** Pulls in the latest columnar
+  Parquet-backend release.
+- **`FlamegraphProfiler` benchmark utility (`oxisqlite-core`).** New
+  `benches/common/profiler.rs` implements a Criterion 0.8-compatible `Profiler`
+  backed by `pprof`, emitting per-benchmark flamegraph SVGs when run with
+  `--profile-time`. Avoids the `criterion` 0.5 ↔ 0.8 version conflict that
+  `pprof`'s bundled integration introduced.
 
 ---
 
@@ -193,14 +211,14 @@ Add to your workspace's root `Cargo.toml`:
 ```toml
 # Workspace root Cargo.toml
 [workspace.dependencies]
-oxisql = { version = "0.3.0", features = ["embedded"] }
+oxisql = { version = "0.3.1", features = ["embedded"] }
 ```
 
 Or add to a single crate:
 
 ```toml
 [dependencies]
-oxisql = { version = "0.3.0", features = ["embedded", "postgres", "pool-embedded", "migrate"] }
+oxisql = { version = "0.3.1", features = ["embedded", "postgres", "pool-embedded", "migrate"] }
 ```
 
 ---
@@ -439,26 +457,26 @@ cross-backend OLAP queries (filter / projection / limit pushdown).
 
 ```toml
 # In-memory only
-oxisql = { version = "0.3.0", features = ["embedded"] }
+oxisql = { version = "0.3.1", features = ["embedded"] }
 
 # PostgreSQL + pooling
-oxisql = { version = "0.3.0", features = ["postgres", "pool-postgres"] }
+oxisql = { version = "0.3.1", features = ["postgres", "pool-postgres"] }
 
 # MySQL + migrations
-oxisql = { version = "0.3.0", features = ["mysql", "pool-mysql", "migrate"] }
+oxisql = { version = "0.3.1", features = ["mysql", "pool-mysql", "migrate"] }
 
 # C-free SQLite + pooling
-oxisql = { version = "0.3.0", features = ["sqlite", "pool-sqlite-compat"] }
+oxisql = { version = "0.3.1", features = ["sqlite", "pool-sqlite-compat"] }
 
 # All OLTP backends + pooling + migrations
-oxisql = { version = "0.3.0", features = [
+oxisql = { version = "0.3.1", features = [
     "embedded", "postgres", "mysql", "sqlite",
     "pool-embedded", "pool-postgres", "pool-mysql", "pool-sqlite-compat",
     "migrate",
 ] }
 
 # Full stack including DataFusion OLAP and the REPL
-oxisql = { version = "0.3.0", features = [
+oxisql = { version = "0.3.1", features = [
     "embedded", "postgres", "mysql", "sqlite", "datafusion",
     "pool-embedded", "pool-postgres", "pool-mysql",
     "migrate", "repl",

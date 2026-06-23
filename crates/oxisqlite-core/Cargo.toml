@@ -270,7 +270,6 @@ optional = true
 [target.'cfg(not(target_family = "windows"))'.dev-dependencies.pprof]
 version = "0.15.0"
 features = [
-    "criterion",
     "flamegraph",
 ]
 

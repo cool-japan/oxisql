@@ -5,7 +5,6 @@
 //! drive a real `oxisql_core::Connection` at plan time and yield batches
 //! incrementally.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -629,10 +628,6 @@ fn hash_value(val: &Value) -> u64 {
 
 #[async_trait]
 impl TableProvider for OxiSqlTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

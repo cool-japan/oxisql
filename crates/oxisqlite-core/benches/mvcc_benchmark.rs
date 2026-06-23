@@ -2,7 +2,8 @@ use criterion::async_executor::FuturesExecutor;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use limbo_core::mvcc::clock::LocalClock;
 use limbo_core::mvcc::database::{MvStore, Row, RowID};
-use pprof::criterion::{Output, PProfProfiler};
+mod common;
+use common::profiler::FlamegraphProfiler;
 
 fn bench_db() -> MvStore<LocalClock> {
     let clock = LocalClock::default();
@@ -123,7 +124,7 @@ fn bench(c: &mut Criterion) {
 
 criterion_group! {
     name = benches;
-    config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+    config = Criterion::default().with_profiler(FlamegraphProfiler::new(100));
     targets = bench
 }
 criterion_main!(benches);

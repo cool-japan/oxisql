@@ -1,8 +1,11 @@
+use std::hint::black_box;
 use std::sync::Arc;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
 use limbo_core::{Database, PlatformIO, IO as _};
-use pprof::criterion::{Output, PProfProfiler};
+
+mod common;
+use common::profiler::FlamegraphProfiler;
 
 const TPC_H_PATH: &str = "../perf/tpc-h/TPC-H.db";
 
@@ -106,7 +109,7 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
 
 criterion_group! {
     name = benches;
-    config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+    config = Criterion::default().with_profiler(FlamegraphProfiler::new(100));
     targets = bench_tpc_h_queries
 }
 criterion_main!(benches);

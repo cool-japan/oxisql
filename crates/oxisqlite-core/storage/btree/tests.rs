@@ -39,7 +39,7 @@ mod tests_2 {
         types::Value,
         Database, Page, Pager, PlatformIO,
     };
-    use rand::{rng as thread_rng, Rng};
+    use rand::{rng as thread_rng, Rng, RngExt};
     use rand_chacha::{rand_core::SeedableRng, ChaCha8Rng};
     use sorted_vec::SortedVec;
     use std::{
@@ -1103,7 +1103,7 @@ mod tests_2 {
         let mut cells = Vec::new();
         let usable_space = 4096;
         let mut i = 100000;
-        let seed = thread_rng().gen();
+        let seed = thread_rng().random();
         tracing::info!("seed {}", seed);
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         while i > 0 {

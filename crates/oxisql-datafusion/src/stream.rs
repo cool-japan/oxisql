@@ -7,7 +7,6 @@
 //!
 //! [`OxiSqlTableProvider`]: crate::OxiSqlTableProvider
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -355,10 +354,6 @@ impl fmt::Debug for OxiSqlStreamProvider {
 
 #[async_trait]
 impl TableProvider for OxiSqlStreamProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -668,10 +663,6 @@ impl ExecutionPlan for OxiSqlExecPlan {
         "OxiSqlExecPlan"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
@@ -772,10 +763,6 @@ impl DisplayAs for OxiSqlMultiPartExecPlan {
 impl ExecutionPlan for OxiSqlMultiPartExecPlan {
     fn name(&self) -> &'static str {
         "OxiSqlMultiPartExecPlan"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

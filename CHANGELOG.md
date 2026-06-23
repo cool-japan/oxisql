@@ -5,7 +5,31 @@ All notable changes to OxiSQL will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.1] - 2026-06-23
+
+### Added
+
+- **`FlamegraphProfiler` benchmark utility** (`oxisqlite-core`): new `benches/common/profiler.rs`
+  implements a custom Criterion 0.8-compatible `Profiler` backed by `pprof`. It emits a
+  `flamegraph.svg` into each benchmark's output directory when run with `--profile-time`. This
+  avoids the criterion version conflict introduced by `pprof`'s bundled `PProfProfiler` (still
+  pinned to criterion 0.5).
+
+### Changed
+
+- **`arrow` pinned to `58.3.0`** (workspace): downgraded from `59.0.0` to match the version
+  DataFusion 54 re-exports; `arrow 59` has no compatible DataFusion release and
+  `oxistore-columnar` also pins `58.3.0`.
+- **`oxistore-columnar` updated to `0.2.0`** (workspace): pulls in the latest columnar
+  Parquet-backend release.
+- **`as_any()` overrides removed** (`oxisql-datafusion`): `TableProvider` and `ExecutionPlan`
+  impls in `parquet.rs`, `provider.rs`, and `stream.rs` no longer override `as_any()` — the
+  method was removed from both traits in DataFusion 54, so the overrides were dead code.
+
+### Fixed
+
+- **`rand` 0.9 API compatibility** (`oxisqlite-core` btree tests): replaced deprecated
+  `Rng::gen()` with `RngExt::random()` in the B-Tree stress test.
 
 ## [0.3.0] - 2026-06-22
 
@@ -348,7 +372,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Statement cache infrastructure: 128-slot LRU cache keyed by rewritten SQL text is in
   place; activates once limbo fixes the `Statement::reset()` / `Program::n_change` bug.
 
-[Unreleased]: https://github.com/cool-japan/oxisql/compare/v0.3.0...HEAD
+[0.3.1]: https://github.com/cool-japan/oxisql/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/cool-japan/oxisql/releases/tag/v0.3.0
 [0.2.1]: https://github.com/cool-japan/oxisql/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/cool-japan/oxisql/compare/v0.1.2...v0.2.0

@@ -19,7 +19,6 @@
 //! # }
 //! ```
 
-use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -70,10 +69,6 @@ impl ParquetTableProvider {
 
 #[async_trait]
 impl TableProvider for ParquetTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

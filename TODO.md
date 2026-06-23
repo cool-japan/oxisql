@@ -1,9 +1,9 @@
-# OxiSQL TODO — v0.3.0
+# OxiSQL TODO — v0.3.1
 
-Last updated: 2026-06-22
+Last updated: 2026-06-23
 
 MSRV 1.89 · License Apache-2.0 · 20 workspace crates (10 facade/drivers + 7 C-free
-oxisqlite-* engine + 3 ancillary) · ~134,051 lines of Rust across 377 `.rs` files
+oxisqlite-* engine + 3 ancillary) · ~136,360 lines of Rust across 397 `.rs` files
 (≈34.9k facade/drivers + ≈81.2k engine + ≈2.1k vendored TLS patch) · 2,024 tests
 passing (nextest), 0 failing (≈85 skipped, mostly live-server-gated) · 0 build warnings ·
 C-free proven (`CC=/usr/bin/false cargo build --workspace` → EXIT 0) ·
@@ -20,6 +20,7 @@ rsa Marvin, rustls-pemfile).
 - [x] **0.2.0** released (2026-06-17) — ANALYZE/System-R optimizer, UPSERT, execute/schema module splits, schema-cookie invalidation, blocking API, correlated subqueries, 1,997 tests.
 - [x] **0.2.1** released (2026-06-20) — WITHOUT ROWID table support, `BorrowedValue<'a>` zero-alloc SQL value view, B-tree module split, doc-test fix (cancel_token), 2,024 tests.
 - [x] **0.3.0** released (2026-06-22) — objc2-system-configuration removed from default dep closure, whoami-patched vendored crate, oxisqlite-core pure I/O backend, oxitls ^0.2.0.
+- [x] **0.3.1** released (2026-06-23) — DataFusion 54 compatibility (arrow 58.3.0 pin, as_any() removed), oxistore-columnar 0.2.0, FlamegraphProfiler benchmark utility, rand 0.9 API fix.
 
 ## Done in 0.1.2
 

@@ -1,7 +1,11 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use limbo_core::{Database, PlatformIO, IO};
-use pprof::criterion::{Output, PProfProfiler};
+use std::hint::black_box;
 use std::sync::Arc;
+
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use limbo_core::{Database, PlatformIO, IO};
+
+mod common;
+use common::profiler::FlamegraphProfiler;
 
 fn bench_prepare_query(criterion: &mut Criterion) {
     #[allow(clippy::arc_with_non_send_sync)]
@@ -148,7 +152,7 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
 
 criterion_group! {
     name = benches;
-    config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+    config = Criterion::default().with_profiler(FlamegraphProfiler::new(100));
     targets = bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count
 }
 criterion_main!(benches);

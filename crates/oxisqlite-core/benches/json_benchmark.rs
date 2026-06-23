@@ -1,9 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use limbo_core::{Database, PlatformIO, IO};
-use pprof::{
-    criterion::{Output, PProfProfiler},
-    flamegraph::Options,
-};
+mod common;
+use common::profiler::FlamegraphProfiler;
 use std::sync::Arc;
 
 // Title: JSONB Function Benchmarking
@@ -881,7 +879,7 @@ fn bench_json_patch(criterion: &mut Criterion) {
 
 criterion_group! {
     name = benches;
-    config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(Some(Options::default()))));
+    config = Criterion::default().with_profiler(FlamegraphProfiler::new(100));
     targets = bench, bench_sequential_jsonb, bench_json_patch
 }
 
