@@ -10,7 +10,7 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-edition = "2021"
+edition.workspace = true
 name = "oxisqlite-uuid"
 version.workspace = true
 authors = ["the Limbo authors"]
@@ -21,9 +21,11 @@ autoexamples = false
 autotests = false
 autobenches = false
 description = "oxisqlite-uuid — UUID extension for the Pure-Rust oxisqlite engine (C-free fork of limbo)"
-readme = false
+readme = "README.md"
+categories = ["database", "data-structures"]
+keywords = ["sqlite", "uuid", "sql", "extension", "guid"]
 license.workspace = true
-repository = "https://github.com/cool-japan/oxisql"
+repository.workspace = true
 
 [lib]
 name = "limbo_uuid"
@@ -37,7 +39,7 @@ path = "../oxisqlite-ext"
 features = ["static"]
 
 [dependencies.uuid]
-version = "1.23.3"
+version = "1.23.4"
 features = [
     "v4",
     "v7",

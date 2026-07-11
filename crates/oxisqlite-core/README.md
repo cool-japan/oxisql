@@ -17,8 +17,8 @@ It contains:
 - the SQL **built-in functions**.
 
 - **Role:** engine core (interpreter, storage, translation, functions).
-- **Version:** 0.2.1 (Unreleased).
-- **Tests:** 636 passing (all-features), 640 with `index_experimental`, 13 skipped.
+- **Version:** 0.3.2 (2026-07-11).
+- **Tests:** 656 passing (all-features, which already enables `index_experimental`), 13 skipped.
 - **Approx LOC:** ~82,000 (after execute/ + schema/ module splits).
 - **Pure Rust / no C:** 100% Rust. No C allocator, no C parser generator, no
   `cc` / `build.rs`. `CC=/usr/bin/false cargo build` succeeds.

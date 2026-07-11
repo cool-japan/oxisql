@@ -2,7 +2,7 @@
 
 ## Status
 
-**Stable** · version 0.1.2 (in development, branch 0.1.2) · **80 tests**
+**Stable** · version 0.3.2 · **80 tests**
 (`--all-features`; 2 `#[ignore]`d are live-server-gated portability tests).
 
 Unified Pure-Rust SQL facade: a single URI string selects the backend and the

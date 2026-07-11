@@ -943,10 +943,27 @@ pub fn group_by_emit_row_phase<'a>(
     program.resolve_label(labels.label_subrtn_acc_clear, program.offset());
     let start_reg = registers.reg_non_aggregate_exprs_acc;
 
-    // Reset all accumulator registers to NULL
+    // Reset the per-group accumulator registers to NULL so the next group's first
+    // AggStep starts a fresh aggregate context (this is the equivalent of SQLite
+    // emitting OP_Null over the accumulators at each new group).
+    //
+    // The range must reach through the END of the aggregate-accumulator block.
+    // `group_by_sorter_column_count()` counts one column per aggregate *argument*,
+    // which under-counts whenever an aggregate has fewer arguments than it has
+    // accumulator registers (e.g. a zero-argument `COUNT(*)`): the trailing
+    // aggregate register would then keep its finalized value from the previous
+    // group. We therefore extend the range to also cover the whole aggregate block
+    // — `max` guarantees we never reset fewer registers than before.
+    let sorter_span_end = start_reg + plan.group_by_sorter_column_count().saturating_sub(1);
+    let dest_end = match t_ctx.reg_agg_start {
+        Some(agg_start) if !plan.aggregates.is_empty() => {
+            sorter_span_end.max(agg_start + plan.aggregates.len() - 1)
+        }
+        _ => sorter_span_end,
+    };
     program.emit_insn(Insn::Null {
         dest: start_reg,
-        dest_end: Some(start_reg + plan.group_by_sorter_column_count() - 1),
+        dest_end: Some(dest_end),
     });
 
     // Reopen ephemeral indexes for distinct aggregates (effectively clearing them).

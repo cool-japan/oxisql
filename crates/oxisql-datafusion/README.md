@@ -142,7 +142,7 @@ Filters on the snapshot provider are reported as `Inexact`, so DataFusion still 
 
 ## Test coverage
 
-**57 tests pass** (4 ignored: 2 live-server backend tests for the optional `mysql`/`postgres` backends, plus 2 rustdoc-ignored examples). This crate is part of a workspace where **1,720 tests pass** in total.
+**87 tests pass** (4 ignored: 2 live-server tests for the optional `postgres` backend, 2 for the optional `mysql` backend). This crate is part of a workspace where **2,030 tests pass** in total.
 
 ## Part of the OxiSQL workspace
 

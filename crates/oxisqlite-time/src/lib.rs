@@ -1,3 +1,8 @@
+//! Date/time SQL function extension for the C-free **oxisqlite** engine.
+//!
+//! Registers `time_now`, `time_date`, `make_date`, `make_timestamp`, and the
+//! `time_get*` component-accessor scalar SQL functions (year, month, day,
+//! weekday, ISO year, ...) through the `oxisqlite-ext` extension API.
 use std::str::FromStr as _;
 
 use chrono::prelude::*;

@@ -5,6 +5,46 @@ All notable changes to OxiSQL will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-07-11
+
+### Added
+
+- **`zstd-shim` crate** (`crates/zstd-shim/`): a local, non-published Pure-Rust `zstd`-API
+  shim backed by `oxiarc-zstd`, wired in via `[patch.crates-io]`
+  (`zstd = { path = "crates/zstd-shim" }`). Implements only the surface `arrow-ipc` (via
+  DataFusion) actually uses — `bulk::{Compressor, Decompressor}` and
+  `DEFAULT_COMPRESSION_LEVEL` — so the `--all-features` dependency closure no longer pulls
+  the C-FFI `zstd-sys` crate (COOLJAPAN Pure Rust Policy v2 / OxiARC-only compression
+  policy).
+
+### Changed
+
+- **`oxiarc-zstd` bumped to `0.3.5`** (`crates/zstd-shim`): two successive dependency
+  version bumps for the new zstd shim.
+- **`time` updated to `0.3.53`, `uuid` updated to `1.23.4`** (workspace): routine
+  dependency bumps; `uuid` also bumped to match in `oxisqlite-uuid`.
+- **`env_logger` updated to `0.11.11`, `io-uring` updated to `0.7.13`**
+  (`oxisqlite-core`): dev-dependency and Linux target-specific dependency bumps.
+- **`op_agg_step` accumulator initialization hardened** (`oxisqlite-core` VDBE): now
+  re-initializes whenever a register does not already hold an `AggContext` (previously
+  only on `Value::Null`), and `Max`/`Min` no longer type-match the first column value up
+  front — both changes make accumulator init self-healing against stale state left over
+  from a previous `GROUP BY` group. Internal invariant violations now return
+  `LimboError::InternalError` instead of `panic!()`.
+
+### Fixed
+
+- **`GROUP BY` aggregate accumulator reset range** (`oxisqlite-core` query
+  planner/VDBE): fixed a bug where `COUNT(*)` / `COUNT()` reached via `HAVING`,
+  `ORDER BY`, or a nested expression (as opposed to a result column) was planned with
+  zero arguments, undercounting its sorter-column span and leaving its accumulator
+  register unreset across group boundaries — causing out-of-bounds sorter reads and
+  stale-accumulator panics on multi-group `GROUP BY ... HAVING COUNT(*) ...` queries.
+  `COUNT(*)` now carries the same synthetic literal-`1` argument the result-column path
+  already used, and the accumulator-clear range in `group_by_emit_row_phase` now covers
+  the full aggregate block rather than just the (potentially under-counted)
+  sorter-column span. New regression coverage in `tests/group_by_having.rs`.
+
 ## [0.3.1] - 2026-06-23
 
 ### Added
@@ -372,6 +412,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Statement cache infrastructure: 128-slot LRU cache keyed by rewritten SQL text is in
   place; activates once limbo fixes the `Statement::reset()` / `Program::n_change` bug.
 
+[0.3.2]: https://github.com/cool-japan/oxisql/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/cool-japan/oxisql/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/cool-japan/oxisql/releases/tag/v0.3.0
 [0.2.1]: https://github.com/cool-japan/oxisql/compare/v0.2.0...v0.2.1

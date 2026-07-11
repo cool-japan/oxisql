@@ -1,4 +1,10 @@
 // UPSTREAM: vendored Limbo fork — allow upstream style
+//! Procedural macros backing the `oxisqlite-ext` extension API, part of the
+//! C-free **oxisqlite** engine (a Pure-Rust fork of limbo 0.0.22).
+//!
+//! Provides the `scalar` attribute macro, the `AggregateDerive`,
+//! `VTabModuleDerive`, and `VfsDerive` derive macros, and the
+//! `register_extension!` macro that wires them into the engine.
 #![allow(
     rustdoc::bare_urls,
     rustdoc::invalid_html_tags,

@@ -1,6 +1,6 @@
 # oxisql-postgres — TODO
 
-**Status: Stable** · v0.1.2 (in development, branch `0.1.2`) · MSRV 1.89 · edition 2021 · Apache-2.0
+**Status: Stable** · v0.3.2 · MSRV 1.89 · edition 2021 · Apache-2.0
 
 Pure-Rust PostgreSQL backend over `tokio-postgres` (Frontend/Backend Protocol v3),
 no `libpq` and no `openssl-sys`. `PgConnection` implements `oxisql_core::Connection`

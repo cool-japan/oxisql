@@ -2,7 +2,7 @@
 
 ## Status
 
-**Stable** · version 0.1.2 (in development, branch 0.1.2) · **129 tests**.
+**Stable** · version 0.3.2 · **129 tests**.
 
 A `sqlparser` facade with dialect-aware parsing, a fluent `QueryBuilder`, a
 logical planner, a rule-based optimizer, DML planning, a cost model, a schema

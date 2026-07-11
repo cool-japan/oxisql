@@ -10,7 +10,7 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-edition = "2021"
+edition.workspace = true
 name = "oxisqlite"
 version.workspace = true
 authors = ["the Limbo authors"]
@@ -21,9 +21,11 @@ autoexamples = false
 autotests = false
 autobenches = false
 description = "oxisqlite Pure-Rust SQLite-compatible engine (C-free fork of limbo)"
-readme = false
+readme = "README.md"
+categories = ["database", "embedded"]
+keywords = ["sqlite", "sql", "database", "embedded", "limbo"]
 license.workspace = true
-repository = "https://github.com/cool-japan/oxisql"
+repository.workspace = true
 
 [lib]
 name = "limbo"
@@ -46,10 +48,10 @@ version = "0.3"
 path = "../oxisqlite-core"
 
 [dependencies.thiserror]
-version = "2.0.18"
+workspace = true
 
 [dev-dependencies.tempfile]
-version = "3.27.0"
+workspace = true
 
 [dev-dependencies.tokio]
 version = "1.52.3"

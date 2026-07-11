@@ -1,6 +1,6 @@
 # oxisql-pool — TODO
 
-## Status: Stable (0.1.2)
+## Status: Stable (0.3.2)
 
 Pure Rust core, `#![forbid(unsafe_code)]`. Four pool backends behind opt-in
 features: `postgres` (`deadpool-postgres` wrapper), `mysql` (custom

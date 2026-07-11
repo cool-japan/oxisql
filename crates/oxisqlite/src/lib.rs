@@ -1,4 +1,10 @@
 // UPSTREAM: vendored Limbo fork — allow upstream style
+//! Top-level facade of the C-free **oxisqlite** engine, a Pure-Rust fork of
+//! limbo 0.0.22 and entry point for the `oxisql-sqlite-compat` backend.
+//!
+//! Re-exports `Connection`, `Statement`, `params`/`params_from_iter`, and
+//! `Value` as a thin, ergonomic wrapper; bytecode execution, storage, and
+//! SQL processing all live in `oxisqlite-core`.
 #![allow(
     rustdoc::bare_urls,
     rustdoc::invalid_html_tags,

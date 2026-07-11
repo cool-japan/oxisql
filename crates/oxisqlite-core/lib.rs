@@ -1,4 +1,10 @@
 // vendored from limbo 0.0.22 upstream — upstream URLs/HTML in doc comments
+//! Core engine of the C-free **oxisqlite** SQLite-compatible database, a
+//! Pure-Rust fork of limbo 0.0.22 powering the `oxisql-sqlite-compat` backend.
+//!
+//! Implements the VDBE bytecode interpreter, B-tree storage/pager/WAL, a
+//! System-R cost-based SQL query planner, MVCC transactions (`ROLLBACK`,
+//! `SAVEPOINT`), `UPSERT`, and JSON/JSONB support.
 #![allow(
     rustdoc::bare_urls,
     rustdoc::invalid_html_tags,

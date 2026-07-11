@@ -10,7 +10,7 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-edition = "2021"
+edition.workspace = true
 name = "oxisqlite-ext"
 version.workspace = true
 authors = ["the Limbo authors"]
@@ -22,8 +22,10 @@ autotests = false
 autobenches = false
 description = "oxisqlite-ext — extension API for the Pure-Rust oxisqlite engine (C-free fork of limbo)"
 readme = "README.md"
+categories = ["database"]
+keywords = ["sqlite", "extension", "database", "vtab", "udf"]
 license.workspace = true
-repository = "https://github.com/cool-japan/oxisql"
+repository.workspace = true
 
 [lib]
 name = "limbo_ext"
@@ -40,7 +42,8 @@ static = []
 vfs = []
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies.chrono]
-version = "0.4.45"
+workspace = true
+features = ["clock", "oldtime", "wasmbind"]
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies.getrandom]
-version = "0.4.3"
+workspace = true

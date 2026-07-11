@@ -10,7 +10,7 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-edition = "2021"
+edition.workspace = true
 name = "oxisqlite-core"
 version.workspace = true
 authors = ["the Limbo authors"]
@@ -20,9 +20,11 @@ autoexamples = false
 autotests = false
 autobenches = false
 description = "oxisqlite-core — core engine of the Pure-Rust SQLite-compatible oxisqlite fork (C-free)"
-readme = false
+readme = "README.md"
+categories = ["database", "embedded"]
+keywords = ["sqlite", "database", "sql", "embedded", "btree"]
 license.workspace = true
-repository = "https://github.com/cool-japan/oxisql"
+repository.workspace = true
 
 [lib]
 name = "limbo_core"
@@ -84,22 +86,25 @@ path = "tests/analyze.rs"
 name = "without_rowid"
 path = "tests/without_rowid.rs"
 
+[[test]]
+name = "group_by_having"
+path = "tests/group_by_having.rs"
+
 [dependencies.bitflags]
-version = "2.13.0"
+workspace = true
 
 [dependencies.chrono]
-version = "0.4.45"
+workspace = true
 features = ["clock"]
-default-features = false
 
 [dependencies.crossbeam-skiplist]
 version = "0.1.3"
 
 [dependencies.fallible-iterator]
-version = "0.3.0"
+workspace = true
 
 [dependencies.getrandom]
-version = "0.4.3"
+workspace = true
 
 [dependencies.hex]
 version = "0.4.3"
@@ -142,7 +147,7 @@ features = ["static"]
 optional = true
 
 [dependencies.miette]
-version = "7.6.0"
+workspace = true
 
 [dependencies.parking_lot]
 version = "0.12.5"
@@ -162,25 +167,24 @@ default-features = false
 version = "1.0.23"
 
 [dependencies.serde]
-version = "1.0"
-features = ["derive"]
+workspace = true
 optional = true
 
 [dependencies.strum]
-version = "0.28"
+workspace = true
 features = ["derive"]
 
 [dependencies.strum_macros]
-version = "0.28"
+workspace = true
 
 [dependencies.thiserror]
-version = "2.0.18"
+workspace = true
 
 [dependencies.tracing]
 version = "0.1.44"
 
 [dependencies.uncased]
-version = "0.9.10"
+workspace = true
 
 [dev-dependencies.criterion]
 version = "0.8"
@@ -191,7 +195,7 @@ features = [
 ]
 
 [dev-dependencies.env_logger]
-version = "0.11.10"
+workspace = true
 
 [dev-dependencies.lru]
 version = "0.18.0"
@@ -217,7 +221,7 @@ version = "0.26.1"
 version = "0.8.10"
 
 [dev-dependencies.tempfile]
-version = "3.27.0"
+workspace = true
 
 [dev-dependencies.test-log]
 version = "0.2.21"
@@ -283,5 +287,5 @@ features = ["fs"]
 optional = true
 
 [target.'cfg(target_os = "linux")'.dependencies.io-uring]
-version = "0.7.12"
+version = "0.7.13"
 optional = true

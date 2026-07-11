@@ -1,4 +1,10 @@
 // UPSTREAM: vendored Limbo fork — allow upstream style
+//! Extension API for the C-free **oxisqlite** engine: write new SQL
+//! functionality in pure Rust, no C, in the spirit of `sqlite3` extensions.
+//!
+//! Provides the `scalar`, `AggregateDerive`, and `VTabModuleDerive` macros
+//! (scalar/aggregate functions, virtual tables), an optional `vfs`-gated VFS
+//! interface, and the `register_extension!` macro that plugs it all in.
 #![allow(
     rustdoc::bare_urls,
     rustdoc::invalid_html_tags,

@@ -10,7 +10,7 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-edition = "2021"
+edition.workspace = true
 name = "oxisqlite-time"
 version.workspace = true
 authors = ["the Limbo authors"]
@@ -21,9 +21,11 @@ autoexamples = false
 autotests = false
 autobenches = false
 description = "oxisqlite-time — time extension for the Pure-Rust oxisqlite engine (C-free fork of limbo)"
-readme = false
+readme = "README.md"
+categories = ["date-and-time", "database"]
+keywords = ["sqlite", "datetime", "sql", "extension", "chrono"]
 license.workspace = true
-repository = "https://github.com/cool-japan/oxisql"
+repository.workspace = true
 
 [lib]
 name = "limbo_time"
@@ -31,7 +33,8 @@ crate-type = ["lib"]
 path = "src/lib.rs"
 
 [dependencies.chrono]
-version = "0.4.45"
+workspace = true
+features = ["clock", "oldtime", "wasmbind"]
 
 [dependencies.limbo_ext]
 package = "oxisqlite-ext"
@@ -40,13 +43,13 @@ path = "../oxisqlite-ext"
 features = ["static"]
 
 [dependencies.strum]
-version = "0.28.0"
+workspace = true
 
 [dependencies.strum_macros]
-version = "0.28.0"
+workspace = true
 
 [dependencies.thiserror]
-version = "2.0.18"
+workspace = true
 
 [features]
 static = ["limbo_ext/static"]

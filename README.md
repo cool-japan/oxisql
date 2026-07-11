@@ -28,9 +28,39 @@ CC=/usr/bin/false cargo build --workspace   # → exit 0
 cargo build --workspace                      # → 0 warnings
 ```
 
-**Version 0.3.1 — 2026-06-23.**
-20 workspace crates · 2,024 tests passing · 0 failing · 0 clippy warnings.
+**Version 0.3.2 — 2026-07-11.**
+20 workspace crates · 2,030 tests passing · 0 failing · 0 clippy warnings.
 ~136,360 lines of Rust across 397 source files.
+
+---
+
+## What's new in 0.3.2
+
+- **`zstd-shim` — a local Pure-Rust `zstd`-API patch crate.** A new, unpublished
+  `crates/zstd-shim/` implements just the `bulk::{Compressor, Decompressor}` /
+  `DEFAULT_COMPRESSION_LEVEL` surface that `arrow-ipc` (via DataFusion) actually
+  calls, backed by `oxiarc-zstd`, and is wired in via `[patch.crates-io]`
+  (`zstd = { path = "crates/zstd-shim" }`). The `--all-features` dependency
+  closure no longer pulls the C-FFI `zstd-sys` crate, closing the last gap under
+  the COOLJAPAN OxiARC-only compression policy (no `zip`, `flate2`, `zstd`,
+  `bzip2`, `lz4`, `tar`, `snap`, `brotli`, or `miniz_oxide` — everything routes
+  through `oxiarc-*`).
+- **`GROUP BY … HAVING COUNT(*)` accumulator fix (`oxisqlite-core`).**
+  `COUNT(*)`/`COUNT()` reached via `HAVING`, `ORDER BY`, or a nested expression
+  — rather than a result column — was planned with zero arguments, undercounting
+  its sorter-column span and leaving its accumulator register unreset across
+  group boundaries; multi-group `GROUP BY … HAVING COUNT(*) …` queries could
+  read the sorter out of bounds or panic on a stale accumulator. `COUNT(*)` now
+  carries the same synthetic literal-`1` argument the result-column path already
+  used, and the accumulator-clear range now covers the full aggregate block.
+  `op_agg_step` initialization is also self-healing (re-initializes on any
+  non-`AggContext` register, not just `Value::Null`) and returns
+  `LimboError::InternalError` instead of panicking on internal invariant
+  violations. New coverage in `tests/group_by_having.rs`.
+- **Routine dependency bumps.** `oxiarc-zstd` to `0.3.5` (backing the new shim),
+  `time` to `0.3.53`, `uuid` to `1.23.4` (also in `oxisqlite-uuid`), and, in
+  `oxisqlite-core`, `env_logger` to `0.11.11` and the Linux-only `io-uring` to
+  `0.7.13`.
 
 ---
 
@@ -42,8 +72,6 @@ cargo build --workspace                      # → 0 warnings
   DataFusion 54, so the overrides were dead code. `arrow` pinned to `58.3.0` to
   match DataFusion 54's re-exported version (`oxistore-columnar` also pins
   `58.3.0`; arrow 59 has no compatible DataFusion 54 release).
-- **`oxistore-columnar` updated to `0.2.0`.** Pulls in the latest columnar
-  Parquet-backend release.
 - **`FlamegraphProfiler` benchmark utility (`oxisqlite-core`).** New
   `benches/common/profiler.rs` implements a Criterion 0.8-compatible `Profiler`
   backed by `pprof`, emitting per-benchmark flamegraph SVGs when run with
@@ -188,7 +216,7 @@ consumed by `oxisql-sqlite-compat` and not part of OxiSQL's public surface.
 | Crate | Status | Tests | Description |
 |-------|--------|-------|-------------|
 | `oxisqlite` | Internal | 5 | Top-level engine facade / connection entry point |
-| `oxisqlite-core` | Internal | 652 (+85 skipped) | Storage engine: B-tree (split), pager, WAL, VDBE, transactions, ROLLBACK, ANALYZE, System-R optimizer, WITHOUT ROWID |
+| `oxisqlite-core` | Internal | 656 (+13 skipped) | Storage engine: B-tree (split), pager, WAL, VDBE, transactions, ROLLBACK, ANALYZE, System-R optimizer, WITHOUT ROWID |
 | `oxisqlite-ext` | Internal | — | Built-in extensions / virtual-table glue |
 | `oxisqlite-macros` | Internal | — | Procedural macros for the engine |
 | `oxisqlite-sqlite3-parser` | Internal | 208 (+6) | SQL parser (pre-generated, no `lemon` C generator) |
@@ -211,14 +239,14 @@ Add to your workspace's root `Cargo.toml`:
 ```toml
 # Workspace root Cargo.toml
 [workspace.dependencies]
-oxisql = { version = "0.3.1", features = ["embedded"] }
+oxisql = { version = "0.3.2", features = ["embedded"] }
 ```
 
 Or add to a single crate:
 
 ```toml
 [dependencies]
-oxisql = { version = "0.3.1", features = ["embedded", "postgres", "pool-embedded", "migrate"] }
+oxisql = { version = "0.3.2", features = ["embedded", "postgres", "pool-embedded", "migrate"] }
 ```
 
 ---
@@ -457,26 +485,26 @@ cross-backend OLAP queries (filter / projection / limit pushdown).
 
 ```toml
 # In-memory only
-oxisql = { version = "0.3.1", features = ["embedded"] }
+oxisql = { version = "0.3.2", features = ["embedded"] }
 
 # PostgreSQL + pooling
-oxisql = { version = "0.3.1", features = ["postgres", "pool-postgres"] }
+oxisql = { version = "0.3.2", features = ["postgres", "pool-postgres"] }
 
 # MySQL + migrations
-oxisql = { version = "0.3.1", features = ["mysql", "pool-mysql", "migrate"] }
+oxisql = { version = "0.3.2", features = ["mysql", "pool-mysql", "migrate"] }
 
 # C-free SQLite + pooling
-oxisql = { version = "0.3.1", features = ["sqlite", "pool-sqlite-compat"] }
+oxisql = { version = "0.3.2", features = ["sqlite", "pool-sqlite-compat"] }
 
 # All OLTP backends + pooling + migrations
-oxisql = { version = "0.3.1", features = [
+oxisql = { version = "0.3.2", features = [
     "embedded", "postgres", "mysql", "sqlite",
     "pool-embedded", "pool-postgres", "pool-mysql", "pool-sqlite-compat",
     "migrate",
 ] }
 
 # Full stack including DataFusion OLAP and the REPL
-oxisql = { version = "0.3.1", features = [
+oxisql = { version = "0.3.2", features = [
     "embedded", "postgres", "mysql", "sqlite", "datafusion",
     "pool-embedded", "pool-postgres", "pool-mysql",
     "migrate", "repl",
@@ -659,9 +687,17 @@ cargo build --workspace                      # → 0 warnings
 cargo deny check licenses bans sources       # → PASS
 ```
 
-`cargo deny` passes with three pre-existing advisories explicitly accepted
-because no safe upgrade exists: `paste` (unmaintained), `rsa` (Marvin attack
-advisory), and `rustls-pemfile` (unmaintained).
+`cargo audit` currently reports 3 vulnerabilities and 4 unmaintained-crate
+warnings, none with a fix applied yet. Only one touches OxiSQL's production
+surface: `rsa` 0.9.10's Marvin Attack timing side-channel (RUSTSEC-2023-0071,
+medium severity, no safe upgrade exists), pulled in via `rustls-rustcrypto` for
+the PostgreSQL/MySQL TLS path. The other two vulnerabilities — `quick-xml`
+0.26.0 (RUSTSEC-2026-0194, RUSTSEC-2026-0195, both high severity) — are
+reachable only through `oxisqlite-core`'s dev-only `pprof`/`inferno` benchmark
+dependency (the `FlamegraphProfiler` utility), never through a production
+build. The 4 unmaintained-but-not-vulnerable crates are `paste`,
+`rustls-pemfile`, `fxhash`, and `instant` (the latter two via `sled` →
+`oxisql-embedded`).
 
 ---
 

@@ -15,11 +15,11 @@ keywords = ["database", "sql", "in-memory", "gluesql", "oxisql"]
 # Enable SledGlueStorage: persistent embedded SQL backed by sled (Pure Rust).
 # Uses hand-rolled serde_json serialisation (no bincode) to comply with
 # the COOLJAPAN no-bincode policy.
-sled-storage = ["dep:sled", "dep:serde_json", "dep:ordered-float"]
+sled-storage = ["dep:sled", "dep:serde_json"]
 # Enable FjallGlueStorage: persistent embedded SQL backed by the fjall LSM-tree.
 fjall-storage = ["dep:fjall", "dep:serde_json"]
 # Enable RedbGlueStorage: persistent embedded SQL backed by redb (pure Rust).
-redb-storage = ["dep:redb", "dep:serde_json", "dep:ordered-float", "dep:rust_decimal"]
+redb-storage = ["dep:redb", "dep:serde_json", "dep:rust_decimal"]
 
 [dependencies]
 oxisql-core.workspace = true
@@ -34,7 +34,6 @@ sqlparser = { workspace = true, features = ["std", "visitor"] }
 fjall         = { workspace = true, optional = true }
 serde_json    = { workspace = true, optional = true }
 redb          = { workspace = true, optional = true }
-ordered-float = { workspace = true, optional = true }
 rust_decimal  = { workspace = true, optional = true }
 sled          = { workspace = true, optional = true }
 

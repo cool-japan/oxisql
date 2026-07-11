@@ -16,6 +16,17 @@ use std::{borrow::BorrowMut, rc::Rc};
 
 use super::InsnFunctionStepResult;
 
+/// Build the VDBE error reported when an `AggStep` accumulator register does not
+/// hold an aggregate context. After the generic initializer in [`op_agg_step`]
+/// this is unreachable for well-formed programs, so it stays a hard invariant
+/// check — but it returns a proper error instead of panicking.
+fn unexpected_agg_step_register(state: &ProgramState, acc_reg: usize) -> crate::LimboError {
+    crate::LimboError::InternalError(format!(
+        "Unexpected value {:?} in AggStep at register {}",
+        state.registers[acc_reg], acc_reg
+    ))
+}
+
 pub fn op_agg_step(
     program: &Program,
     state: &mut ProgramState,
@@ -32,7 +43,15 @@ pub fn op_agg_step(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    if let Register::Value(Value::Null) = state.registers[*acc_reg] {
+    // Initialize (or RE-initialize) the accumulator whenever the register does
+    // not already hold an aggregate context. Testing for "not an Aggregate"
+    // rather than only `Value::Null` makes AggStep self-healing across GROUP BY
+    // group boundaries: if a finalized value from a previous group is still
+    // present in this register (because a reset path was missed), we start a
+    // fresh context here for every aggregate function instead of falling through
+    // to the invariant guards below. This complements the translator-side
+    // accumulator reset and prevents a hard failure if that reset is ever short.
+    if !matches!(state.registers[*acc_reg], Register::Aggregate(_)) {
         state.registers[*acc_reg] = match func {
             AggFunc::Avg => {
                 Register::Aggregate(AggContext::Avg(Value::Float(0.0), Value::Integer(0)))
@@ -42,28 +61,12 @@ pub fn op_agg_step(
             AggFunc::Count | AggFunc::Count0 => {
                 Register::Aggregate(AggContext::Count(Value::Integer(0)))
             }
-            AggFunc::Max => {
-                let col = state.registers[*col].get_owned_value();
-                match col {
-                    Value::Integer(_) => Register::Aggregate(AggContext::Max(None)),
-                    Value::Float(_) => Register::Aggregate(AggContext::Max(None)),
-                    Value::Text(_) => Register::Aggregate(AggContext::Max(None)),
-                    _ => {
-                        unreachable!();
-                    }
-                }
-            }
-            AggFunc::Min => {
-                let col = state.registers[*col].get_owned_value();
-                match col {
-                    Value::Integer(_) => Register::Aggregate(AggContext::Min(None)),
-                    Value::Float(_) => Register::Aggregate(AggContext::Min(None)),
-                    Value::Text(_) => Register::Aggregate(AggContext::Min(None)),
-                    _ => {
-                        unreachable!();
-                    }
-                }
-            }
+            // The first observed value seeds the accumulator in the step logic
+            // below (the `None` case), so the initial context is always empty
+            // regardless of the column's type. Initialize unconditionally so a
+            // NULL/Blob first value cannot trip an invariant panic.
+            AggFunc::Max => Register::Aggregate(AggContext::Max(None)),
+            AggFunc::Min => Register::Aggregate(AggContext::Min(None)),
             AggFunc::GroupConcat | AggFunc::StringAgg => {
                 Register::Aggregate(AggContext::GroupConcat(Value::build_text("")))
             }
@@ -96,10 +99,7 @@ pub fn op_agg_step(
         AggFunc::Avg => {
             let col = state.registers[*col].clone();
             let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                panic!(
-                    "Unexpected value {:?} in AggStep at register {}",
-                    state.registers[*acc_reg], *acc_reg
-                );
+                return Err(unexpected_agg_step_register(state, *acc_reg));
             };
             let AggContext::Avg(acc, count) = agg.borrow_mut() else {
                 unreachable!();
@@ -110,10 +110,7 @@ pub fn op_agg_step(
         AggFunc::Sum | AggFunc::Total => {
             let col = state.registers[*col].clone();
             let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                panic!(
-                    "Unexpected value {:?} at register {:?} in AggStep",
-                    state.registers[*acc_reg], *acc_reg
-                );
+                return Err(unexpected_agg_step_register(state, *acc_reg));
             };
             let AggContext::Sum(acc) = agg.borrow_mut() else {
                 unreachable!();
@@ -127,15 +124,12 @@ pub fn op_agg_step(
         }
         AggFunc::Count | AggFunc::Count0 => {
             let col = state.registers[*col].get_owned_value().clone();
-            if matches!(&state.registers[*acc_reg], Register::Value(Value::Null)) {
-                state.registers[*acc_reg] =
-                    Register::Aggregate(AggContext::Count(Value::Integer(0)));
-            }
+            // The generic initializer above already installed a fresh
+            // `AggContext::Count(0)` for a non-aggregate (e.g. NULL or a stale
+            // finalized value from a previous group), so no extra re-init guard
+            // is needed here.
             let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                panic!(
-                    "Unexpected value {:?} in AggStep at register {}",
-                    state.registers[*acc_reg], *acc_reg
-                );
+                return Err(unexpected_agg_step_register(state, *acc_reg));
             };
             let AggContext::Count(count) = agg.borrow_mut() else {
                 unreachable!();
@@ -147,10 +141,7 @@ pub fn op_agg_step(
         AggFunc::Max => {
             let col = state.registers[*col].clone();
             let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                panic!(
-                    "Unexpected value {:?} in AggStep at register {}",
-                    state.registers[*acc_reg], *acc_reg
-                );
+                return Err(unexpected_agg_step_register(state, *acc_reg));
             };
             let AggContext::Max(acc) = agg.borrow_mut() else {
                 unreachable!();
@@ -182,10 +173,7 @@ pub fn op_agg_step(
         AggFunc::Min => {
             let col = state.registers[*col].clone();
             let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                panic!(
-                    "Unexpected value {:?} in AggStep",
-                    state.registers[*acc_reg]
-                );
+                return Err(unexpected_agg_step_register(state, *acc_reg));
             };
             let AggContext::Min(acc) = agg.borrow_mut() else {
                 unreachable!();

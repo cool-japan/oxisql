@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 rust-version = "1.89"
 authors = ["COOLJAPAN OU (Team Kitasan)"]
@@ -67,10 +67,10 @@ tokio-rustls            = { version = "0.26", default-features = false, features
 rustls-rustcrypto       = { version = "0.0.2-alpha" }
 oxitls                  = { version = "0.2.0", default-features = false, features = ["pure", "webpki-roots"] }
 bytes                   = { version = "1" }
-time                    = { version = "0.3.51", default-features = false, features = ["std", "formatting", "macros"] }
+time                    = { version = "0.3.53", default-features = false, features = ["std", "formatting", "macros"] }
 tracing                 = { version = "0.1" }
 tracing-subscriber      = { version = "0.3", default-features = false, features = ["fmt", "std"] }
-uuid                    = { version = "1.23.3" }
+uuid                    = { version = "1.23.4" }
 
 # MySQL backend (Pure Rust, no libmysqlclient/mysqlclient-sys/openssl-sys)
 # default-features=false avoids libz-sys; minimal-rust + rustls-tls gives a
@@ -98,6 +98,19 @@ anyhow = { version = "1" }
 # index_experimental enables CREATE INDEX support
 oxisqlite = { path = "crates/oxisqlite", version = "0.3", features = ["index_experimental"] }
 
+# oxisqlite-* family — shared third-party deps (oxisqlite-core, oxisqlite-sqlite3-parser,
+# oxisqlite-time, oxisqlite-ext)
+strum             = { version = "0.28.0" }
+strum_macros      = { version = "0.28.0" }
+tempfile          = { version = "3.27.0" }
+bitflags          = { version = "2.13.0" }
+fallible-iterator = { version = "0.3.0" }
+getrandom         = { version = "0.4.3" }
+miette            = { version = "7.6.0" }
+serde             = { version = "1.0", features = ["derive"] }
+uncased           = { version = "0.9.10" }
+env_logger        = { version = "0.11.11" }
+
 # Persistent embedded storage — fjall LSM-tree (Pure Rust, optional)
 fjall = { version = "3.1.5" }
 
@@ -118,6 +131,12 @@ serde_json = { version = "1" }
 
 # OxiStore columnar Parquet backend (Pure Rust, optional)
 # Pinned to the 0.1.x line — see the arrow/datafusion note above before bumping to 0.2.x.
+# Re-confirmed 2026-07-02: oxistore-columnar 0.2.0 bundles arrow/parquet 59.0.0,
+# which conflicts with datafusion 54.0.0's internal arrow ^58 requirement.
+# oxisql-datafusion/src/parquet.rs bridges oxistore_columnar::{Schema,RecordBatch}
+# directly into datafusion/arrow types by relying on identical arrow versions;
+# bumping to 0.2.0 breaks that bridge with E0308 (two `arrow_schema` versions in
+# the dependency graph). See ~/work/cargo-upgrade/oxisql.toml for the tracked skip.
 oxistore-columnar = { version = "0.1.3" }
 
 # ── Security patches ───────────────────────────────────────────────────────────
@@ -130,4 +149,7 @@ rustls-rustcrypto = { path = "crates/rustls-rustcrypto-patched" }
 # Pure-Rust patch: drop objc2-system-configuration (macOS SCDynamicStore) from
 # whoami's std feature — pulled via tokio-postgres; see COOLJAPAN Pure Rust Policy v2 §3 Role-A.
 whoami = { path = "crates/whoami-patched" }
+# Pure-Rust patch: replace the C-FFI `zstd` (zstd-sys) with a pure shim backed by
+# oxiarc-zstd; arrow-ipc (via datafusion) is the only consumer (COOLJAPAN Pure Rust v2).
+zstd = { path = "crates/zstd-shim" }
 

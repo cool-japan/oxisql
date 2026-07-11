@@ -2,7 +2,7 @@
 
 ## Status
 
-**Stable** · version 0.1.2 (in development, branch 0.1.2) · **114 tests**.
+**Stable** · version 0.3.2 · **114 tests**.
 
 Core traits and types are fully implemented and shared by every OxiSQL backend.
 `Connection` / `Transaction` / `ConnectionPool` / `PreparedStatement` async

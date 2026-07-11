@@ -238,8 +238,13 @@ impl BackendInfo {
     pub fn sqlite_compat() -> Self {
         Self {
             name: "sqlite",
-            // Statically-known OxiSQLite engine version (C-free fork of limbo 0.0.22).
-            version: Some("oxisqlite 0.1.0".to_string()),
+            // `oxisqlite` is workspace-version-locked to this crate (both
+            // `crates/oxisql/Cargo.toml` and `crates/oxisqlite/Cargo.toml` inherit
+            // `version.workspace = true` from the same `[workspace.package]`), so
+            // `CARGO_PKG_VERSION` here is guaranteed to equal the actual OxiSQLite
+            // engine version shipped alongside this release (C-free fork of limbo
+            // 0.0.22) — unlike a hand-typed literal, it can never go stale.
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
             features: vec!["sqlite-compat", "pure-rust", "oxisqlite", "embedded"],
         }
     }

@@ -1,14 +1,18 @@
-# OxiSQL TODO — v0.3.1
+# OxiSQL TODO — v0.3.2
 
-Last updated: 2026-06-23
+Last updated: 2026-07-11
 
 MSRV 1.89 · License Apache-2.0 · 20 workspace crates (10 facade/drivers + 7 C-free
-oxisqlite-* engine + 3 ancillary) · ~136,360 lines of Rust across 397 `.rs` files
-(≈34.9k facade/drivers + ≈81.2k engine + ≈2.1k vendored TLS patch) · 2,024 tests
+oxisqlite-* engine + 3 ancillary) · ~136,578 lines of Rust across 400 `.rs` files
+(≈34.9k facade/drivers + ≈81.2k engine + ≈2.1k vendored TLS patch) · 2,030 tests
 passing (nextest), 0 failing (≈85 skipped, mostly live-server-gated) · 0 build warnings ·
 C-free proven (`CC=/usr/bin/false cargo build --workspace` → EXIT 0) ·
-`cargo deny` licenses/bans/sources PASS (3 pre-existing advisories: paste,
-rsa Marvin, rustls-pemfile).
+`cargo deny check licenses bans sources` PASS; a full `cargo deny check` FAILS on
+advisories (5 tracked: `quick-xml` RUSTSEC-2026-0194/-0195 — new, high-severity,
+reached only via `oxisqlite-core`'s dev-only `pprof`/`inferno` benchmark
+dependency — `rsa` 0.9.10 Marvin RUSTSEC-2023-0071, `paste` + `rustls-pemfile`
+unmaintained); `cargo audit` additionally flags `fxhash` + `instant` as
+unmaintained (7 findings total; no safe upgrade yet for any).
 
 ## Release History
 
@@ -20,7 +24,8 @@ rsa Marvin, rustls-pemfile).
 - [x] **0.2.0** released (2026-06-17) — ANALYZE/System-R optimizer, UPSERT, execute/schema module splits, schema-cookie invalidation, blocking API, correlated subqueries, 1,997 tests.
 - [x] **0.2.1** released (2026-06-20) — WITHOUT ROWID table support, `BorrowedValue<'a>` zero-alloc SQL value view, B-tree module split, doc-test fix (cancel_token), 2,024 tests.
 - [x] **0.3.0** released (2026-06-22) — objc2-system-configuration removed from default dep closure, whoami-patched vendored crate, oxisqlite-core pure I/O backend, oxitls ^0.2.0.
-- [x] **0.3.1** released (2026-06-23) — DataFusion 54 compatibility (arrow 58.3.0 pin, as_any() removed), oxistore-columnar 0.2.0, FlamegraphProfiler benchmark utility, rand 0.9 API fix.
+- [x] **0.3.1** released (2026-06-23) — DataFusion 54 compatibility (arrow 58.3.0 pin, as_any() removed), oxistore-columnar 0.2.0 bump evaluated then reverted to 0.1.3 same day (arrow/parquet 59 conflicts with DataFusion 54's arrow ^58), FlamegraphProfiler benchmark utility, rand 0.9 API fix.
+- [x] **0.3.2** released (2026-07-11) — `zstd-shim` Pure-Rust patch crate (drops the C-FFI `zstd-sys` from the `--all-features` closure via `oxiarc-zstd`, wired in via `[patch.crates-io]`), GROUP BY/HAVING `COUNT(*)` accumulator reset fix (`oxisqlite-core`), routine dependency bumps (`oxiarc-zstd` 0.3.5, `time` 0.3.53, `uuid` 1.23.4, `env_logger` 0.11.11, `io-uring` 0.7.13).
 
 ## Done in 0.1.2
 

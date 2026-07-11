@@ -1,6 +1,6 @@
 # oxisql-datafusion — TODO
 
-**Status:** Alpha · v0.1.2 (in development) · 83 tests pass (4 ignored).
+**Status:** Alpha · v0.3.2 · 87 tests pass (4 ignored).
 
 Apache DataFusion 53.x bridge exposing OxiSQL-backed tables to OLAP SQL. Ships a snapshot provider (`OxiSqlTableProvider`) and a live-streaming provider (`OxiSqlStreamProvider`), an `OxiSqlContext` `SessionContext` wrapper, filter/projection/limit/sort pushdown, multi-table catalog registration for cross-table joins, full `Value` ↔ Arrow type mapping, and range-based partitioning for parallel scans.
 

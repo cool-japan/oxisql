@@ -87,7 +87,18 @@ pub fn resolve_aggregates(top_level_expr: &Expr, aggs: &mut Vec<Aggregate>) -> R
                 {
                     aggs.push(Aggregate {
                         func: f,
-                        args: vec![],
+                        // `COUNT(*)` (and `COUNT()`) take no user argument, but the
+                        // whole GROUP BY pipeline (sorter column layout, aggregate
+                        // argument reads, and the accumulator clear range) is driven
+                        // uniformly by `agg.args`. Give the star form the same synthetic
+                        // constant-`1` argument that the result-column path
+                        // (`translate/select.rs`) already uses, so a `COUNT(*)` reached
+                        // only via HAVING / ORDER BY / a nested expression stays
+                        // consistent with one reached as a result column. Without this,
+                        // the aggregate contributes zero sorter columns yet still gets an
+                        // accumulator register, which caused an out-of-bounds sorter read
+                        // and a stale-accumulator panic across GROUP BY group boundaries.
+                        args: vec![ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))],
                         original_expr: expr.clone(),
                         distinctness: Distinctness::NonDistinct,
                     });

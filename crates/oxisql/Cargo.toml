@@ -81,7 +81,7 @@ tokio.workspace = true
 arrow.workspace = true
 oxisql-embedded = { path = "../oxisql-embedded" }
 oxisql-pool = { path = "../oxisql-pool", features = ["embedded"] }
-oxisql-core.workspace = true
+oxisql-core = { path = "../oxisql-core" }
 criterion = { workspace = true }
 
 [[bench]]

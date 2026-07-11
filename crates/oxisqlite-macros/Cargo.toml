@@ -10,7 +10,7 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-edition = "2021"
+edition.workspace = true
 name = "oxisqlite-macros"
 version.workspace = true
 authors = ["the Limbo authors"]
@@ -21,9 +21,11 @@ autoexamples = false
 autotests = false
 autobenches = false
 description = "oxisqlite-macros — proc-macros for the Pure-Rust oxisqlite engine (C-free fork of limbo)"
-readme = false
+readme = "README.md"
+categories = ["development-tools::procedural-macro-helpers", "database"]
+keywords = ["sqlite", "macros", "proc-macro", "derive", "extension"]
 license.workspace = true
-repository = "https://github.com/cool-japan/oxisql"
+repository.workspace = true
 
 [lib]
 name = "limbo_macros"

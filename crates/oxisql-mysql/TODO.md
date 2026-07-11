@@ -1,6 +1,6 @@
 # oxisql-mysql — TODO
 
-**Status: Stable** · v0.1.2 (in development, branch `0.1.2`) · MSRV 1.89 · edition 2021 · Apache-2.0
+**Status: Stable** · v0.3.2 · MSRV 1.89 · edition 2021 · Apache-2.0
 
 Pure-Rust MySQL backend over `mysql_async`, no `libmysqlclient` and no
 `openssl-sys`. `MyConnection` implements `oxisql_core::Connection` over an

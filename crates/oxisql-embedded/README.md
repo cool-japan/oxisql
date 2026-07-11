@@ -153,7 +153,7 @@ Named placeholders (`:name`, `$name`, `@name`) are provided by `oxisql_core` def
 
 ## Test coverage
 
-**278 tests pass** with `--all-features` (unit + integration; CSV, schema introspection, persistence round-trips, parameter binding, UDFs, FTS, virtual tables, and more). The crate is part of a workspace where **1,720 tests pass** in total.
+**278 tests pass** with `--all-features` (unit + integration; CSV, schema introspection, persistence round-trips, parameter binding, UDFs, FTS, virtual tables, and more). The crate is part of a workspace where **2,030 tests pass** in total.
 
 ## Part of the OxiSQL workspace
 

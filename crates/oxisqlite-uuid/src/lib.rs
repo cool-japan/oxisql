@@ -1,3 +1,8 @@
+//! UUID SQL function extension for the C-free **oxisqlite** engine.
+//!
+//! Registers `uuid4`/`uuid4_str` (v4), `uuid7`/`uuid7_str`/`uuid7_ts` (v7),
+//! and generic `uuid_str`/`uuid_blob` scalar SQL functions through the
+//! `oxisqlite-ext` extension API (`register_extension!`).
 use limbo_ext::{register_extension, scalar, ResultCode, Value, ValueType};
 
 register_extension! {
