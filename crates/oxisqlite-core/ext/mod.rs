@@ -78,7 +78,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
     if ctx.is_null() {
         return ResultCode::Error;
     }
-    let conn = unsafe { &mut *(ctx as *mut Connection) };
+    let conn = unsafe { &*(ctx as *const Connection) };
 
     conn.register_vtab_module_impl(&name_str, module, kind)
 }
@@ -137,7 +137,7 @@ impl Connection {
     }
 
     fn register_vtab_module_impl(
-        &mut self,
+        &self,
         name: &str,
         module: VTabModuleImpl,
         kind: VTabKind,

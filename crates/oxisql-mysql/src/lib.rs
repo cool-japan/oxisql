@@ -5,7 +5,8 @@
 //!
 //! Provides [`MyConnection`], which implements [`oxisql_core::Connection`]
 //! over `mysql_async` (no `libmysqlclient`, no C bindings) with optional TLS
-//! support via `rustls` + `rustls-rustcrypto` (no `ring`, no `openssl-sys`).
+//! support via `rustls` + the pure-Rust RustCrypto provider from `oxitls`
+//! (no `ring`, no `openssl-sys`).
 //!
 //! # Quick start (no TLS)
 //!
@@ -25,7 +26,7 @@
 //! # }
 //! ```
 //!
-//! # Quick start (TLS via rustls-rustcrypto)
+//! # Quick start (TLS via the oxitls pure-Rust provider)
 //!
 //! ```rust,no_run
 //! # #[tokio::main]
@@ -35,7 +36,7 @@
 //!
 //! // Build a ClientConfig using the pure-Rust CryptoProvider.
 //! // In production, populate root_store from rustls-native-certs or webpki-roots.
-//! let provider = Arc::new(rustls_rustcrypto::provider());
+//! let provider = oxitls::pure_provider();
 //! let root_store = rustls::RootCertStore::empty();
 //! let cfg = rustls::ClientConfig::builder_with_provider(provider)
 //!     .with_safe_default_protocol_versions()?

@@ -20,11 +20,11 @@ It offers two `TableProvider` flavours: a **snapshot** provider that materialise
 
 ```toml
 [dependencies]
-oxisql-datafusion = "0.1.2"
+oxisql-datafusion = "0.3.3"
 
 # Optional features:
-# oxisql-datafusion = { version = "0.1.2", features = ["parse"] }     # SQL → DataFusion plan bridge
-# oxisql-datafusion = { version = "0.1.2", features = ["columnar"] }  # Parquet table provider
+# oxisql-datafusion = { version = "0.3.3", features = ["parse"] }     # SQL → DataFusion plan bridge
+# oxisql-datafusion = { version = "0.3.3", features = ["columnar"] }  # Parquet table provider
 ```
 
 ## Quick start
@@ -103,18 +103,23 @@ let ctx = oxisql::connect_datafusion("datafusion://").await?;
 | `OxiSqlTableProvider::from_connection(conn, table, schema)` *(async)* | Snapshot built by running `SELECT * FROM {table}`. |
 | `provider.refresh(conn, table)` *(async)* | Re-query the connection to replace the snapshot. |
 | `provider.with_range_partition(key_col, n)` | Sort by `key_col` and split into `n` contiguous partitions. |
+| `provider.with_hash_partition(key_col, n)` | Hash-bucket rows by `key_col` into `n` partitions (no ordering guarantee within a bucket). |
+| `provider.with_auto_partition(n_parallel, target_batch_size)` | Auto-size range partitions from row count vs. `target_batch_size`, capped at `n_parallel`; no-op if partitioning would not help. Available on both `OxiSqlTableProvider` and `OxiSqlStreamProvider`. |
 | `OxiSqlStreamProvider::new(conn, table, schema)` | Live-streaming provider driving a real `Connection` at scan time. |
 | `provider.with_sort(vec![(col, SortOrder::Asc \| SortOrder::Desc)])` | Push an `ORDER BY` into the backing query. |
 | `OxiSqlContext::new()` / `from_session_context(ctx)` | DataFusion `SessionContext` wrapper, fresh or wrapping an existing context. |
 | `ctx.register_table(name, conn, schema)` | Register a live connection (uses `OxiSqlStreamProvider`). |
 | `ctx.register_snapshot(name, rows, schema)` | Register a static snapshot (uses `OxiSqlTableProvider`). |
+| `ctx.register_view(name, sql)` *(async)* | Register a SQL view (`CREATE VIEW name AS sql`) queryable by later statements. |
+| `ctx.deregister_table(name)` | Remove a previously registered table; returns whether one existed. |
 | `ctx.execute_sql(sql)` *(async)* | Run SQL, return `Vec<RecordBatch>`. |
 | `ctx.sql(sql)` *(async)* | Run SQL, return a DataFusion `DataFrame`. |
 | `ctx.explain_plan(sql)` *(async)* | Logical + physical plan as a formatted string. |
 | `ctx.register_scalar_function(...)` / `ctx.register_aggregate_function(...)` | Register a scalar UDF / aggregate UDAF. |
+| `ctx.register_parquet(name, path)` *(feature `columnar`)* | Register a Parquet file as a queryable table (schema inferred from file metadata). |
 | `ctx.session_context()` / `into_session_context()` | Borrow / take the underlying `SessionContext`. |
 | `register_oxisql_table(ctx, name, conn, schema)` | Free fn — one-line registration of any `Connection`-backed table. |
-| `register_embedded_table(ctx, name, conn, schema)` *(async)* | Free fn — convenience for `EmbeddedConnection`. |
+| `register_embedded_table(ctx, name, conn, schema)` *(async)* | Free fn — convenience for `EmbeddedConnection`; also available as the `ctx.register_embedded_table(conn, table_name)` method. |
 | `OxiSqlFusionError` | Error type: `OxiSql(String)`, `Arrow(ArrowError)`, `DataFusion(DataFusionError)`, `SchemaMismatch`, `UnsupportedType`. |
 
 ## Feature flags
@@ -142,7 +147,7 @@ Filters on the snapshot provider are reported as `Inexact`, so DataFusion still 
 
 ## Test coverage
 
-**87 tests pass** (4 ignored: 2 live-server tests for the optional `postgres` backend, 2 for the optional `mysql` backend). This crate is part of a workspace where **2,030 tests pass** in total.
+**67 tests pass** with default features and **87 tests pass** with `--all-features` (4 ignored: 2 live-server tests for the optional `postgres` backend, 2 for the optional `mysql` backend). The extra all-features tests are the `parse` plan-bridge suite, the `columnar` Parquet-provider suite, and one `sqlite` streaming test — all individually feature-gated. This crate is part of a workspace where **2,157 tests pass** in total (**2,651** with `--all-features`).
 
 ## Part of the OxiSQL workspace
 

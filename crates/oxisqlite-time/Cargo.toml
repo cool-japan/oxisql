@@ -34,12 +34,13 @@ path = "src/lib.rs"
 
 [dependencies.chrono]
 workspace = true
-features = ["clock", "oldtime", "wasmbind"]
+# "now" (not "clock") — this crate never uses `chrono::Local`, only UTC-based
+# arithmetic, so it doesn't need the host OS timezone database (`iana-time-zone`
+# / macOS `core-foundation-sys`) that "clock" pulls in.
+features = ["now", "oldtime", "wasmbind"]
 
 [dependencies.limbo_ext]
-package = "oxisqlite-ext"
-version = "0.3"
-path = "../oxisqlite-ext"
+workspace = true
 features = ["static"]
 
 [dependencies.strum]

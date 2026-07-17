@@ -5,17 +5,35 @@ Top-level facade of the C-free **oxisqlite** engine — a Pure-Rust fork of
 workspace.
 
 This crate re-exports the engine's public surface — `Connection`, `Statement`,
-`params` / `params_from_iter`, and the value/`Value` types — and is the entry
-point consumed by the `oxisql-sqlite-compat` backend. It is a thin, ergonomic
-wrapper over `oxisqlite-core`; all bytecode execution, storage, and SQL
-processing live there.
+positional and named parameter binding (`params` / `params_from_iter` /
+`named_params!`, covering `:name` / `@name` / `$name` / `#name` placeholder
+forms), and the value/`Value` types — and is the entry point consumed by the
+`oxisql-sqlite-compat` backend. It is a thin, ergonomic wrapper over
+`oxisqlite-core`; all bytecode execution, storage, and SQL processing live
+there.
+
+`Database::open_from_bytes(bytes)` additionally opens a shareable `Database`
+directly from an in-memory SQLite image — e.g. `include_bytes!`, `VACUUM INTO`,
+or `sqlite3_serialize()` output — mirroring SQLite's `sqlite3_deserialize()`.
+No temporary file is involved, so it works under WASI, in a browser, or on a
+read-only filesystem; the returned `Database` can be `connect()`ed multiple
+times, and all connections share the same preloaded image. Malformed input
+(too short, wrong magic, or an invalid page size) is a typed error, never a
+panic.
 
 - **Role:** engine facade (`Connection`, `Statement`, params, value types).
-- **Approx LOC:** ~973.
+- **Version:** 0.3.3 (2026-07-17).
+- **Tests:** 38 passing (default features and `--all-features`), 0 failed
+  (verified 2026-07-17).
+- **Approx LOC:** ~1,900 (tokei `src/`; up from ~973 pre-0.3.3 — this release
+  added `open_from_bytes` and full named-parameter binding with
+  `Cow<'static, str>` keys).
 - **Pure Rust / no C:** 100% safe, portable Rust. No C allocator, no C parser
   generator, no `cc` / `build.rs`. `CC=/usr/bin/false cargo build` succeeds.
-- **Internal:** this is a private member of the OxiSQL workspace and is not
-  published separately.
+- **Internal:** engine-internal member of the OxiSQL workspace (the entry
+  point consumed by `oxisql-sqlite-compat`); independently published on
+  crates.io like every other `oxisqlite-*` crate (no `publish = false`; live
+  since v0.1.0, 2026-06-11).
 
 ## Fork lineage & licensing
 

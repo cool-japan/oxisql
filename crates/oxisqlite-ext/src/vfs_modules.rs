@@ -27,7 +27,9 @@ pub trait VfsExtension: Default + Send + Sync {
         i64::from_ne_bytes(buf)
     }
     fn get_current_time(&self) -> String {
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+        // UTC, not Local: avoids depending on the host OS's local-timezone
+        // database for this extension-VFS timestamp.
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
     }
 }
 

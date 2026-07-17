@@ -544,7 +544,7 @@ impl BTreeCursor {
                     let free_space = compute_free_space(
                         contents,
                         self.usable_space() as u16,
-                    );
+                    )?;
                     let needs_balancing = self.stack.has_parent()
                         && free_space as usize * 3 > self.usable_space() * 2;
                     if rightmost_cell_was_dropped {
@@ -965,7 +965,7 @@ impl BTreeCursor {
             record,
             self.usable_space() as u16,
             self.pager.clone(),
-        );
+        )?;
         let (old_offset, old_local_size) = {
             let page_ref = page_ref.get();
             let page = page_ref.get().contents.as_ref().unwrap();
@@ -974,19 +974,19 @@ impl BTreeCursor {
                 payload_overflow_threshold_max(page_type, self.usable_space() as u16),
                 payload_overflow_threshold_min(page_type, self.usable_space() as u16),
                 self.usable_space(),
-            )
+            )?
         };
         if new_payload.len() == old_local_size {
             self.overwrite_content(page_ref.clone(), old_offset, &new_payload)?;
             Ok(CursorResult::Ok(()))
         } else {
             drop_cell(
-                page_ref.get().get_contents(),
+                page_ref.get().get_contents_mut(),
                 cell_idx,
                 self.usable_space() as u16,
             )?;
             insert_into_cell(
-                page_ref.get().get_contents(),
+                page_ref.get().get_contents_mut(),
                 &new_payload,
                 cell_idx,
                 self.usable_space() as u16,
@@ -1032,8 +1032,17 @@ impl BTreeCursor {
         if self.count == 0 {
             self.move_to_root();
         }
-        if let Some(_mv_cursor) = &self.mv_cursor {
-            todo!("Implement count for mvcc");
+        if let Some(mv_cursor) = &self.mv_cursor {
+            // The MVCC scan cursor eagerly collects the full set of row ids for
+            // this table in its constructor (see `ScanCursor::new` /
+            // `scan_row_ids_for_table`), so the count is simply its length.
+            // Like the on-disk-btree path below, this does not filter by MVCC
+            // visibility (`is_visible_to`) -- neither path in this cursor does,
+            // so this keeps the same correctness ceiling as the rest of the
+            // MVCC read path rather than introducing a new, inconsistent
+            // semantic (visibility-aware counting would undercount compared to
+            // every other MVCC read here).
+            return Ok(CursorResult::Ok(mv_cursor.borrow().row_ids.len()));
         }
         let mut mem_page_rc;
         let mut mem_page;
@@ -1259,7 +1268,7 @@ impl BTreeCursor {
     pub fn read_page(&self, page_idx: usize) -> Result<BTreePage> {
         btree_read_page(&self.pager, page_idx)
     }
-    pub fn allocate_page(&self, page_type: PageType, offset: usize) -> BTreePage {
+    pub fn allocate_page(&self, page_type: PageType, offset: usize) -> Result<BTreePage> {
         self.pager.do_allocate_page(page_type, offset, BtreePageAllocMode::Any)
     }
 }

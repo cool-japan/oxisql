@@ -6,7 +6,7 @@ use crate::translate::collate::CollationSeq;
 use crate::LimboError;
 use crate::Result;
 use core::fmt;
-use limbo_sqlite3_parser::ast::{self, ColumnDefinition, Expr};
+use limbo_sqlite3_parser::ast::{self, ColumnDefinition, Expr, ResolveType};
 
 /// # SQLite Column Type Affinities
 ///
@@ -135,7 +135,22 @@ pub struct Column {
     pub notnull: bool,
     pub default: Option<Expr>,
     pub unique: bool,
+    /// The `ON CONFLICT <action>` resolution declared on this column's own
+    /// `UNIQUE` constraint (e.g. `x INTEGER UNIQUE ON CONFLICT REPLACE`).
+    /// Meaningless when `unique` is `false`. Defaults to [`ResolveType::Abort`]
+    /// when the constraint didn't specify a clause, matching SQLite's own
+    /// default. This is independent from a statement-level
+    /// `INSERT/UPDATE OR <action>`, which takes precedence over this value
+    /// when present (see `translate::insert`/`translate::emitter`).
+    pub unique_conflict: ResolveType,
     pub collation: Option<CollationSeq>,
+    /// Whether this column is declared `GENERATED ALWAYS AS (...)`, either
+    /// `STORED` or `VIRTUAL` (see [`ast::ColumnConstraint::Generated`]).
+    /// SQLite rejects a `SET`/`DO UPDATE SET` target on a generated column
+    /// identically regardless of the `STORED`/`VIRTUAL` sub-kind, so a single
+    /// flag is sufficient for that check; the sub-kind itself isn't tracked
+    /// because nothing yet needs to distinguish them.
+    pub is_generated: bool,
 }
 impl Column {
     pub fn affinity(&self) -> Affinity {
@@ -149,12 +164,19 @@ impl From<ColumnDefinition> for Column {
         let mut notnull = false;
         let mut primary_key = false;
         let mut unique = false;
+        let mut unique_conflict = ResolveType::Abort;
         let mut collation = None;
+        let mut is_generated = false;
         for ast::NamedColumnConstraint { constraint, .. } in value.constraints {
             match constraint {
                 ast::ColumnConstraint::PrimaryKey { .. } => primary_key = true,
                 ast::ColumnConstraint::NotNull { .. } => notnull = true,
-                ast::ColumnConstraint::Unique(..) => unique = true,
+                ast::ColumnConstraint::Unique(on_conflict) => {
+                    unique = true;
+                    if let Some(resolve) = on_conflict {
+                        unique_conflict = resolve;
+                    }
+                }
                 ast::ColumnConstraint::Default(expr) => {
                     default.replace(expr);
                 }
@@ -163,6 +185,9 @@ impl From<ColumnDefinition> for Column {
                         CollationSeq::new(&collation_name.0)
                             .expect("collation should have been set correctly in create table"),
                     );
+                }
+                ast::ColumnConstraint::Generated { .. } => {
+                    is_generated = true;
                 }
                 _ => {}
             };
@@ -203,7 +228,9 @@ impl From<ColumnDefinition> for Column {
             primary_key,
             is_rowid_alias: primary_key && matches!(ty, Type::Integer),
             unique,
+            unique_conflict,
             collation,
+            is_generated,
         }
     }
 }

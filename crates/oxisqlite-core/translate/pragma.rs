@@ -396,7 +396,24 @@ fn query_pragma(
             let base_reg = register;
             program.alloc_registers(5);
             if let Some(table) = table {
-                for (i, column) in table.columns().iter().enumerate() {
+                // A view's output columns are resolved lazily (schema load leaves
+                // them empty to keep connection opens cheap; see
+                // `util::parse_schema_rows`). Infer them here, the sole consumer.
+                // A malformed/cyclic view resolves to no columns, exactly as the
+                // former eager pass left it.
+                let resolved_view_columns: Vec<crate::schema::Column> = match table.as_ref() {
+                    crate::schema::Table::View(view) if view.columns.is_empty() => {
+                        let syms = connection.syms.borrow();
+                        crate::util::resolve_view_columns(schema, &syms, view).unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                };
+                let columns: &[crate::schema::Column] = if resolved_view_columns.is_empty() {
+                    table.columns()
+                } else {
+                    &resolved_view_columns
+                };
+                for (i, column) in columns.iter().enumerate() {
                     // cid
                     program.emit_int(i as i64, base_reg);
                     // name

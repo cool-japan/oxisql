@@ -5,7 +5,7 @@
 use crate::translate::collate::CollationSeq;
 use crate::{util::normalize_ident, Result};
 use fallible_iterator::FallibleIterator;
-use limbo_sqlite3_parser::ast::{Expr, SortOrder};
+use limbo_sqlite3_parser::ast::{Expr, ResolveType, SortOrder};
 use limbo_sqlite3_parser::{
     ast::{Cmd, Stmt},
     lexer::sql::Parser,
@@ -28,6 +28,15 @@ pub struct Index {
     /// For example, WITHOUT ROWID tables (not supported in Limbo yet),
     /// and  SELECT DISTINCT ephemeral indexes will not have a rowid.
     pub has_rowid: bool,
+    /// The `ON CONFLICT <action>` resolution that applies when this index's
+    /// uniqueness is violated. For an automatic index backing a table-level or
+    /// column-level `UNIQUE`/`PRIMARY KEY` constraint, this is the constraint's
+    /// own declared (or defaulted-to-`Abort`) resolution. For an explicit
+    /// `CREATE [UNIQUE] INDEX` (which has no `ON CONFLICT` syntax of its own)
+    /// this is always [`ResolveType::Abort`]. DML codegen consults this value
+    /// only when no statement-level `INSERT/UPDATE OR <action>` is present —
+    /// see `translate::insert`/`translate::emitter`.
+    pub on_conflict: ResolveType,
 }
 impl Index {
     pub fn from_sql(sql: &str, root_page: usize, table: &BTreeTable) -> Result<Index> {
@@ -68,9 +77,21 @@ impl Index {
                     unique,
                     ephemeral: false,
                     has_rowid: table.has_rowid,
+                    // `CREATE INDEX` has no `ON CONFLICT` clause of its own in
+                    // SQLite's grammar; only per-constraint UNIQUE/PRIMARY KEY
+                    // declarations on `CREATE TABLE` carry one (see
+                    // `automatic_from_primary_key_and_unique`).
+                    on_conflict: ResolveType::Abort,
                 })
             }
-            _ => todo!("Expected create index statement"),
+            // The sole caller (schema reload via `ParseSchema`/reopen) only ever
+            // feeds this function trusted, self-generated SQL text read back from
+            // `sqlite_schema`. Reaching this arm means that text no longer parses
+            // as a CREATE INDEX statement, i.e. the persisted schema is corrupt.
+            _ => crate::bail_corrupt_error!(
+                "malformed sqlite_schema entry: expected a CREATE INDEX statement, got: {}",
+                sql
+            ),
         }
     }
     /// The order of index returned should be kept the same
@@ -119,6 +140,7 @@ impl Index {
                 unique: true,
                 ephemeral: false,
                 has_rowid: table.has_rowid,
+                on_conflict: table.primary_key_conflict,
             });
         }
         let unique_indices = table
@@ -152,6 +174,7 @@ impl Index {
                         unique: true,
                         ephemeral: false,
                         has_rowid: table.has_rowid,
+                        on_conflict: column.unique_conflict,
                     })
                 } else {
                     None
@@ -178,8 +201,11 @@ impl Index {
                 .iter()
                 .filter(|set| {
                     if has_primary_key_index
-                        && table.primary_key_columns.len() == set.len()
-                        && table.primary_key_columns.iter().all(|col| set.contains(col))
+                        && table.primary_key_columns.len() == set.columns.len()
+                        && table
+                            .primary_key_columns
+                            .iter()
+                            .all(|col| set.columns.contains(col))
                     {
                         return false;
                     } else {
@@ -193,6 +219,7 @@ impl Index {
                             "number of auto_indices in schema should be same number of indices calculated",
                         );
                     let index_cols = set
+                        .columns
                         .iter()
                         .map(|(col_name, order)| {
                             let Some((pos_in_table, _)) = table.get_column(col_name)
@@ -219,6 +246,7 @@ impl Index {
                         unique: true,
                         ephemeral: false,
                         has_rowid: table.has_rowid,
+                        on_conflict: set.resolve,
                     }
                 });
             indices.extend(unique_set_indices);
@@ -307,6 +335,7 @@ impl Index {
             unique: true,
             ephemeral: false,
             has_rowid: false,
+            on_conflict: table.primary_key_conflict,
         })
     }
 }

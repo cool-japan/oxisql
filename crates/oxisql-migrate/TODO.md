@@ -1,6 +1,6 @@
 # oxisql-migrate — TODO
 
-## Status: Stable (0.3.2)
+## Status: Stable (0.3.3)
 
 Pure Rust, `#![forbid(unsafe_code)]`. The scanner parses
 `{14-digit-timestamp}__{name}.sql` (and optional `.down.sql`) filenames and returns
@@ -11,7 +11,9 @@ embedded GlueSQL backend and any generic `oxisql_core::Connection`. The `migrate
 feature gates `sqlparser`/`gluesql`/`tokio`; the `pool` feature adds
 `run_pooled`/`run_with_pool`; the `cli` feature builds the `oxisql-migrate` binary.
 
-**Tests: 44 pass with `--all-features`, 0 ignored.** Zero clippy warnings.
+**Tests: 47 pass with default features; 51 pass with `--all-features`**
+(49 integration + 2 doc), **1 ignored** (a live-server-gated PostgreSQL
+advisory-lock test). Zero clippy warnings.
 
 ## Done
 

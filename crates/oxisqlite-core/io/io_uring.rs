@@ -218,7 +218,10 @@ impl IO for UringIO {
 
 impl Clock for UringIO {
     fn now(&self) -> Instant {
-        let now = chrono::Local::now();
+        // UTC, not Local: `timestamp()`/`timestamp_subsec_micros()` return
+        // the same absolute Unix instant regardless of timezone, so there is
+        // no need for the host OS's local-timezone database here.
+        let now = chrono::Utc::now();
         Instant {
             secs: now.timestamp(),
             micros: now.timestamp_subsec_micros(),

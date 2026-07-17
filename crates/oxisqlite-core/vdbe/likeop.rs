@@ -88,6 +88,35 @@ pub fn exec_glob(
     }
 }
 
+/// Implements the `REGEXP` operator (`text REGEXP pattern`, i.e. `regexp(pattern, text)`).
+///
+/// The pattern is a full regular expression (same dialect as the `regex` crate) and,
+/// following SQLite's `REGEXP` semantics, matches if the pattern is found anywhere in
+/// `text` (an unanchored search). When a cache is provided the compiled pattern is
+/// memoised. A malformed pattern is reported as a constraint error rather than panicking,
+/// matching how corrupt/untrusted input is surfaced elsewhere in the engine.
+pub fn exec_regexp(
+    regex_cache: Option<&mut HashMap<String, Regex>>,
+    pattern: &str,
+    text: &str,
+) -> Result<bool, LimboError> {
+    if let Some(cache) = regex_cache {
+        if let Some(re) = cache.get(pattern) {
+            return Ok(re.is_match(text));
+        }
+        let re = construct_regexp(pattern)?;
+        let res = re.is_match(text);
+        cache.insert(pattern.to_string(), re);
+        Ok(res)
+    } else {
+        Ok(construct_regexp(pattern)?.is_match(text))
+    }
+}
+
+fn construct_regexp(pattern: &str) -> Result<Regex, LimboError> {
+    Regex::new(pattern).map_err(|e| LimboError::Constraint(format!("invalid REGEXP pattern: {e}")))
+}
+
 fn push_char_to_regex_pattern(c: char, regex_pattern: &mut String) {
     if regex_syntax::is_meta_character(c) {
         regex_pattern.push('\\');
@@ -201,6 +230,31 @@ mod test {
         assert!(!exec_like_with_escape("abcXX", "abc5", 'X'));
         assert!(!exec_like_with_escape("abcXX", "abc", 'X'));
         assert!(!exec_like_with_escape("abcXX", "abcXX", 'X'));
+    }
+
+    #[test]
+    fn test_exec_regexp() {
+        // Unanchored search: matches anywhere in the subject.
+        assert!(exec_regexp(None, "b", "abc").unwrap());
+        assert!(exec_regexp(None, "wor", "hello world").unwrap());
+        assert!(!exec_regexp(None, "^world", "hello world").unwrap());
+        assert!(exec_regexp(None, "world$", "hello world").unwrap());
+        assert!(exec_regexp(None, "c.t", "cat").unwrap());
+        assert!(!exec_regexp(None, "c.t", "ct").unwrap());
+        assert!(exec_regexp(None, "[0-9]+", "foo123").unwrap());
+        assert!(!exec_regexp(None, "[0-9]+", "foobar").unwrap());
+        // A malformed pattern is a recoverable error, never a panic.
+        assert!(exec_regexp(None, "(", "abc").is_err());
+    }
+
+    #[test]
+    fn test_exec_regexp_with_cache() {
+        let mut cache = HashMap::new();
+        assert!(exec_regexp(Some(&mut cache), "a.c", "abc").unwrap());
+        // Second call hits the cached compiled pattern.
+        assert!(exec_regexp(Some(&mut cache), "a.c", "aXc").unwrap());
+        assert!(!exec_regexp(Some(&mut cache), "a.c", "abd").unwrap());
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]

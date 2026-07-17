@@ -318,6 +318,7 @@ pub enum ScalarFunc {
     Likely,
     TimeDiff,
     Likelihood,
+    Regexp,
 }
 
 impl ScalarFunc {
@@ -375,6 +376,7 @@ impl ScalarFunc {
             ScalarFunc::Likely => true,
             ScalarFunc::TimeDiff => false,
             ScalarFunc::Likelihood => true,
+            ScalarFunc::Regexp => true,
         }
     }
 }
@@ -434,6 +436,7 @@ impl Display for ScalarFunc {
             Self::Likely => "likely".to_string(),
             Self::TimeDiff => "timediff".to_string(),
             Self::Likelihood => "likelihood".to_string(),
+            Self::Regexp => "regexp".to_string(),
         };
         write!(f, "{}", str)
     }
@@ -694,6 +697,7 @@ impl Func {
             "changes" => Ok(Self::Scalar(ScalarFunc::Changes)),
             "total_changes" => Ok(Self::Scalar(ScalarFunc::TotalChanges)),
             "glob" => Ok(Self::Scalar(ScalarFunc::Glob)),
+            "regexp" => Ok(Self::Scalar(ScalarFunc::Regexp)),
             "ifnull" => Ok(Self::Scalar(ScalarFunc::IfNull)),
             "iif" => Ok(Self::Scalar(ScalarFunc::Iif)),
             "instr" => Ok(Self::Scalar(ScalarFunc::Instr)),

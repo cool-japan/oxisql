@@ -1275,8 +1275,8 @@ cmd ::= DROP TRIGGER ifexists(NOERR) fullname(X). {
 
 //////////////////////// ATTACH DATABASE file AS name /////////////////////////
 %ifndef SQLITE_OMIT_ATTACH
-cmd ::= ATTACH database_kw_opt expr(F) AS expr(D) key_opt(K). {
-  self.ctx.stmt = Some(Stmt::Attach{ expr: Box::new(F), db_name: Box::new(D), key: K.map(Box::new) });
+cmd ::= ATTACH database_kw_opt(H) expr(F) AS expr(D) key_opt(K). {
+  self.ctx.stmt = Some(Stmt::Attach{ expr: Box::new(F), db_name: Box::new(D), key: K.map(Box::new), database_kw: H });
 }
 cmd ::= DETACH database_kw_opt expr(D). {
   self.ctx.stmt = Some(Stmt::Detach(Box::new(D)));
@@ -1286,8 +1286,9 @@ cmd ::= DETACH database_kw_opt expr(D). {
 key_opt(A) ::= .                     { A = None; }
 key_opt(A) ::= KEY expr(X).          { A = Some(X); }
 
-database_kw_opt ::= DATABASE.
-database_kw_opt ::= .
+%type database_kw_opt {bool}
+database_kw_opt(A) ::= DATABASE.     { A = true; }
+database_kw_opt(A) ::= .             { A = false; }
 %endif SQLITE_OMIT_ATTACH
 
 ////////////////////////// REINDEX collation //////////////////////////////////

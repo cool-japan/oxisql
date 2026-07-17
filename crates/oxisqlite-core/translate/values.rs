@@ -22,6 +22,11 @@ pub fn emit_values(
             emit_values_in_subquery(program, plan, resolver, yield_reg)?
         }
         QueryDestination::EphemeralIndex { .. } => unreachable!(),
+        // Guarded against at plan-build time: a compound SELECT with a VALUES arm rejects
+        // ORDER BY up front (see `select::resolve_compound_order_by`'s caller in
+        // `select::prepare_select_plan`), which is the only way a VALUES plan's
+        // `query_destination` could ever be `Sorter`.
+        QueryDestination::Sorter { .. } => unreachable!(),
     };
     Ok(reg_result_cols_start)
 }
@@ -58,6 +63,11 @@ fn emit_values_when_single_row(
             });
         }
         QueryDestination::EphemeralIndex { .. } => unreachable!(),
+        // Guarded against at plan-build time: a compound SELECT with a VALUES arm rejects
+        // ORDER BY up front (see `select::resolve_compound_order_by`'s caller in
+        // `select::prepare_select_plan`), which is the only way a VALUES plan's
+        // `query_destination` could ever be `Sorter`.
+        QueryDestination::Sorter { .. } => unreachable!(),
     }
     Ok(start_reg)
 }

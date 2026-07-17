@@ -48,6 +48,7 @@ pub fn op_checkpoint(
         Ok(CheckpointResult {
             num_wal_frames: num_wal_pages,
             num_checkpointed_frames: num_checkpointed_pages,
+            ..
         }) => {
             state.registers[*dest] = Register::Value(Value::Integer(0));
             state.registers[*dest + 1] = Register::Value(Value::Integer(num_wal_pages as i64));
@@ -457,7 +458,10 @@ pub fn op_read_cookie(
             pager.db_header.lock().vacuum_mode_largest_root_page.into()
         }
         Cookie::ApplicationId => pager.db_header.lock().application_id as i32 as i64,
-        cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
+        Cookie::DatabaseFormat => pager.db_header.lock().schema_format.into(),
+        Cookie::DefaultPageCacheSize => pager.db_header.lock().default_page_cache_size.into(),
+        Cookie::DatabaseTextEncoding => pager.db_header.lock().text_encoding.into(),
+        Cookie::IncrementalVacuum => pager.db_header.lock().incremental_vacuum_enabled.into(),
     };
     state.registers[*dest] = Register::Value(Value::Integer(cookie_value));
     state.pc += 1;
@@ -605,4 +609,110 @@ pub fn op_integrity_check(
         }
     }
     Ok(InsnFunctionStepResult::Step)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Database, MemoryIO, IO};
+    use std::sync::Arc;
+
+    /// Build a throwaway in-memory `Program` + `Pager` pair by preparing a
+    /// trivial statement on a fresh `:memory:` connection.
+    ///
+    /// `op_read_cookie` never reads or writes `program` (it sources every
+    /// cookie value from the `pager` argument alone), so any well-formed
+    /// `Program` works here; obtaining one from a real connection is simpler
+    /// and less brittle than hand-assembling the `Program` struct.
+    fn program_and_pager() -> (Rc<Program>, Rc<Pager>) {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", false).expect("open in-memory db");
+        let conn = db.connect().expect("connect");
+        let stmt = conn.prepare("SELECT 1").expect("prepare trivial statement");
+        (stmt.program.clone(), stmt.pager.clone())
+    }
+
+    /// Invoke `op_read_cookie` directly for `cookie` and return the integer
+    /// value it wrote to the destination register.
+    ///
+    /// This bypasses the SQL/PRAGMA layer entirely: none of the four cookies
+    /// under test (`DatabaseFormat`, `DefaultPageCacheSize`,
+    /// `DatabaseTextEncoding`, `IncrementalVacuum`) is reachable from a
+    /// PRAGMA or other opcode-emission site yet.
+    fn read_cookie_value(pager: &Rc<Pager>, program: &Program, cookie: Cookie) -> i64 {
+        let mut state = ProgramState::new(1, 0);
+        let insn = Insn::ReadCookie {
+            db: 0,
+            dest: 0,
+            cookie,
+        };
+        op_read_cookie(program, &mut state, &insn, pager, None).expect("op_read_cookie");
+        match state.registers[0].get_owned_value() {
+            Value::Integer(i) => *i,
+            other => panic!("expected Value::Integer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_cookie_database_format() {
+        let (program, pager) = program_and_pager();
+        pager.db_header.lock().schema_format = 4;
+        assert_eq!(
+            read_cookie_value(&pager, &program, Cookie::DatabaseFormat),
+            4
+        );
+        pager.db_header.lock().schema_format = 2;
+        assert_eq!(
+            read_cookie_value(&pager, &program, Cookie::DatabaseFormat),
+            2
+        );
+    }
+
+    #[test]
+    fn read_cookie_default_page_cache_size() {
+        let (program, pager) = program_and_pager();
+        // SQLite historically stores the default cache size as a negative
+        // number of KiB (see `DEFAULT_CACHE_SIZE`); make sure the sign
+        // survives the round trip through the i32 header field.
+        pager.db_header.lock().default_page_cache_size = -2000;
+        assert_eq!(
+            read_cookie_value(&pager, &program, Cookie::DefaultPageCacheSize),
+            -2000
+        );
+        pager.db_header.lock().default_page_cache_size = 512;
+        assert_eq!(
+            read_cookie_value(&pager, &program, Cookie::DefaultPageCacheSize),
+            512
+        );
+    }
+
+    #[test]
+    fn read_cookie_database_text_encoding() {
+        let (program, pager) = program_and_pager();
+        pager.db_header.lock().text_encoding = 1;
+        assert_eq!(
+            read_cookie_value(&pager, &program, Cookie::DatabaseTextEncoding),
+            1
+        );
+        pager.db_header.lock().text_encoding = 3;
+        assert_eq!(
+            read_cookie_value(&pager, &program, Cookie::DatabaseTextEncoding),
+            3
+        );
+    }
+
+    #[test]
+    fn read_cookie_incremental_vacuum() {
+        let (program, pager) = program_and_pager();
+        pager.db_header.lock().incremental_vacuum_enabled = 0;
+        assert_eq!(
+            read_cookie_value(&pager, &program, Cookie::IncrementalVacuum),
+            0
+        );
+        pager.db_header.lock().incremental_vacuum_enabled = 1;
+        assert_eq!(
+            read_cookie_value(&pager, &program, Cookie::IncrementalVacuum),
+            1
+        );
+    }
 }

@@ -268,8 +268,13 @@ impl BTreeKey<'_> {
 struct BalanceInfo {
     /// Old pages being balanced. We can have maximum 3 pages being balanced at the same time.
     pages_to_balance: [Option<BTreePage>; 3],
-    /// Bookkeeping of the rightmost pointer so the offset::BTREE_RIGHTMOST_PTR can be updated.
-    rightmost_pointer: *mut u8,
+    /// Absolute byte offset, within the parent page's buffer, of the 4-byte
+    /// child pointer that must be repointed at the new rightmost sibling --
+    /// either the parent's `BTREE_RIGHTMOST_PTR` header field or a divider
+    /// cell's leading left-child pointer. Stored as an offset rather than a
+    /// raw `*mut u8` so it never aliases (and cannot be invalidated by) the
+    /// live page buffer across the many page edits that happen in between.
+    rightmost_pointer: usize,
     /// Divider cells of old pages. We can have maximum 2 divider cells because of 3 pages.
     divider_cells: [Option<Vec<u8>>; 2],
     /// Number of siblings being used to balance

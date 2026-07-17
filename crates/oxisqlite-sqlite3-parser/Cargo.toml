@@ -20,9 +20,9 @@ autoexamples = false
 autotests = false
 autobenches = false
 description = "SQL parser (as understood by SQLite)"
-documentation = "http://docs.rs/sqlite3-parser"
 readme = "README.md"
 keywords = [
+    "sqlite",
     "sql",
     "parser",
     "scanner",

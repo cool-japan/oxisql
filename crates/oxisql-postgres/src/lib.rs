@@ -4,7 +4,8 @@
 //!
 //! Provides [`PgConnection`], which implements [`oxisql_core::Connection`]
 //! over `tokio-postgres` (no `libpq`, no C bindings) with TLS support via
-//! `rustls` + `rustls-rustcrypto` (no `ring`, no `openssl-sys`).
+//! `rustls` + the pure-Rust RustCrypto provider from `oxitls`
+//! (no `ring`, no `openssl-sys`).
 //!
 //! # Wire protocol compliance
 //!
@@ -22,7 +23,12 @@
 //!
 //! ## Limitations
 //!
-//! * **Logical replication** (Streaming Replication Protocol) is not supported.
+//! * **Logical replication** via the `pgoutput` plugin is available behind the
+//!   `replication` feature (see [`PgReplicationConnection`]); this is an MVP:
+//!   no in-progress-transaction streaming, no two-phase commit, and no
+//!   physical replication. (Binary-format tuple values and array-typed
+//!   columns *are* decoded, in both text and binary format, even though this
+//!   MVP never actually negotiates `binary 'true'` with the server.)
 //! * **Cancellation** via the `CancelRequest` flow is available through
 //!   [`PgConnection::cancel_token`] → [`PostgresCancelToken::cancel_query`].
 //!   It is not exposed at the `Connection` trait level; individual queries can
@@ -79,6 +85,8 @@ mod error;
 mod notify;
 mod pipeline;
 mod prepared;
+#[cfg(feature = "replication")]
+mod replication;
 mod tls;
 pub mod types;
 
@@ -91,4 +99,10 @@ pub use error::PgError;
 pub use notify::{NotificationStream, PgNotification};
 pub use pipeline::{PgPipeline, PipelineResult};
 pub use prepared::PgPrepared;
+#[cfg(feature = "replication")]
+pub use replication::{
+    pg_micros_to_unix_micros, tuple_to_values, unix_micros_to_pg_micros, CellValue, ColumnSpec,
+    CreatedSlot, IdentifySystem, LogicalReplicationMessage, Lsn, PgReplicationConnection,
+    RelationBody, ReplicaIdentity, ReplicationEvent, ReplicationStream, TupleColumn, TupleData,
+};
 pub use types::{pg_row_to_row, value_to_param, OwnedParam};

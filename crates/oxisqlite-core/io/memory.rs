@@ -32,7 +32,10 @@ impl Default for MemoryIO {
 
 impl Clock for MemoryIO {
     fn now(&self) -> Instant {
-        let now = chrono::Local::now();
+        // UTC, not Local: `timestamp()`/`timestamp_subsec_micros()` return
+        // the same absolute Unix instant regardless of timezone, so there is
+        // no need for the host OS's local-timezone database here.
+        let now = chrono::Utc::now();
         Instant {
             secs: now.timestamp(),
             micros: now.timestamp_subsec_micros(),
@@ -53,8 +56,11 @@ impl IO for MemoryIO {
         Ok(())
     }
 
-    fn wait_for_completion(&self, _c: Arc<Completion>) -> Result<()> {
-        todo!();
+    fn wait_for_completion(&self, c: Arc<Completion>) -> Result<()> {
+        while !c.is_completed() {
+            self.run_once()?;
+        }
+        Ok(())
     }
 
     fn generate_random_number(&self) -> i64 {
@@ -200,5 +206,146 @@ impl MemoryFile {
 
     fn get_page(&self, page_no: usize) -> Option<&MemPage> {
         unsafe { (*self.pages.get()).get(&page_no) }
+    }
+
+    /// Construct a [`MemoryFile`] preloaded with `data`, split into fixed
+    /// `PAGE_SIZE` (4096-byte) storage chunks.
+    ///
+    /// The input is copied in verbatim: the final partial chunk is
+    /// zero-padded up to `PAGE_SIZE`, but `size` is set to `data.len()`
+    /// exactly (never rounded up), so [`File::size`] reports the true image
+    /// length and reads past EOF still zero-fill through the existing
+    /// `file_size` check in [`MemoryFile::pread`]. This storage chunking is
+    /// completely independent of the SQLite logical page size recorded in the
+    /// database header, so any valid page size (512..=65536) round-trips.
+    ///
+    /// `data` is never mutated; the returned file owns a private copy.
+    pub fn from_bytes(data: &[u8]) -> Self {
+        let mut pages: BTreeMap<usize, MemPage> = BTreeMap::new();
+        for (page_no, chunk) in data.chunks(PAGE_SIZE).enumerate() {
+            let mut page: MemPage = Box::new([0u8; PAGE_SIZE]);
+            page[..chunk.len()].copy_from_slice(chunk);
+            pages.insert(page_no, page);
+        }
+        Self {
+            pages: UnsafeCell::new(pages),
+            size: Cell::new(data.len()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::WriteCompletion;
+    use std::rc::Rc;
+
+    #[test]
+    fn test_wait_for_completion_returns_ok_for_already_completed_operation() {
+        let io = MemoryIO::new();
+        let file = io
+            .open_file("test.db", OpenFlags::Create, false)
+            .expect("open_file should succeed");
+
+        let drop_fn = Rc::new(|_buf| {});
+        let buf = Arc::new(RefCell::new(Buffer::allocate(8, drop_fn)));
+        let write_complete = Box::new(|_| {});
+        let completion = Arc::new(Completion::Write(WriteCompletion::new(write_complete)));
+
+        // `MemoryFile::pwrite` completes the operation synchronously before
+        // returning, so `completion` is already completed at this point.
+        file.pwrite(0, buf, completion.clone())
+            .expect("pwrite should succeed");
+        assert!(completion.is_completed());
+
+        // Regression coverage: for an already-completed operation the
+        // while-loop in `wait_for_completion` must not iterate (and must
+        // not hang) -- it should observe `is_completed() == true` right
+        // away and return `Ok(())` promptly.
+        io.wait_for_completion(completion).expect(
+            "wait_for_completion should return Ok promptly for an already-completed operation",
+        );
+    }
+
+    /// Read `len` bytes at `pos` back out of a [`MemoryFile`] via the public
+    /// `pread` path (the same path the storage layer uses).
+    fn read_back(file: &MemoryFile, pos: usize, len: usize) -> Vec<u8> {
+        let drop_fn = Rc::new(|_buf| {});
+        let buf = Arc::new(RefCell::new(Buffer::allocate(len, drop_fn)));
+        let read_complete = Box::new(|_res| {});
+        let completion = Arc::new(Completion::Read(crate::io::ReadCompletion::new(
+            buf.clone(),
+            read_complete,
+        )));
+        file.pread(pos, completion).expect("pread should succeed");
+        let out = buf.borrow().as_slice().to_vec();
+        out
+    }
+
+    #[test]
+    fn test_from_bytes_exact_round_trip() {
+        // A payload that is an exact multiple of PAGE_SIZE.
+        let data: Vec<u8> = (0..PAGE_SIZE * 3).map(|i| (i % 251) as u8).collect();
+        let file = MemoryFile::from_bytes(&data);
+        assert_eq!(file.size().expect("size"), data.len() as u64);
+        assert_eq!(read_back(&file, 0, data.len()), data);
+    }
+
+    #[test]
+    fn test_from_bytes_partial_last_chunk_padding_and_size() {
+        // Not a multiple of PAGE_SIZE: the last chunk is partial.
+        let len = PAGE_SIZE * 2 + 123;
+        let data: Vec<u8> = (0..len).map(|i| (i % 97) as u8).collect();
+        let file = MemoryFile::from_bytes(&data);
+        // size() must be exact, not rounded up to a chunk boundary.
+        assert_eq!(file.size().expect("size"), len as u64);
+        assert_eq!(read_back(&file, 0, len), data);
+        // Reads past EOF zero-fill and never exceed the real size.
+        let over = read_back(&file, 0, len + PAGE_SIZE);
+        assert_eq!(&over[..len], &data[..]);
+    }
+
+    #[test]
+    fn test_from_bytes_page_boundary_crossing_read() {
+        let len = PAGE_SIZE * 2;
+        let data: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
+        let file = MemoryFile::from_bytes(&data);
+        // A read that straddles the 4096-byte storage-chunk boundary.
+        let start = PAGE_SIZE - 10;
+        let read = read_back(&file, start, 20);
+        assert_eq!(read, data[start..start + 20]);
+    }
+
+    #[test]
+    fn test_from_bytes_empty() {
+        let file = MemoryFile::from_bytes(&[]);
+        assert_eq!(file.size().expect("size"), 0);
+        // A read against an empty file returns all zeros (complete(0)).
+        assert_eq!(read_back(&file, 0, 16), vec![0u8; 16]);
+    }
+
+    #[test]
+    fn test_from_bytes_does_not_alias_source() {
+        // Two files built from the same slice are independent copies: writing
+        // into one via pwrite must not affect the other or the source slice.
+        let data = vec![0xAAu8; PAGE_SIZE + 5];
+        let file_a = MemoryFile::from_bytes(&data);
+        let file_b = MemoryFile::from_bytes(&data);
+
+        let drop_fn = Rc::new(|_buf| {});
+        let write = vec![0x55u8; 4];
+        let buf = Arc::new(RefCell::new(Buffer::allocate(write.len(), drop_fn)));
+        buf.borrow_mut().as_mut_slice().copy_from_slice(&write);
+        let write_complete = Box::new(|_| {});
+        let completion = Arc::new(Completion::Write(WriteCompletion::new(write_complete)));
+        file_a
+            .pwrite(0, buf, completion)
+            .expect("pwrite should succeed");
+
+        assert_eq!(read_back(&file_a, 0, 4), write);
+        // file_b is untouched.
+        assert_eq!(read_back(&file_b, 0, 4), vec![0xAAu8; 4]);
+        // Source slice is untouched.
+        assert_eq!(&data[0..4], &[0xAAu8; 4]);
     }
 }

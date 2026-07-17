@@ -119,7 +119,11 @@ impl std::fmt::Display for Transaction {
             self.state.load(),
             self.tx_id,
             self.begin_ts,
-            // FIXME: I'm sorry, we obviously shouldn't be cloning here.
+            // NOTICE: `RowID` is `Copy`, so this is copying a handful of small
+            // (table_id, row_id) pairs into a `Vec` for formatting, not cloning
+            // anything expensive. It also isn't a needless intermediate: `SkipSet`'s
+            // own `Debug` impl just prints the placeholder `"SkipSet { .. }"`, so
+            // collecting is the only way to actually show the row IDs here.
             self.write_set
                 .iter()
                 .map(|v| *v.value())
@@ -343,7 +347,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     drop(row_versions);
                     drop(row_versions_opt);
                     drop(tx);
-                    self.rollback_tx(tx_id);
+                    // This is a best-effort cleanup: the write-write conflict is the
+                    // substantive reason for failure below regardless of whether the
+                    // rollback itself reports an error (it should not, since we are the
+                    // only ones who can remove our own `tx_id`).
+                    let _ = self.rollback_tx(tx_id);
                     return Err(DatabaseError::WriteWriteConflict);
                 }
 
@@ -379,7 +387,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// and `None` otherwise.
     pub fn read(&self, tx_id: TxID, id: RowID) -> Result<Option<Row>> {
         tracing::trace!("read(tx_id={}, id={:?})", tx_id, id);
-        let tx = self.txs.get(&tx_id).unwrap();
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or(DatabaseError::NoSuchTransactionID(tx_id))?;
         let tx = tx.value().read().unwrap();
         assert_eq!(tx.state, TransactionState::Active);
         if let Some(row_versions) = self.rows.get(&id) {
@@ -497,20 +508,42 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// # Arguments
     ///
     /// * `tx_id` - The ID of the transaction to commit.
+    ///
+    /// # Durability ordering
+    ///
+    /// This function computes what the committed row versions and `LogRecord`
+    /// would look like *without* mutating any shared state, hands the
+    /// `LogRecord` to [`Storage::log_tx`](crate::mvcc::persistent_storage::Storage::log_tx),
+    /// and only then applies the in-memory changes: flips the transaction's state
+    /// to `Committed` (making its writes visible to everyone else), rewrites the
+    /// row versions it touched, and finally removes it from `self.txs`. If
+    /// persistence fails, none of that has happened yet, so the transaction is
+    /// simply reverted to `Active` and the error is returned: it is never
+    /// reported committed, never made visible to another transaction, and never
+    /// removed from `self.txs`. This closes a durability gap where a crash
+    /// between "became visible in-memory" and "persisted" could otherwise lose a
+    /// transaction's data despite it having already been visible and reported
+    /// committed to the caller.
     pub fn commit_tx(&self, tx_id: TxID) -> Result<()> {
         let end_ts = self.get_timestamp();
-        // NOTICE: the first shadowed tx keeps the entry alive in the map
-        // for the duration of this whole function, which is important for correctness!
-        let tx = self.txs.get(&tx_id).ok_or(DatabaseError::TxTerminated)?;
-        let tx = tx.value().write().unwrap();
-        match tx.state.load() {
-            TransactionState::Terminated => return Err(DatabaseError::TxTerminated),
-            _ => {
-                assert_eq!(tx.state, TransactionState::Active);
+        let write_set: Vec<RowID> = {
+            // NOTICE: the shadowed `tx` keeps the entry alive in the map
+            // for the duration of this block, which is important for correctness!
+            let tx = self.txs.get(&tx_id).ok_or(DatabaseError::TxTerminated)?;
+            // `state` is a plain atomic and `write_set`/`read_set` are lock-free
+            // `SkipSet`s, so every operation below only needs a shared reference; a
+            // read lock is sufficient (and lets concurrent readers proceed).
+            let tx = tx.value().read().unwrap();
+            match tx.state.load() {
+                TransactionState::Terminated => return Err(DatabaseError::TxTerminated),
+                _ => {
+                    assert_eq!(tx.state, TransactionState::Active);
+                }
             }
-        }
-        tx.state.store(TransactionState::Preparing);
-        tracing::trace!("prepare_tx(tx_id={})", tx_id);
+            tx.state.store(TransactionState::Preparing);
+            tracing::trace!("prepare_tx(tx_id={})", tx_id);
+            tx.write_set.iter().map(|v| *v.value()).collect()
+        };
 
         /* TODO: The code we have here is sufficient for snapshot isolation.
         ** In order to implement serializability, we need the following steps:
@@ -585,56 +618,68 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 only if TE commits.
             """
         */
-        tx.state.store(TransactionState::Committed(end_ts));
-        tracing::trace!("commit_tx(tx_id={})", tx_id);
-        let write_set: Vec<RowID> = tx.write_set.iter().map(|v| *v.value()).collect();
-        drop(tx);
-        // Postprocessing: inserting row versions and logging the transaction to persistent storage.
-        // TODO: we should probably save to persistent storage first, and only then update the in-memory structures.
+
+        // Figure out what this transaction's row versions will look like once
+        // committed, and build the `LogRecord` to persist, WITHOUT mutating any
+        // shared (in-memory) state yet — see "Durability ordering" above.
         let mut log_record = LogRecord::new(end_ts);
-        for ref id in write_set {
+        for id in &write_set {
+            if let Some(row_versions) = self.rows.get(id) {
+                let row_versions = row_versions.value().read().unwrap();
+                for row_version in row_versions.iter() {
+                    if let Some(updated) = rewritten_for_commit(row_version, tx_id, end_ts) {
+                        self.insert_version_raw(&mut log_record.row_versions, updated);
+                    }
+                }
+            }
+        }
+        tracing::trace!("prepared(tx_id={})", tx_id);
+
+        if !log_record.row_versions.is_empty() {
+            if let Err(e) = self.storage.log_tx(log_record) {
+                // Persistence failed: this transaction must not be reported committed,
+                // made visible to anyone else, or removed from `self.txs`. Nothing was
+                // mutated above, so reverting the state to `Active` fully undoes the
+                // `Preparing` transition and leaves the transaction usable: the caller
+                // may retry `commit_tx`, or explicitly `rollback_tx` it.
+                let tx = self.txs.get(&tx_id).ok_or(DatabaseError::TxTerminated)?;
+                let tx = tx.value().read().unwrap();
+                tx.state.store(TransactionState::Active);
+                tracing::debug!("commit_tx(tx_id={tx_id}) failed to persist: {e}");
+                return Err(e);
+            }
+            tracing::trace!("logged(tx_id={})", tx_id);
+        }
+
+        // The transaction's `LogRecord` (if any) is now durable, so it is safe to
+        // make its writes visible to everyone else.
+        {
+            let tx = self.txs.get(&tx_id).ok_or(DatabaseError::TxTerminated)?;
+            let tx = tx.value().read().unwrap();
+            tx.state.store(TransactionState::Committed(end_ts));
+        }
+        tracing::trace!("commit_tx(tx_id={})", tx_id);
+
+        for id in &write_set {
             if let Some(row_versions) = self.rows.get(id) {
                 let mut row_versions = row_versions.value().write().unwrap();
                 for row_version in row_versions.iter_mut() {
-                    if let TxTimestampOrID::TxID(id) = row_version.begin {
-                        if id == tx_id {
-                            // New version is valid STARTING FROM committing transaction's end timestamp
-                            // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                            row_version.begin = TxTimestampOrID::Timestamp(end_ts);
-                            self.insert_version_raw(
-                                &mut log_record.row_versions,
-                                row_version.clone(),
-                            ); // FIXME: optimize cloning out
-                        }
-                    }
-                    if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
-                        if id == tx_id {
-                            // Old version is valid UNTIL committing transaction's end timestamp
-                            // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                            row_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
-                            self.insert_version_raw(
-                                &mut log_record.row_versions,
-                                row_version.clone(),
-                            ); // FIXME: optimize cloning out
-                        }
+                    if let Some(updated) = rewritten_for_commit(row_version, tx_id, end_ts) {
+                        *row_version = updated;
                     }
                 }
             }
         }
         tracing::trace!("updated(tx_id={})", tx_id);
-        // We have now updated all the versions with a reference to the
-        // transaction ID to a timestamp and can, therefore, remove the
-        // transaction. Please note that when we move to lockless, the
-        // invariant doesn't necessarily hold anymore because another thread
-        // might have speculatively read a version that we want to remove.
-        // But that's a problem for another day.
-        // FIXME: it actually just become a problem for today!!!
-        // TODO: test that reproduces this failure, and then a fix
+
+        // We have now durably persisted and applied every version this
+        // transaction touched (rewriting each reference from a `TxID` to a
+        // `Timestamp`), so it is safe to remove the transaction: no later reader
+        // can still need to consult `self.txs` for it. `drop_unused_row_versions`
+        // never drops a version whose `begin`/`end` still names a tracked
+        // transaction (see its doc comment), so there is no way for a row to have
+        // disappeared out from under the loop above between the two passes.
         self.txs.remove(&tx_id);
-        if !log_record.row_versions.is_empty() {
-            self.storage.log_tx(log_record)?;
-        }
-        tracing::trace!("logged(tx_id={})", tx_id);
         Ok(())
     }
 
@@ -646,8 +691,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// # Arguments
     ///
     /// * `tx_id` - The ID of the transaction to abort.
-    pub fn rollback_tx(&self, tx_id: TxID) {
-        let tx_unlocked = self.txs.get(&tx_id).unwrap();
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError::TxTerminated`] if `tx_id` is no longer tracked,
+    /// e.g. because it was already committed or rolled back.
+    pub fn rollback_tx(&self, tx_id: TxID) -> Result<()> {
+        let tx_unlocked = self.txs.get(&tx_id).ok_or(DatabaseError::TxTerminated)?;
         let tx = tx_unlocked.value().write().unwrap();
         assert_eq!(tx.state, TransactionState::Active);
         tx.state.store(TransactionState::Aborted);
@@ -668,9 +718,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = tx_unlocked.value().read().unwrap();
         tx.state.store(TransactionState::Terminated);
         tracing::trace!("terminate(tx_id={})", tx_id);
-        // FIXME: verify that we can already remove the transaction here!
-        // Maybe it's fine for snapshot isolation, but too early for serializable?
+        // Every version this transaction inserted (matched by `begin`) has just
+        // been removed above, and `drop_unused_row_versions` never drops a version
+        // whose `begin`/`end` still names a tracked transaction (see its doc
+        // comment), so it is safe to remove the transaction now: no later reader
+        // can still need to consult `self.txs` for it.
         self.txs.remove(&tx_id);
+        Ok(())
     }
 
     /// Generates next unique transaction id
@@ -683,9 +737,33 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.clock.get_timestamp()
     }
 
-    /// Removes unused row  versions with very loose heuristics,
-    /// which sometimes leaves versions intact for too long.
-    /// Returns the number of removed versions.
+    /// Removes row versions that can no longer be observed by any tracked
+    /// transaction, and returns the number of removed versions.
+    ///
+    /// Correctness invariant: a row version whose `begin` or `end` still names a
+    /// `TxID` that is present in `self.txs` must *never* be dropped. That
+    /// transaction may still be `Active`/`Preparing` (in which case it, or a
+    /// concurrent reader with an overlapping snapshot, may still need this exact
+    /// version), or it may be about to commit (in which case its own
+    /// `commit_tx` is solely responsible for rewriting the `TxID` to a
+    /// `Timestamp` before it removes itself from `self.txs` — see `commit_tx`).
+    /// Dropping such a version out from under a still-tracked transaction was a
+    /// real, reproducible bug: a concurrent `insert()`/`delete()`/`commit_tx()`
+    /// could then fail to find the row it was about to rewrite (because this
+    /// function had already deleted the whole `RowID` entry from `self.rows`),
+    /// silently skip rewriting it, and still go on to remove the transaction
+    /// from `self.txs` — leaving a *different*, concurrently-executing reader
+    /// (one that had obtained its own reference to the row before it was
+    /// dropped here) staring at a stale `TxID` whose transaction had already
+    /// vanished, which is exactly the panic `is_begin_visible`/`is_end_visible`/
+    /// `is_write_write_conflict` used to hit.
+    ///
+    /// Only once the owning transaction is no longer tracked at all is it safe
+    /// to reassess: a *committed* transaction is always fully rewritten before
+    /// it is removed (see above), so a still-`TxID`-tagged version whose owner
+    /// has vanished can only be a leftover of an *aborted* transaction, which
+    /// `is_begin_visible`/`is_end_visible` already and permanently treat as
+    /// invisible garbage — so it is both safe and correct to drop it.
     pub fn drop_unused_row_versions(&self) -> usize {
         tracing::trace!(
             "drop_unused_row_versions() -> txs: {}; rows: {}",
@@ -697,29 +775,36 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         for entry in self.rows.iter() {
             let mut row_versions = entry.value().write().unwrap();
             row_versions.retain(|rv| {
-                // FIXME: should take rv.begin into account as well
-                let should_stay = match rv.end {
-                    Some(TxTimestampOrID::Timestamp(version_end_ts)) => {
-                        // a transaction started before this row version ended, ergo row version is needed
-                        // NOTICE: O(row_versions x transactions), but also lock-free, so sounds acceptable
-                        self.txs.iter().any(|tx| {
-                            let tx = tx.value().read().unwrap();
-                            // FIXME: verify!
-                            match tx.state.load() {
-                                TransactionState::Active | TransactionState::Preparing => {
-                                    version_end_ts > tx.begin_ts
+                // A version whose `begin` still names a tracked transaction is
+                // "owned" by it and must be kept no matter what `end` says: see
+                // the invariant documented on this function.
+                let begin_still_owned = matches!(
+                    rv.begin,
+                    TxTimestampOrID::TxID(begin_tx_id) if self.txs.contains_key(&begin_tx_id)
+                );
+                let should_stay = begin_still_owned
+                    || match rv.end {
+                        Some(TxTimestampOrID::Timestamp(version_end_ts)) => {
+                            // a transaction started before this row version ended, ergo row version is needed
+                            // NOTICE: O(row_versions x transactions), but also lock-free, so sounds acceptable
+                            self.txs.iter().any(|tx| {
+                                let tx = tx.value().read().unwrap();
+                                match tx.state.load() {
+                                    TransactionState::Active | TransactionState::Preparing => {
+                                        version_end_ts > tx.begin_ts
+                                    }
+                                    _ => false,
                                 }
-                                _ => false,
-                            }
-                        })
-                    }
-                    // Let's skip potentially complex logic if the transafction is still
-                    // active/tracked. We will drop the row version when the transaction
-                    // gets garbage-collected itself, it will always happen eventually.
-                    Some(TxTimestampOrID::TxID(tx_id)) => !self.txs.contains_key(&tx_id),
-                    // this row version is current, ergo visible
-                    None => true,
-                };
+                            })
+                        }
+                        // While the transaction that (tentatively) ended this version is
+                        // still tracked it must be kept (see the invariant above); once
+                        // that transaction is gone this can only be an aborted leftover,
+                        // which is already permanently invisible, so dropping it is safe.
+                        Some(TxTimestampOrID::TxID(tx_id)) => self.txs.contains_key(&tx_id),
+                        // this row version is current, ergo visible
+                        None => true,
+                    };
                 if !should_stay {
                     dropped += 1;
                     tracing::trace!(
@@ -757,15 +842,22 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn get_begin_timestamp(&self, ts_or_id: &TxTimestampOrID) -> u64 {
         match ts_or_id {
             TxTimestampOrID::Timestamp(ts) => *ts,
-            TxTimestampOrID::TxID(tx_id) => {
-                self.txs
-                    .get(tx_id)
-                    .unwrap()
-                    .value()
-                    .read()
-                    .unwrap()
-                    .begin_ts
-            }
+            TxTimestampOrID::TxID(tx_id) => match self.txs.get(tx_id) {
+                Some(tx) => tx.value().read().unwrap().begin_ts,
+                // The transaction is no longer tracked. This is only used to order
+                // versions for insertion, and (see `drop_unused_row_versions` and
+                // `is_begin_visible`) a `TxID` that outlives its own transaction's
+                // presence in `self.txs` can only be a leftover from an aborted
+                // transaction — a version nobody can see any more, so its relative
+                // sort position is immaterial. Treat it as the oldest possible
+                // entry rather than panicking.
+                None => {
+                    tracing::debug!(
+                        "get_begin_timestamp: tx {tx_id} no longer tracked; sorting as 0"
+                    );
+                    0
+                }
+            },
         }
     }
 
@@ -803,6 +895,35 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 }
 
+/// If `row_version` is owned (as `begin` and/or `end`) by transaction `tx_id`,
+/// returns a clone with every such `TxID` reference rewritten to
+/// `TxTimestampOrID::Timestamp(end_ts)` — i.e. what it should look like once
+/// `tx_id` has committed at `end_ts`. Returns `None` if `row_version` is
+/// unrelated to `tx_id`, in which case the caller has nothing to do.
+///
+/// Both fields are checked (rather than using an `else if`) because a single
+/// version can legitimately be owned by `tx_id` on both ends at once, e.g. a
+/// transaction that inserts a row and then deletes it again before committing.
+fn rewritten_for_commit(row_version: &RowVersion, tx_id: TxID, end_ts: u64) -> Option<RowVersion> {
+    let begin_matches = matches!(row_version.begin, TxTimestampOrID::TxID(id) if id == tx_id);
+    let end_matches = matches!(row_version.end, Some(TxTimestampOrID::TxID(id)) if id == tx_id);
+    if !begin_matches && !end_matches {
+        return None;
+    }
+    let mut updated = row_version.clone();
+    if begin_matches {
+        // New version is valid STARTING FROM committing transaction's end timestamp
+        // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
+        updated.begin = TxTimestampOrID::Timestamp(end_ts);
+    }
+    if end_matches {
+        // Old version is valid UNTIL committing transaction's end timestamp
+        // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
+        updated.end = Some(TxTimestampOrID::Timestamp(end_ts));
+    }
+    Some(updated)
+}
+
 /// A write-write conflict happens when transaction T_current attempts to update a
 /// row version that is:
 /// a) currently being updated by an active transaction T_previous, or
@@ -822,7 +943,16 @@ pub(crate) fn is_write_write_conflict(
 ) -> bool {
     match rv.end {
         Some(TxTimestampOrID::TxID(rv_end)) => {
-            let te = txs.get(&rv_end).unwrap();
+            let Some(te) = txs.get(&rv_end) else {
+                // `rv_end`'s transaction is no longer tracked. Transactions are only
+                // ever removed from `txs` after being fully resolved (a commit always
+                // rewrites every version it touched to a `Timestamp` before removing
+                // itself — see `commit_tx`), so a version whose `end` still names a
+                // vanished `TxID` can only be a leftover of an *aborted* transaction:
+                // treat it exactly like the live `TransactionState::Aborted` case below
+                // (not a conflict) instead of panicking.
+                return false;
+            };
             let te = te.value().read().unwrap();
             if te.tx_id == tx.tx_id {
                 return false;
@@ -856,7 +986,21 @@ fn is_begin_visible(
     match rv.begin {
         TxTimestampOrID::Timestamp(rv_begin_ts) => tx.begin_ts >= rv_begin_ts,
         TxTimestampOrID::TxID(rv_begin) => {
-            let tb = txs.get(&rv_begin).unwrap();
+            let Some(tb) = txs.get(&rv_begin) else {
+                // `rv_begin`'s transaction is no longer tracked. `rollback_tx` always
+                // removes every version it inserted (matched by `begin`) before
+                // removing itself from `txs`, and `commit_tx` always rewrites them to
+                // a `Timestamp` first — so, symmetrically with `is_end_visible`, a
+                // version whose `begin` still names a vanished `TxID` can only be a
+                // stale leftover, equivalent to the live `TransactionState::Aborted`
+                // case below: ignore it rather than panicking.
+                tracing::trace!(
+                    "is_begin_visible: tx={tx}, tb=<{rv_begin}: no longer tracked> rv = {:?}-{:?} visible = false",
+                    rv.begin,
+                    rv.end
+                );
+                return false;
+            };
             let tb = tb.value().read().unwrap();
             let visible = match tb.state.load() {
                 TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),
@@ -886,7 +1030,19 @@ fn is_end_visible(
     match rv.end {
         Some(TxTimestampOrID::Timestamp(rv_end_ts)) => tx.begin_ts < rv_end_ts,
         Some(TxTimestampOrID::TxID(rv_end)) => {
-            let te = txs.get(&rv_end).unwrap();
+            let Some(te) = txs.get(&rv_end) else {
+                // See `is_write_write_conflict`: a version whose `end` still names a
+                // transaction that is no longer tracked can only be a leftover from an
+                // aborted transaction, i.e. equivalent to the live
+                // `TransactionState::Aborted` case below (not visible), so return that
+                // instead of panicking.
+                tracing::trace!(
+                    "is_end_visible: tx={tx}, te=<{rv_end}: no longer tracked> rv = {:?}-{:?} visible = false",
+                    rv.begin,
+                    rv.end
+                );
+                return false;
+            };
             let te = te.value().read().unwrap();
             let visible = match te.state.load() {
                 TransactionState::Active => tx.tx_id != te.tx_id,

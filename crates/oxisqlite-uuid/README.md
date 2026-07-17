@@ -8,7 +8,13 @@ This crate provides the engine's UUID SQL functions, registered through the
 oxisqlite extension API.
 
 - **Role:** UUID SQL function extension.
-- **Approx LOC:** ~126.
+- **Version:** 0.3.3 (2026-07-17).
+- **Tests:** no dedicated unit tests in this crate; it is a thin extension
+  validated indirectly — its SQL functions are registered
+  (`register_extension_static`) into every `oxisqlite-core` connection when
+  the `uuid` feature is enabled, and are exercised as part of
+  `oxisqlite-core`'s `--all-features` integration suite (849 tests).
+- **Approx LOC:** ~128.
 - **Pure Rust / no C:** 100% Rust. No C allocator, no C parser generator, no
   `cc` / `build.rs`.
 - **Internal:** private member of the OxiSQL workspace; not published separately.

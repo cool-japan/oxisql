@@ -1,11 +1,13 @@
 #![allow(unused_variables)]
-use super::super::likeop::{construct_like_escape_arg, exec_glob, exec_like_with_escape};
+use super::super::likeop::{
+    construct_like_escape_arg, exec_glob, exec_like_with_escape, exec_regexp,
+};
 use super::super::{Program, ProgramState, Register};
 use crate::function::AlterTableFunc;
 use crate::info;
 use crate::types::Text;
 use crate::util::normalize_ident;
-use crate::{bail_constraint_error, MvStore, Pager, Result, DATABASE_VERSION};
+use crate::{bail_constraint_error, bail_corrupt_error, MvStore, Pager, Result, DATABASE_VERSION};
 use crate::{
     error::LimboError,
     ext::ExtValue,
@@ -110,8 +112,14 @@ pub fn op_vcreate(
         vec![]
     };
     let conn = program.connection.clone();
-    let table =
-        crate::VirtualTable::table(Some(&table_name), &module_name, args, &conn.syms.borrow())?;
+    // The read borrow must be explicitly scoped (and so dropped) before the write borrow below:
+    // `&conn.syms.borrow()` as a bare call argument is a temporary whose guard is not guaranteed
+    // to drop until the end of the *enclosing statement*, which previously extended past this
+    // point and made the `borrow_mut()` below panic with "already borrowed".
+    let table = {
+        let syms = conn.syms.borrow();
+        crate::VirtualTable::table(Some(&table_name), &module_name, args, &syms)?
+    };
     {
         conn.syms
             .borrow_mut()
@@ -611,6 +619,34 @@ pub fn op_function(
                 };
                 state.registers[*dest] = Register::Value(result);
             }
+            ScalarFunc::Regexp => {
+                // `text REGEXP pattern` is `regexp(pattern, text)`: the pattern is the
+                // first argument (start_reg), the subject text is the second.
+                let pattern = &state.registers[*start_reg];
+                let text = &state.registers[*start_reg + 1];
+                let pattern = match pattern.get_owned_value() {
+                    Value::Text(_) => pattern.get_owned_value().clone(),
+                    Value::Null => Value::Null,
+                    other => other.exec_cast("TEXT"),
+                };
+                let text = match text.get_owned_value() {
+                    Value::Text(_) => text.get_owned_value().clone(),
+                    Value::Null => Value::Null,
+                    other => other.exec_cast("TEXT"),
+                };
+                let result = match (&pattern, &text) {
+                    (Value::Text(pattern), Value::Text(text)) => {
+                        let cache = if *constant_mask > 0 {
+                            Some(&mut state.regex_cache.regexp)
+                        } else {
+                            None
+                        };
+                        Value::Integer(exec_regexp(cache, pattern.as_str(), text.as_str())? as i64)
+                    }
+                    _ => Value::Null,
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
             ScalarFunc::IfNull => {}
             ScalarFunc::Iif => {}
             ScalarFunc::Instr => {
@@ -1075,8 +1111,16 @@ pub fn op_function(
                             break 'sql None;
                         };
                         let mut parser = Parser::new(sql.as_str().as_bytes());
-                        let ast::Cmd::Stmt(stmt) = parser.next().unwrap().unwrap() else {
-                            todo!()
+                        // This is a re-parse of SQL text this same engine persisted to
+                        // `sqlite_schema`, so it should always parse back to `Cmd::Stmt`.
+                        // Still, fail gracefully instead of panicking if a corrupted or
+                        // foreign-written schema row is ever encountered.
+                        let Some(ast::Cmd::Stmt(stmt)) = parser.next()? else {
+                            bail_corrupt_error!(
+                                "malformed sqlite_schema entry during ALTER TABLE RENAME: \
+                                 expected a statement, got: {}",
+                                sql.as_str()
+                            );
                         };
                         match stmt {
                             ast::Stmt::CreateIndex {
@@ -1129,7 +1173,28 @@ pub fn op_function(
                                     .unwrap(),
                                 )
                             }
-                            _ => todo!(),
+                            // `CREATE VIEW`/`CREATE TRIGGER`/`CREATE VIRTUAL TABLE` bodies are
+                            // deliberately NOT rewritten here: correctly rewriting every
+                            // identifier reference to `rename_from` inside an arbitrary
+                            // SELECT/trigger-body/module-args AST is a separate, much larger
+                            // feature. This is a known limitation, not corruption — it mirrors
+                            // this codebase's existing behavior for `CreateIndex`/`CreateTable`
+                            // rows that belong to some other, unrelated table above (also left
+                            // untouched via `break 'sql None`). The row's `name`/`tbl_name`
+                            // columns are still corrected above when they reference the
+                            // renamed table; only the persisted `sql` text is left exactly
+                            // as-is, so a view/trigger/vtab that referenced the table by its
+                            // old name keeps doing so. Crucially: no panic, and the ALTER
+                            // TABLE statement completes successfully.
+                            ast::Stmt::CreateView { .. }
+                            | ast::Stmt::CreateTrigger(_)
+                            | ast::Stmt::CreateVirtualTable(_) => None,
+                            _ => bail_corrupt_error!(
+                                "malformed sqlite_schema entry during ALTER TABLE RENAME: \
+                                 expected a CREATE TABLE/INDEX/VIEW/TRIGGER/VIRTUAL TABLE \
+                                 statement, got: {}",
+                                sql.as_str()
+                            ),
                         }
                     };
                     (new_name, new_tbl_name, new_sql)
@@ -1161,8 +1226,16 @@ pub fn op_function(
                             break 'sql None;
                         };
                         let mut parser = Parser::new(sql.as_str().as_bytes());
-                        let ast::Cmd::Stmt(stmt) = parser.next().unwrap().unwrap() else {
-                            todo!()
+                        // This is a re-parse of SQL text this same engine persisted to
+                        // `sqlite_schema`, so it should always parse back to `Cmd::Stmt`.
+                        // Still, fail gracefully instead of panicking if a corrupted or
+                        // foreign-written schema row is ever encountered.
+                        let Some(ast::Cmd::Stmt(stmt)) = parser.next()? else {
+                            bail_corrupt_error!(
+                                "malformed sqlite_schema entry during ALTER TABLE RENAME \
+                                 COLUMN: expected a statement, got: {}",
+                                sql.as_str()
+                            );
                         };
                         match stmt {
                             ast::Stmt::CreateIndex {
@@ -1208,13 +1281,24 @@ pub fn op_function(
                                 if table != normalize_ident(&tbl_name.name.0) {
                                     break 'sql None;
                                 }
+                                // `sqlite_schema.sql` for a table is always persisted in
+                                // `ColumnsAndConstraints` form, even for tables originally
+                                // created via `CREATE TABLE ... AS SELECT` (the `AS SELECT`
+                                // form is desugared before being persisted, see
+                                // `translate::schema`). An `AsSelect` body here would mean a
+                                // corrupted or foreign-written schema row.
                                 let ast::CreateTableBody::ColumnsAndConstraints {
                                     mut columns,
                                     constraints,
                                     options,
                                 } = *body
                                 else {
-                                    todo!()
+                                    bail_corrupt_error!(
+                                        "malformed sqlite_schema entry during ALTER TABLE \
+                                         RENAME COLUMN: expected a CREATE TABLE statement with \
+                                         explicit columns, got: {}",
+                                        sql.as_str()
+                                    );
                                 };
                                 let column_index = columns
                                     .get_index_of(&ast::Name(rename_from))
@@ -1243,7 +1327,19 @@ pub fn op_function(
                                     .unwrap(),
                                 )
                             }
-                            _ => todo!(),
+                            // See the matching comment in the `RenameTable` arm above: view,
+                            // trigger, and virtual-table bodies are a known, deliberate
+                            // rewrite limitation (not corruption) — leave `sql` untouched
+                            // rather than panicking.
+                            ast::Stmt::CreateView { .. }
+                            | ast::Stmt::CreateTrigger(_)
+                            | ast::Stmt::CreateVirtualTable(_) => None,
+                            _ => bail_corrupt_error!(
+                                "malformed sqlite_schema entry during ALTER TABLE RENAME \
+                                 COLUMN: expected a CREATE TABLE/INDEX/VIEW/TRIGGER/VIRTUAL \
+                                 TABLE statement, got: {}",
+                                sql.as_str()
+                            ),
                         }
                     };
                     (name, tbl_name, new_sql)

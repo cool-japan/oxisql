@@ -10,7 +10,11 @@ This crate is part of the C-free **oxisqlite** engine fork. The parser
 no C compiler, no `lemon.c` parser generator, no build script, no `cc` crate
 dependency.
 
-- **Approx LOC:** ~14,800.
+- **Approx LOC:** ~15,800 (tokei; up from ~14,800 — mostly this release's
+  `splitrs` file-per-concern reorganization, see below).
+- **Version:** 0.3.3 (2026-07-17).
+- **Tests:** 221 passing (default features and `--all-features`), 0 failed
+  (verified 2026-07-17).
 - **Internal:** private member of the OxiSQL workspace; not published separately.
 
 ## SQLite3 Grammar Coverage
@@ -36,6 +40,22 @@ See `checks.md` for the semantic checks applied on top of the grammar.
 ## Minimum Supported Rust Version
 
 Latest stable Rust at time of release. Building requires no C toolchain.
+
+## COOLJAPAN changes vs upstream limbo
+
+- **Lifetime-free `Token`.** The lexer's token type was simplified from the
+  lifetime-parameterized `Token<'i>(usize, &'i [u8], usize)` to
+  `Token(usize, Cow<'static, str>, usize)` (`src/dialect/mod.rs`): a token
+  whose source spelling matches its canonical form exactly (e.g. an
+  uppercase `SELECT` keyword) borrows the associated `&'static str` from
+  `TokenType::as_str` at zero cost, while every other token (identifiers,
+  literals, differently-cased keywords) still allocates an owned `String`.
+  **Breaking** for any direct consumer of the lexer's `Token` type.
+- **Module split via `splitrs`.** `parser/ast/fmt.rs` and `parser/ast/mod.rs`
+  were split into smaller per-concern files (`fmt/functions.rs`,
+  `fmt/types.rs`, `ast/types.rs` plus `types_9.rs`/`types_10.rs`/`types_11.rs`,
+  etc.) to stay under the workspace's 2000-line-per-file policy — purely
+  internal reorganization, no functional or public-API change.
 
 ## Fork lineage & licensing
 

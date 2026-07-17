@@ -101,6 +101,8 @@
 //! use oxisql::prelude::*;
 //! ```
 
+use std::time::Duration;
+
 pub use oxisql_core::{
     ColumnInfo, Connection, ConnectionMetrics, ConnectionPool, ForeignKeyInfo, FromValue,
     IndexInfo, LoggingConnection, MetricsConnection, MetricsSnapshot, OxiSqlError, RetryConnection,
@@ -164,30 +166,112 @@ impl BackendInfo {
         }
     }
 
-    /// Metadata for the PostgreSQL backend.
+    /// Metadata for the PostgreSQL backend, with `version` statically `None`.
     ///
-    /// `version` is `None` here because the server version is not known until
-    /// after the connection handshake.
-    // TODO: populate version from server handshake once supported.
+    /// This is a **static, connectionless** constructor — like
+    /// [`backend_info_for_uri`], it performs no I/O, so the server version
+    /// cannot be known here. Once a `postgres` connection is established, use
+    /// `BackendInfo::from_postgres_connection` (requires the `postgres`
+    /// feature) instead to populate `version` from the live server.
     #[must_use]
     pub fn postgres() -> Self {
         Self {
             name: "postgres",
-            version: None, // populated after handshake — not known statically
+            version: None, // static dispatch — no connection to query yet
             features: vec!["tcp", "tls", "prepared-statements"],
         }
     }
 
-    /// Metadata for the MySQL backend.
+    /// Metadata for the MySQL backend, with `version` statically `None`.
     ///
-    /// `version` is `None` here because the server version is not known until
-    /// after the connection handshake.
-    // TODO: populate version from server handshake once supported.
+    /// This is a **static, connectionless** constructor — like
+    /// [`backend_info_for_uri`], it performs no I/O, so the server version
+    /// cannot be known here. Once a `mysql` connection is established, use
+    /// `BackendInfo::from_mysql_connection` (requires the `mysql` feature)
+    /// instead to populate `version` from the live server.
     #[must_use]
     pub fn mysql() -> Self {
         Self {
             name: "mysql",
-            version: None, // populated after handshake — not known statically
+            version: None, // static dispatch — no connection to query yet
+            features: vec!["tcp", "tls", "prepared-statements"],
+        }
+    }
+
+    /// Build [`BackendInfo`] for a **live** PostgreSQL connection, populating
+    /// `version` from the server's handshake parameters instead of leaving it
+    /// `None`.
+    ///
+    /// Unlike [`BackendInfo::postgres`], which is a static, connectionless
+    /// dispatcher, this reads `PgConnection::server_version` — a value
+    /// `PgConnection::connect` captures from the `server_version`
+    /// `ParameterStatus` message during the connection handshake — so the
+    /// returned `version` reflects the actual connected server.
+    ///
+    /// `version` is `None` only when `conn` was built via
+    /// `PgConnection::from_client` (no handshake parameters were available to
+    /// capture) or in the practically-impossible case that the server did not
+    /// report `server_version` at all.
+    ///
+    /// Requires the `postgres` feature.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use oxisql::postgres::{PgConnection, TlsMode};
+    ///
+    /// let conn = PgConnection::connect("host=localhost user=postgres", TlsMode::Disabled).await?;
+    /// let info = oxisql::BackendInfo::from_postgres_connection(&conn);
+    /// println!("server version: {:?}", info.version);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "postgres")]
+    #[must_use]
+    pub fn from_postgres_connection(conn: &oxisql_postgres::PgConnection) -> Self {
+        Self {
+            name: "postgres",
+            version: conn.server_version().map(str::to_string),
+            features: vec!["tcp", "tls", "prepared-statements"],
+        }
+    }
+
+    /// Build [`BackendInfo`] for a **live** MySQL connection, populating
+    /// `version` from the server's reported version instead of leaving it
+    /// `None`.
+    ///
+    /// Unlike [`BackendInfo::mysql`], which is a static, connectionless
+    /// dispatcher, this calls `MyConnection::server_version`, which reports
+    /// the actual connected server's version, formatted as
+    /// `"{major}.{minor}.{patch}"`. Because `mysql_async` checks connections
+    /// out of its pool per call rather than holding one persistently, this
+    /// performs a pool round-trip. On failure (e.g. the pool cannot reach the
+    /// server), `version` is left `None` rather than propagating the error,
+    /// since `BackendInfo` is best-effort metadata, not a health check.
+    ///
+    /// Requires the `mysql` feature.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use oxisql::mysql::{MyConnection, TlsMode};
+    ///
+    /// let conn = MyConnection::connect("mysql://root:@localhost/mydb", TlsMode::Disabled).await?;
+    /// let info = oxisql::BackendInfo::from_mysql_connection(&conn).await;
+    /// println!("server version: {:?}", info.version);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "mysql")]
+    #[must_use]
+    pub async fn from_mysql_connection(conn: &oxisql_mysql::MyConnection) -> Self {
+        Self {
+            name: "mysql",
+            version: conn.server_version().await.ok(),
             features: vec!["tcp", "tls", "prepared-statements"],
         }
     }
@@ -231,9 +315,12 @@ impl BackendInfo {
     /// Metadata for the Pure-Rust SQLite-compat backend (OxiSQLite — C-free fork).
     ///
     /// The version reflects the statically-known OxiSQLite engine version.  For
-    /// network backends (Postgres, MySQL) the server version is not known until
-    /// after the connection handshake; those leave `version: None`.
-    // TODO: populate postgres/mysql version from server handshake once supported.
+    /// network backends (Postgres, MySQL), the *static* dispatchers
+    /// ([`BackendInfo::postgres`], [`BackendInfo::mysql`]) leave `version:
+    /// None` since the server version is not known until after the
+    /// connection handshake; use `BackendInfo::from_postgres_connection` /
+    /// `BackendInfo::from_mysql_connection` on an established connection to
+    /// populate it instead.
     #[must_use]
     pub fn sqlite_compat() -> Self {
         Self {
@@ -328,7 +415,11 @@ pub use oxisql_sqlite_compat::SqliteConnection;
 /// populated from a URI query string using [`ConnectOptions::from_uri`].
 #[derive(Debug, Clone, Default)]
 pub struct ConnectOptions {
-    /// Connection timeout in milliseconds. None = no timeout.
+    /// Connection timeout in milliseconds, applied by
+    /// [`connect_with_options`] to network-backed drivers (PostgreSQL; see
+    /// that function's doc comment for why MySQL is unaffected in
+    /// practice). `None` falls back to [`DEFAULT_CONNECT_TIMEOUT`] rather
+    /// than waiting indefinitely.
     pub connect_timeout_ms: Option<u64>,
     /// Maximum pool size (used by `connect_pooled`).
     pub pool_size: Option<usize>,
@@ -470,9 +561,19 @@ pub fn version() -> &'static str {
 }
 
 /// Re-exports from the PostgreSQL backend (requires the `postgres` feature).
+///
+/// Logical-replication types are additionally re-exported when the
+/// `postgres-replication` feature is enabled (which also implies `postgres`).
 #[cfg(feature = "postgres")]
 pub mod postgres {
     pub use oxisql_postgres::{PgConnection, PgError, PgTransaction, TlsMode};
+
+    #[cfg(feature = "postgres-replication")]
+    pub use oxisql_postgres::{
+        pg_micros_to_unix_micros, unix_micros_to_pg_micros, CellValue, ColumnSpec, CreatedSlot,
+        IdentifySystem, LogicalReplicationMessage, Lsn, PgReplicationConnection, RelationBody,
+        ReplicaIdentity, ReplicationEvent, ReplicationStream, TupleColumn, TupleData,
+    };
 }
 
 /// Re-exports from the MySQL backend (requires the `mysql` feature).
@@ -633,6 +734,47 @@ pub mod pool {
     pub use oxisql_pool::{OxidbPool, PoolConfig, PoolConfigBuilder, PoolError, PoolMetrics};
 }
 
+/// Default upper bound on how long [`connect`] will wait for a
+/// network-backed driver (PostgreSQL, MySQL) to establish a connection
+/// before giving up.
+///
+/// Without a bound, a firewalled or "black-holed" host (one that silently
+/// drops packets instead of refusing the connection) leaves the connect
+/// call hanging for however long the OS TCP stack takes to give up on its
+/// own — often 60-130+ seconds, and sometimes effectively unbounded. This
+/// constant exists so [`connect`] fails cleanly well before that.
+///
+/// 10 seconds was chosen to:
+/// - Sit at the low (fast-feedback) end of the commonly-recommended 10-30s
+///   range for interactive/CLI database clients — [`connect`] is most
+///   visibly used from `oxisql-repl`, where a human is waiting on the
+///   result, so failing fast on an unreachable host matters more than it
+///   would for a long-lived background service. It is still generous
+///   relative to typical connection-establishment latency: even a slow or
+///   congested *working* network rarely takes more than a couple of
+///   seconds to complete a TCP handshake plus the PostgreSQL auth exchange,
+///   so legitimate slow connections are not expected to be falsely flagged.
+/// - Contrast deliberately with [`oxisql_pool::PoolConfig`]'s default
+///   (`connect_timeout_ms: Some(30_000)`): pool connections are typically
+///   established once, at service startup or idle-recovery time, where a
+///   longer wait is far more tolerable than in this facade's synchronous,
+///   one-shot `connect`.
+///
+/// Neither `tokio_postgres::Config` nor `mysql_async::Opts` apply a default
+/// connect timeout of their own (both leave it unbounded unless the caller
+/// opts in), so there was no existing driver default to match instead.
+///
+/// Only PostgreSQL is actually bounded by this value in practice — see the
+/// `mysql://` branch in this module's `connect_inner` for why MySQL's
+/// `connect` call performs no blocking network I/O to bound in the first
+/// place. Embedded/local backends (`memory://`, `redb://`, `fjall://`,
+/// `sled://`, `sqlite://`) are unaffected for the same reason.
+///
+/// Use [`connect_with_options`] with [`ConnectOptions::timeout_ms`] (or a
+/// `?connect_timeout=<secs>` query parameter parsed by
+/// [`ConnectOptions::from_uri`]) to override this default.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Connect to a database identified by `uri`.
 ///
 /// # URI schemes
@@ -644,12 +786,39 @@ pub mod pool {
 /// - `mysql://...` — MySQL (requires the `mysql` feature; connects with no TLS /
 ///   plain-text; for TLS use `mysql::MyConnection::connect` directly).
 ///
+/// # Connection timeout
+///
+/// Network-backed drivers are bounded by [`DEFAULT_CONNECT_TIMEOUT`] (10
+/// seconds) so a firewalled or black-holed host fails cleanly instead of
+/// hanging indefinitely. Use [`connect_with_options`] to override the
+/// default.
+///
 /// # Errors
 ///
 /// Returns [`OxiSqlError::NotConnected`] when no backend is compiled in for
-/// the requested scheme, or a backend-specific error on connection failure.
+/// the requested scheme, [`OxiSqlError::Timeout`] when a network-backed
+/// driver does not finish connecting within the timeout, or a
+/// backend-specific error on connection failure.
 #[must_use = "the returned Connection should be used for database operations"]
 pub async fn connect(uri: &str) -> Result<Box<dyn Connection>, OxiSqlError> {
+    connect_inner(uri, DEFAULT_CONNECT_TIMEOUT).await
+}
+
+/// Shared dispatch logic behind [`connect`] and [`connect_with_options`].
+///
+/// `timeout` bounds only the PostgreSQL driver, via
+/// `oxisql_postgres::PgConnection::connect_with_timeout`. Embedded/local
+/// backends perform no blocking network I/O and ignore it entirely.
+///
+/// MySQL is a deliberate exception, left unwrapped: `mysql_async::Pool::new`
+/// (invoked by `oxisql_mysql::MyConnection::connect`) constructs the pool
+/// object synchronously with no network I/O at all — connections are dialed
+/// lazily, per checkout, on the first `execute`/`query` call — so there is
+/// nothing for `timeout` to bound at this stage, and `mysql_async` exposes
+/// no client-side connect-timeout mechanism (neither an `OptsBuilder`
+/// method nor a recognised URL query parameter) to wire in even for
+/// defensive symmetry with PostgreSQL.
+async fn connect_inner(uri: &str, timeout: Duration) -> Result<Box<dyn Connection>, OxiSqlError> {
     #[cfg(feature = "embedded")]
     if uri.starts_with("memory://") {
         return oxisql_embedded::EmbeddedConnection::open_memory()
@@ -658,12 +827,19 @@ pub async fn connect(uri: &str) -> Result<Box<dyn Connection>, OxiSqlError> {
 
     #[cfg(feature = "postgres")]
     if uri.starts_with("postgres://") || uri.starts_with("postgresql://") {
-        let conn = oxisql_postgres::PgConnection::connect(uri, oxisql_postgres::TlsMode::Disabled)
-            .await
-            .map_err(|e| OxiSqlError::Other(e.to_string()))?;
+        let conn = oxisql_postgres::PgConnection::connect_with_timeout(
+            uri,
+            oxisql_postgres::TlsMode::Disabled,
+            timeout,
+        )
+        .await
+        .map_err(OxiSqlError::from)?;
         return Ok(Box::new(conn) as Box<dyn Connection>);
     }
 
+    // See this function's doc comment: `MyConnection::connect` only builds a
+    // `mysql_async::Pool` (synchronous, no network I/O), so `timeout` has
+    // nothing to bound here and is intentionally not applied.
     #[cfg(feature = "mysql")]
     if uri.starts_with("mysql://") {
         let conn = oxisql_mysql::MyConnection::connect(uri, oxisql_mysql::TlsMode::Disabled)
@@ -770,6 +946,11 @@ pub async fn connect(uri: &str) -> Result<Box<dyn Connection>, OxiSqlError> {
              URI was: {uri}"
         )));
     }
+
+    // Suppress an unused-variable warning when `postgres` — the only branch
+    // that reads `timeout` — is not compiled in. `Duration` is `Copy`, so
+    // this discard has no effect on the real use above when it is.
+    let _ = timeout;
 
     Err(OxiSqlError::UnsupportedUri(uri.to_string()))
 }
@@ -1071,7 +1252,13 @@ fn render_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
 /// [`is_database_missing_error`] can classify a missing database.
 #[cfg(feature = "postgres")]
 async fn pg_probe(uri: &str) -> Result<(), OxiSqlError> {
-    match oxisql_postgres::PgConnection::connect(uri, oxisql_postgres::TlsMode::Disabled).await {
+    match oxisql_postgres::PgConnection::connect_with_timeout(
+        uri,
+        oxisql_postgres::TlsMode::Disabled,
+        DEFAULT_CONNECT_TIMEOUT,
+    )
+    .await
+    {
         Ok(_conn) => Ok(()),
         Err(e) => Err(OxiSqlError::Other(format!(
             "postgres connect error: {}",
@@ -1243,21 +1430,43 @@ pub async fn connect_pool(
 
 /// Connect to a database with explicit [`ConnectOptions`].
 ///
-/// This is the same as [`connect`] but accepts additional options.
-/// Currently `connect_timeout_ms` and `require_tls` options are **not yet
-/// applied** — they require backend-specific support.  `pool_size` is
-/// ignored (use [`connect_pooled`] for pooling).
+/// This is the same as [`connect`], except `opts.connect_timeout_ms` — when
+/// set — overrides [`DEFAULT_CONNECT_TIMEOUT`] for the PostgreSQL driver
+/// (MySQL's `connect` performs no blocking network I/O regardless; see
+/// [`connect`]'s doc comment). `require_tls` is **not yet applied** — it
+/// requires backend-specific support (use [`connect_with_tls`] for an
+/// explicit TLS config in the meantime). `pool_size` is ignored (use
+/// [`connect_pooled`] for pooling).
 ///
 /// # Errors
 ///
 /// Returns [`OxiSqlError::NotConnected`] when no backend is compiled in for
-/// the requested scheme, or a backend-specific error on connection failure.
+/// the requested scheme, [`OxiSqlError::Timeout`] when the PostgreSQL
+/// driver does not finish connecting within the (possibly overridden)
+/// timeout, or a backend-specific error on connection failure.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), oxisql::OxiSqlError> {
+/// // Override the default 10-second timeout with a short one for a
+/// // fast-fail health check against a possibly-unreachable host.
+/// let opts = oxisql::ConnectOptions::new().timeout_ms(2_000);
+/// let _conn = oxisql::connect_with_options("postgres://localhost/mydb", opts).await?;
+/// # Ok(())
+/// # }
+/// ```
 #[must_use = "the returned Connection should be used for database operations"]
 pub async fn connect_with_options(
     uri: &str,
-    _opts: ConnectOptions,
+    opts: ConnectOptions,
 ) -> Result<Box<dyn Connection>, OxiSqlError> {
-    connect(uri).await
+    let timeout = opts
+        .connect_timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_CONNECT_TIMEOUT);
+    connect_inner(uri, timeout).await
 }
 
 /// Connect to a database with an explicit TLS configuration.
@@ -1300,12 +1509,13 @@ pub async fn connect_with_tls(
     #[cfg(feature = "postgres")]
     if uri.starts_with("postgres://") || uri.starts_with("postgresql://") {
         if let Some(tls_cfg) = _tls_config {
-            let conn = oxisql_postgres::PgConnection::connect(
+            let conn = oxisql_postgres::PgConnection::connect_with_timeout(
                 uri,
                 oxisql_postgres::TlsMode::Rustls(tls_cfg),
+                DEFAULT_CONNECT_TIMEOUT,
             )
             .await
-            .map_err(|e| OxiSqlError::Other(e.to_string()))?;
+            .map_err(OxiSqlError::from)?;
             return Ok(Box::new(conn) as Box<dyn Connection>);
         }
     }
@@ -1355,6 +1565,15 @@ pub async fn introspect(conn: &dyn Connection) -> Vec<TableInfo> {
     conn.tables().await.unwrap_or_default()
 }
 
+// ── Clean error display ─────────────────────────────────────────────────────
+//
+// Implementation lives in `error_display.rs` (kept out of this file to stay
+// under the workspace's 2000-line guideline); `display_error` is
+// re-exported here so `oxisql::display_error` keeps working unchanged.
+
+mod error_display;
+pub use error_display::display_error;
+
 #[cfg(test)]
 mod feature_flag_tests {
     /// Verify that the feature-gated code compiles for all enabled features.
@@ -1373,10 +1592,31 @@ mod feature_flag_tests {
         #[cfg(feature = "postgres")]
         {
             let _: fn() -> crate::BackendInfo = crate::BackendInfo::postgres;
+            // `from_postgres_connection` takes a live `&PgConnection` — no
+            // connection is created here, this only proves the signature
+            // type-checks (`fn(&PgConnection) -> BackendInfo`).
+            let _: fn(&oxisql_postgres::PgConnection) -> crate::BackendInfo =
+                crate::BackendInfo::from_postgres_connection;
         }
         #[cfg(feature = "mysql")]
         {
             let _: fn() -> crate::BackendInfo = crate::BackendInfo::mysql;
+            // `from_mysql_connection` is `async fn(&MyConnection) -> BackendInfo`.
+            // Its opaque `impl Future` return type captures the input
+            // reference's lifetime, which makes a plain `fn`-pointer
+            // coercion fail to type-check (a known limitation with async fns
+            // taking borrowed parameters) — so, mirroring
+            // `connect_with_timeout_signature_compiles` in
+            // `oxisql-postgres/tests/connect.rs`, a thin wrapper function
+            // whose body calls it is used instead to prove the signature
+            // type-checks, without ever running it.
+            #[allow(dead_code)]
+            async fn _check_from_mysql_connection(
+                conn: &oxisql_mysql::MyConnection,
+            ) -> crate::BackendInfo {
+                crate::BackendInfo::from_mysql_connection(conn).await
+            }
+            let _ = std::mem::size_of_val(&_check_from_mysql_connection);
         }
         #[cfg(feature = "datafusion")]
         {

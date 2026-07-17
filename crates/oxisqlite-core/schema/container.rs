@@ -11,7 +11,7 @@ use std::sync::Arc;
 use super::bootstrap::{SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT};
 use super::index::Index;
 use super::sqlite_schema_table;
-use super::table::{BTreeTable, Table};
+use super::table::{BTreeTable, Table, View};
 
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
@@ -61,6 +61,15 @@ impl Schema {
     pub fn add_virtual_table(&mut self, table: Rc<VirtualTable>) {
         let name = normalize_ident(&table.name);
         self.tables.insert(name, Table::Virtual(table).into());
+    }
+    /// Register (or re-register, overwriting) a view under its normalized name,
+    /// in the same flat namespace as tables and virtual tables. Re-registration
+    /// is used by the two-phase schema loader: a placeholder view (empty
+    /// `columns`) is first inserted so every view is name-resolvable, then
+    /// replaced by a column-resolved copy in a later pass.
+    pub fn add_view(&mut self, view: Rc<View>) {
+        let name = normalize_ident(&view.name);
+        self.tables.insert(name, Table::View(view).into());
     }
     pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
         let name = normalize_ident(name);

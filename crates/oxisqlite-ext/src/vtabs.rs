@@ -38,6 +38,19 @@ pub struct VTabCreateResult {
 
 #[cfg(feature = "core_only")]
 impl VTabModuleImpl {
+    /// Instantiates the virtual table module via its FFI `create` (`xCreate`/`xConnect`)
+    /// callback, returning the schema it declares together with the live table instance
+    /// pointer.
+    ///
+    /// This is the single, on-demand source of truth for a virtual table's column list:
+    /// there is no separate cache of column names persisted anywhere. The caller that
+    /// creates the real, long-lived table instance (`VirtualTable::table` in
+    /// `oxisqlite-core`, driven by the `VCreate` instruction) parses columns straight out
+    /// of the returned schema and keeps the table pointer alive; anything that later needs
+    /// to know those columns again (query compilation, `PRAGMA table_info`, schema reload
+    /// via `parse_schema_rows`) reads that same already-resolved `VirtualTable`, mirroring
+    /// how SQLite itself never persists a virtual table's column list in `sqlite_schema.sql`
+    /// and instead (re)connects the module on demand whenever it needs to know the columns.
     pub fn create(&self, args: Vec<Value>) -> crate::ExtResult<(String, *const c_void)> {
         let result = unsafe { (self.create)(args.as_ptr(), args.len() as i32) };
         for arg in args {
@@ -48,25 +61,6 @@ impl VTabModuleImpl {
         }
         let schema = unsafe { std::ffi::CString::from_raw(result.schema as *mut _) };
         Ok((schema.to_string_lossy().to_string(), result.table))
-    }
-
-    // TODO: This function is temporary and should eventually be removed.
-    //       The only difference from `create` is that it takes ownership of the table instance.
-    //       Currently, it is used to generate virtual table column names that are stored in
-    //       `sqlite_schema` alongside the table's schema.
-    //       However, storing column names is not necessary to match SQLite's behavior.
-    //       SQLite computes the list of columns dynamically each time the `.schema` command
-    //       is executed, using the `shell_add_schema` UDF function.
-    pub fn create_schema(&self, args: Vec<Value>) -> crate::ExtResult<String> {
-        self.create(args).and_then(|(schema, table)| {
-            // Drop the allocated table instance to avoid a memory leak.
-            let result = unsafe { (self.destroy)(table) };
-            if result.is_ok() {
-                Ok(schema)
-            } else {
-                Err(result)
-            }
-        })
     }
 }
 

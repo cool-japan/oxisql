@@ -1,6 +1,7 @@
 //! This module contains all `Param` related utilities and traits.
 
 use crate::{Error, Result, Value};
+use std::borrow::Cow;
 
 mod sealed {
     pub trait Sealed {}
@@ -98,7 +99,13 @@ pub trait IntoParams: Sealed {
 pub enum Params {
     None,
     Positional(Vec<Value>),
-    Named(Vec<(String, Value)>),
+    /// `(name, value)` pairs. `name` includes its `:`/`@`/`$`/`#` prefix
+    /// character, exactly as `oxisqlite_core::parameters::Parameters` stores
+    /// and looks it up. `Cow` so the overwhelmingly common case — a
+    /// `'static` placeholder-name literal, e.g. `[(":name", value)]` — is
+    /// borrowed rather than allocated; owned `String` keys still work and
+    /// allocate as before.
+    Named(Vec<(Cow<'static, str>, Value)>),
 }
 
 /// Convert an owned iterator into Params.
@@ -158,7 +165,7 @@ impl<T: IntoValue> IntoParams for Vec<(String, T)> {
     fn into_params(self) -> Result<Params> {
         let values = self
             .into_iter()
-            .map(|(k, v)| Ok((k, v.into_value()?)))
+            .map(|(k, v)| Ok((Cow::Owned(k), v.into_value()?)))
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Params::Named(values))
@@ -172,16 +179,18 @@ impl<T: IntoValue, const N: usize> IntoParams for [T; N] {
     }
 }
 
-impl<T: IntoValue, const N: usize> Sealed for [(&str, T); N] {}
-impl<T: IntoValue, const N: usize> IntoParams for [(&str, T); N] {
+impl<T: IntoValue, const N: usize> Sealed for [(&'static str, T); N] {}
+impl<T: IntoValue, const N: usize> IntoParams for [(&'static str, T); N] {
     fn into_params(self) -> Result<Params> {
-        self.into_iter()
-            // TODO: Pretty unfortunate that we need to allocate here when we know
-            // the str is likely 'static. Maybe we should convert our param names
-            // to be `Cow<'static, str>`?
-            .map(|(k, v)| Ok((k.to_string(), v.into_value()?)))
-            .collect::<Result<Vec<_>>>()?
-            .into_params()
+        // `k` is `&'static str` — almost always a placeholder-name literal
+        // such as `":name"` — so it borrows straight into `Params::Named`
+        // with no allocation (see `Params::Named`'s `Cow` field).
+        let values = self
+            .into_iter()
+            .map(|(k, v)| Ok((Cow::Borrowed(k), v.into_value()?)))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Params::Named(values))
     }
 }
 
@@ -207,10 +216,12 @@ macro_rules! tuple_into_params {
 
 macro_rules! named_tuple_into_params {
     ($count:literal : $(($field:tt $ftype:ident)),* $(,)?) => {
-        impl<$($ftype,)*> Sealed for ($((&str, $ftype),)*) where $($ftype: IntoValue,)* {}
-        impl<$($ftype,)*> IntoParams for ($((&str, $ftype),)*) where $($ftype: IntoValue,)* {
+        impl<$($ftype,)*> Sealed for ($((&'static str, $ftype),)*) where $($ftype: IntoValue,)* {}
+        impl<$($ftype,)*> IntoParams for ($((&'static str, $ftype),)*) where $($ftype: IntoValue,)* {
             fn into_params(self) -> Result<Params> {
-                let params = Params::Named(vec![$((self.$field.0.to_string(), self.$field.1.into_value()?)),*]);
+                // `self.$field.0` is `&'static str`, so it borrows straight
+                // into `Cow` with no allocation (see `Params::Named`).
+                let params = Params::Named(vec![$((Cow::Borrowed(self.$field.0), self.$field.1.into_value()?)),*]);
                 Ok(params)
             }
         }

@@ -20,6 +20,34 @@ struct PageCacheEntry {
     next: Option<NonNull<PageCacheEntry>>,
 }
 
+/// Reconstructs the `Box<PageCacheEntry>` that `_insert` allocated via
+/// `Box::new` and then leaked into a raw pointer via `Box::into_raw`, and
+/// drops it.
+///
+/// This both runs `PageCacheEntry`'s destructor (releasing its `PageRef`,
+/// i.e. decrementing the cached page's `Arc<Page>` refcount) *and*
+/// deallocates the heap block `Box::new` allocated. Using
+/// `std::ptr::drop_in_place` alone -- as this module used to -- is *not*
+/// sufficient: `drop_in_place` only runs the destructor, it never
+/// deallocates the backing allocation, so every call site that used it
+/// leaked one `PageCacheEntry`-sized allocation per call (on top of the
+/// separate leak of every entry still resident when the cache itself was
+/// dropped, since neither `DumbLruPageCache` nor `PageHashMap` used to
+/// implement `Drop`).
+///
+/// # Safety
+/// - `ptr` must have been produced by `Box::into_raw(Box::new(..))` in
+///   `_insert` and must not already have been freed.
+/// - Callers must ensure this runs at *most once* per allocation. The
+///   intrusive doubly-linked list (`DumbLruPageCache::head`/`tail` and each
+///   entry's `prev`/`next`) is the sole owner of every `PageCacheEntry`;
+///   `PageHashMap` only stores a second, non-owning `NonNull` alias into the
+///   very same allocation (for O(1) key lookup), so cleanup must walk
+///   either the list or the map to free nodes -- never both.
+unsafe fn free_entry(ptr: NonNull<PageCacheEntry>) {
+    drop(unsafe { Box::from_raw(ptr.as_ptr()) });
+}
+
 pub struct DumbLruPageCache {
     capacity: usize,
     map: RefCell<PageHashMap>,
@@ -29,6 +57,11 @@ pub struct DumbLruPageCache {
 unsafe impl Send for DumbLruPageCache {}
 unsafe impl Sync for DumbLruPageCache {}
 
+// Intentionally does *not* implement `Drop`: every `NonNull<PageCacheEntry>`
+// stored in `buckets` is a non-owning alias into an allocation owned by
+// `DumbLruPageCache`'s intrusive LRU list (see `free_entry`'s safety
+// doc-comment). Freeing entries here too, on top of `DumbLruPageCache`'s
+// `Drop` impl, would double-free every node still cached at drop time.
 struct PageHashMap {
     // FIXME: do we prefer array buckets or list? Deletes will be slower here which I guess happens often. I will do this for now to test how well it does.
     buckets: Vec<Vec<HashMapNode>>,
@@ -50,6 +83,16 @@ pub enum CacheError {
     ActiveRefs,
     Full,
     KeyExists,
+    /// A different page (a distinct `PageRef`) was already cached under this
+    /// key. Callers are expected to only ever insert the same key with either
+    /// (a) the exact same `PageRef` they previously inserted (harmless,
+    /// reported as [`CacheError::KeyExists`]) or (b) a key that truly isn't
+    /// present yet. Hitting this variant means a key collided with genuinely
+    /// different page content, which should be unreachable under the pager's
+    /// current locking discipline (it always holds the cache's write lock
+    /// across its own get+insert sequence) -- but we still report it as an
+    /// error rather than panicking, in case that discipline is ever relaxed.
+    KeyExistsContentMismatch,
 }
 
 #[derive(Debug, PartialEq)]
@@ -100,10 +143,14 @@ impl DumbLruPageCache {
         // Check first if page already exists in cache
         if !ignore_exists {
             if let Some(existing_page_ref) = self.get(&key) {
-                assert!(
-                    Arc::ptr_eq(&value, &existing_page_ref),
-                    "Attempted to insert different page with same key"
-                );
+                if !Arc::ptr_eq(&value, &existing_page_ref) {
+                    // Someone tried to insert a genuinely different page under
+                    // a key that's already occupied. This should not happen
+                    // in practice (see `CacheError::KeyExistsContentMismatch`
+                    // doc), but if it ever does, surface it as an error
+                    // instead of panicking and taking down the process.
+                    return Err(CacheError::KeyExistsContentMismatch);
+                }
                 return Err(CacheError::KeyExists);
             }
         }
@@ -136,8 +183,13 @@ impl DumbLruPageCache {
         let ptr = *self.map.borrow().get(&key).unwrap();
         // Try to detach from LRU list first, can fail
         self.detach(ptr, clean_page)?;
-        let ptr = self.map.borrow_mut().remove(&key).unwrap();
-        unsafe { std::ptr::drop_in_place(ptr.as_ptr()) };
+        if let Some(ptr) = self.map.borrow_mut().remove(&key) {
+            // SAFETY: `ptr` was just unlinked from the LRU list by `detach`
+            // above (the list is its owning structure) and removed from the
+            // map (its only other, non-owning alias), so this is the single
+            // place that frees this particular allocation.
+            unsafe { free_entry(ptr) };
+        }
         Ok(())
     }
 
@@ -296,7 +348,10 @@ impl DumbLruPageCache {
             unsafe {
                 assert!(!current_entry.as_ref().page.is_dirty());
             }
-            unsafe { std::ptr::drop_in_place(current_entry.as_ptr()) };
+            // SAFETY: `current_entry` was just removed from the map above
+            // (its only non-owning alias) and unlinked from the LRU list by
+            // `detach`, so this is the only place it is freed.
+            unsafe { free_entry(current_entry) };
             current = next;
         }
         let _ = self.head.take();
@@ -479,6 +534,44 @@ impl DumbLruPageCache {
 impl Default for DumbLruPageCache {
     fn default() -> Self {
         DumbLruPageCache::new(DEFAULT_PAGE_CACHE_SIZE_IN_PAGES)
+    }
+}
+
+impl Drop for DumbLruPageCache {
+    /// Frees every `PageCacheEntry` still resident in the cache when it is
+    /// dropped.
+    ///
+    /// Without this, every `Box::new(PageCacheEntry {..})` allocation made
+    /// by `_insert` (see `NonNull::new_unchecked` right after it) that was
+    /// still linked into the LRU list when the last owner of this cache
+    /// (its enclosing `Arc<RwLock<DumbLruPageCache>>`) went away would leak
+    /// permanently -- confirmed by a Miri leak-check pass that reported
+    /// thousands of such allocations still resident at process/test exit.
+    ///
+    /// This walks the intrusive LRU list directly rather than delegating to
+    /// `clear()`/`detach()`: those deliberately *refuse* to touch a locked
+    /// or dirty page, which is the right call during normal LRU eviction
+    /// (never silently evict data that hasn't been flushed/isn't safe to
+    /// touch yet) but would be exactly the wrong call here. By the time
+    /// `Drop` runs, the cache and everything referencing it is going away
+    /// unconditionally -- there is no "later" for a dirty page to be
+    /// flushed at, and no LRU ordering left to preserve -- so skipping a
+    /// locked/dirty node here would simply leak it, defeating the point of
+    /// this impl. `PageHashMap`'s copy of each pointer is never touched:
+    /// it's a non-owning alias into the same allocation (see `free_entry`),
+    /// and `PageHashMap` has no `Drop` impl of its own, so it is safe to
+    /// let the map's `Vec<Vec<HashMapNode>>` drop as inert `NonNull` values
+    /// after this loop has already freed every node exactly once.
+    fn drop(&mut self) {
+        let mut current = *self.head.borrow();
+        while let Some(entry) = current {
+            // SAFETY: `entry` is a live `PageCacheEntry` allocation reachable
+            // from `head`; we read its `next` pointer before freeing it, and
+            // every node is visited (and freed) exactly once as we walk the
+            // list front to back, so this never touches a freed allocation.
+            current = unsafe { entry.as_ref().next };
+            unsafe { free_entry(entry) };
+        }
     }
 }
 
@@ -831,7 +924,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Attempted to insert different page with same key")]
     fn test_insert_existing_key_fail() {
         let mut cache = DumbLruPageCache::default();
         let key1 = create_key(1);
@@ -840,7 +932,19 @@ mod tests {
         assert!(cache.insert(key1.clone(), page1_v1.clone()).is_ok());
         assert_eq!(cache.len(), 1);
         cache.verify_list_integrity();
-        let _ = cache.insert(key1.clone(), page1_v2.clone()); // Panic
+
+        // Inserting a *different* page under the same, already-occupied key
+        // must return an error rather than panicking.
+        let result = cache.insert(key1.clone(), page1_v2.clone());
+        assert!(
+            matches!(result, Err(CacheError::KeyExistsContentMismatch)),
+            "expected KeyExistsContentMismatch, got {:?}",
+            result
+        );
+        // The failed insert must not have disturbed the existing entry.
+        assert_eq!(cache.len(), 1);
+        assert!(Arc::ptr_eq(&cache.get(&key1).unwrap(), &page1_v1));
+        cache.verify_list_integrity();
     }
 
     #[test]
@@ -909,6 +1013,14 @@ mod tests {
         assert!(cache.map.borrow_mut().remove(&key).is_some());
         cache.verify_list_integrity();
         assert_eq!(cache.len(), 0);
+        // `detach` only unlinks from the LRU list, and the preceding
+        // `map.remove` only de-indexes it -- exactly the two steps `_delete`
+        // takes before freeing (see `free_entry`). Since this test bypasses
+        // the safe `delete()`/`_delete()` API to exercise `detach()` in
+        // isolation, it must finish that pairing itself, or `entry` is
+        // orphaned (unreachable from `cache` via either the list or the
+        // map) and leaks.
+        unsafe { free_entry(entry) };
     }
 
     #[test]
@@ -924,12 +1036,19 @@ mod tests {
         assert!(!page_has_content(&page));
         assert!(cache.map.borrow_mut().remove(&key).is_some());
         cache.verify_list_integrity();
+        // See `test_detach_without_cleaning`: `detach` + the manual
+        // `map.remove` above fully de-link `entry`, so this test -- not
+        // `_delete` -- owns freeing it. `page` (a separate `Arc<Page>`
+        // clone obtained from `peek` above) still holds its own reference
+        // and drops normally at the end of this function, independent of
+        // freeing the entry itself.
+        unsafe { free_entry(entry) };
     }
 
     #[test]
     fn test_detach_only_element_preserves_integrity() {
         let mut cache = DumbLruPageCache::default();
-        let (_, entry) = insert_and_get_entry(&mut cache, 1);
+        let (key, entry) = insert_and_get_entry(&mut cache, 1);
         assert!(cache.detach(entry, false).is_ok());
         assert!(
             cache.head.borrow().is_none(),
@@ -939,6 +1058,15 @@ mod tests {
             cache.tail.borrow().is_none(),
             "Tail should be None after detaching only element"
         );
+        // Unlike the other `detach`-only tests above, this one never removed
+        // `key` from the map, so `entry` is still reachable (and would be
+        // freed correctly by `DumbLruPageCache::drop`'s list walk -- except
+        // `detach` just unlinked it from that very list, so the list can no
+        // longer reach it either). Finish the same `map.remove` + free
+        // pairing `_delete` does so the map isn't left with a dangling
+        // pointer and `entry` isn't leaked.
+        assert!(cache.map.borrow_mut().remove(&key).is_some());
+        unsafe { free_entry(entry) };
     }
 
     #[test]
@@ -968,6 +1096,12 @@ mod tests {
         );
         assert!(cache.map.borrow_mut().remove(&key2).is_some());
         cache.verify_list_integrity();
+        // key1 and key3 were never detached, so they remain reachable from
+        // `cache.head`/`tail` and will be freed by `DumbLruPageCache::drop`
+        // when `cache` goes out of scope below. `entry2` (key2) was fully
+        // de-linked above (list + map), exactly like the other `detach`
+        // tests, so this test must free it itself.
+        unsafe { free_entry(entry2) };
     }
 
     #[test]
@@ -1119,7 +1253,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Attempted to insert different page with same key")]
     fn test_resize_larger() {
         let mut cache = DumbLruPageCache::default();
         let _ = insert_page(&mut cache, 1);
@@ -1135,8 +1268,15 @@ mod tests {
             let _ = insert_page(&mut cache, i);
         }
         assert_eq!(cache.len(), 5);
-        // FIXME: For now this will assert because we cannot insert a page with same id but different contents of page.
-        assert!(cache.insert(create_key(4), page_with_content(4)).is_err());
+        // We cannot insert a page with the same id but different contents: this
+        // must return a content-mismatch error rather than panicking.
+        let result = cache.insert(create_key(4), page_with_content(4));
+        assert!(
+            matches!(result, Err(CacheError::KeyExistsContentMismatch)),
+            "expected KeyExistsContentMismatch, got {:?}",
+            result
+        );
+        assert_eq!(cache.len(), 5);
         cache.verify_list_integrity();
     }
 

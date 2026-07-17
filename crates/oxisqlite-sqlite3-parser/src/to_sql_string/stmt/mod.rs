@@ -32,28 +32,39 @@ impl ToSqlString for ast::Stmt {
             Self::Attach {
                 expr,
                 db_name,
-                key: _,
+                key,
+                database_kw,
             } => {
-                // TODO: what is `key` in the attach syntax?
                 format!(
-                    "ATTACH {} AS {};",
+                    "ATTACH{} {} AS {}{};",
+                    if *database_kw { " DATABASE" } else { "" },
                     expr.to_sql_string(context),
-                    db_name.to_sql_string(context)
+                    db_name.to_sql_string(context),
+                    key.as_ref().map_or("".to_string(), |key| format!(
+                        " KEY {}",
+                        key.to_sql_string(context)
+                    ))
                 )
             }
-            // TODO: not sure where name is applied here
-            // https://www.sqlite.org/lang_transaction.html
-            Self::Begin(transaction_type, _name) => {
+            Self::Begin(transaction_type, name) => {
                 let t_type = transaction_type.map_or("", |t_type| match t_type {
                     ast::TransactionType::Deferred => " DEFERRED",
                     ast::TransactionType::Exclusive => " EXCLUSIVE",
                     ast::TransactionType::Immediate => " IMMEDIATE",
                 });
-                format!("BEGIN{};", t_type)
+                format!(
+                    "BEGIN{}{};",
+                    t_type,
+                    name.as_ref()
+                        .map_or("".to_string(), |name| format!(" TRANSACTION {}", name.0))
+                )
             }
             // END or COMMIT are equivalent here, so just defaulting to COMMIT
-            // TODO: again there are no names in the docs
-            Self::Commit(_name) => "COMMIT;".to_string(),
+            Self::Commit(name) => format!(
+                "COMMIT{};",
+                name.as_ref()
+                    .map_or("".to_string(), |name| format!(" TRANSACTION {}", name.0))
+            ),
             Self::CreateIndex {
                 unique,
                 if_not_exists,
@@ -173,12 +184,13 @@ impl ToSqlString for ast::Stmt {
             ),
             Self::Release(name) => format!("RELEASE {};", name.0),
             Self::Rollback {
-                // TODO: there is no transaction name in SQLITE
-                // https://www.sqlite.org/lang_transaction.html
-                tx_name: _,
+                tx_name,
                 savepoint_name,
             } => format!(
-                "ROLLBACK{};",
+                "ROLLBACK{}{};",
+                tx_name
+                    .as_ref()
+                    .map_or("".to_string(), |name| format!(" TRANSACTION {}", name.0)),
                 savepoint_name
                     .as_ref()
                     .map_or("".to_string(), |name| format!(" TO {}", name.0))
@@ -202,7 +214,7 @@ impl ToSqlString for ast::Stmt {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::to_sql_string::ToSqlContext;
 
     #[macro_export]
@@ -246,11 +258,15 @@ mod tests {
     // Placeholders for compilation
     // Context only necessary parsing inside limbo_core or in the simulator
     impl ToSqlContext for TestContext {
-        fn get_column_name(&self, _table_id: crate::ast::TableInternalId, _col_idx: usize) -> &str {
+        fn get_column_name(
+            &self,
+            _table_id: crate::ast::TableReferenceId,
+            _col_idx: usize,
+        ) -> &str {
             todo!()
         }
 
-        fn get_table_name(&self, _id: crate::ast::TableInternalId) -> &str {
+        fn get_table_name(&self, _id: crate::ast::TableReferenceId) -> &str {
             todo!()
         }
     }
@@ -271,7 +287,27 @@ mod tests {
 
     to_sql_string_test!(test_attach, "ATTACH './test.db' AS test_db;");
 
+    // ATTACH vs ATTACH DATABASE must round-trip to their own form.
+    to_sql_string_test!(test_attach_no_database_kw, "ATTACH './test.db' AS test_db;");
+
+    to_sql_string_test!(
+        test_attach_database_kw,
+        "ATTACH DATABASE './test.db' AS test_db;"
+    );
+
+    to_sql_string_test!(
+        test_attach_with_key,
+        "ATTACH './test.db' AS test_db KEY 'secret';"
+    );
+
+    to_sql_string_test!(
+        test_attach_database_kw_with_key,
+        "ATTACH DATABASE './test.db' AS test_db KEY 'secret';"
+    );
+
     to_sql_string_test!(test_transaction, "BEGIN;");
+
+    to_sql_string_test!(test_transaction_with_name, "BEGIN TRANSACTION name;");
 
     to_sql_string_test!(test_transaction_deferred, "BEGIN DEFERRED;");
 
@@ -280,6 +316,8 @@ mod tests {
     to_sql_string_test!(test_transaction_exclusive, "BEGIN EXCLUSIVE;");
 
     to_sql_string_test!(test_commit, "COMMIT;");
+
+    to_sql_string_test!(test_commit_with_name, "COMMIT TRANSACTION name;");
 
     // Test a simple index on a single column
     to_sql_string_test!(
@@ -406,6 +444,13 @@ mod tests {
     to_sql_string_test!(test_rollback, "ROLLBACK;");
 
     to_sql_string_test!(test_rollback_2, "ROLLBACK TO savepoint_name;");
+
+    to_sql_string_test!(test_rollback_with_name, "ROLLBACK TRANSACTION name;");
+
+    to_sql_string_test!(
+        test_rollback_with_name_and_savepoint,
+        "ROLLBACK TRANSACTION name TO savepoint_name;"
+    );
 
     to_sql_string_test!(test_savepoint, "SAVEPOINT savepoint_name;");
 

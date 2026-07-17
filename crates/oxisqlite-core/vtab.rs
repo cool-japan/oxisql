@@ -259,13 +259,13 @@ impl ExtVirtualTable {
     fn update(&self, args: &[Value]) -> crate::Result<Option<i64>> {
         let arg_count = args.len();
         let ext_args = args.iter().map(|arg| arg.to_ffi()).collect::<Vec<_>>();
-        let newrowid = 0i64;
+        let mut newrowid = 0i64;
         let rc = unsafe {
             (self.implementation.update)(
                 self.table_ptr,
                 arg_count as i32,
                 ext_args.as_ptr(),
-                &newrowid as *const _ as *mut i64,
+                &mut newrowid as *mut i64,
             )
         };
         for arg in ext_args {

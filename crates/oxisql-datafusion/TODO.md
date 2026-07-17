@@ -1,6 +1,6 @@
 # oxisql-datafusion — TODO
 
-**Status:** Alpha · v0.3.2 · 87 tests pass (4 ignored).
+**Status:** Alpha · v0.3.3 · 67 tests pass (default features), 87 tests pass (`--all-features`, 4 ignored).
 
 Apache DataFusion 53.x bridge exposing OxiSQL-backed tables to OLAP SQL. Ships a snapshot provider (`OxiSqlTableProvider`) and a live-streaming provider (`OxiSqlStreamProvider`), an `OxiSqlContext` `SessionContext` wrapper, filter/projection/limit/sort pushdown, multi-table catalog registration for cross-table joins, full `Value` ↔ Arrow type mapping, and range-based partitioning for parallel scans.
 
@@ -33,7 +33,7 @@ Apache DataFusion 53.x bridge exposing OxiSQL-backed tables to OLAP SQL. Ships a
 
 ### Errors & quality
 - [x] `OxiSqlFusionError` — `OxiSql`, `Arrow`, `DataFusion`, `SchemaMismatch`, `UnsupportedType` variants.
-- [x] 83 tests — live streaming, filter/projection/limit pushdown, multi-table JOIN, aggregation, window functions, range partition, NULL handling, schema-mismatch detection, extended types, structural plan_bridge Filter+Project lowering.
+- [x] 67 tests (default features), 87 tests (`--all-features`) — live streaming, filter/projection/limit pushdown, multi-table JOIN, aggregation, window functions, range partition, NULL handling, schema-mismatch detection, extended types, structural plan_bridge Filter+Project lowering.
 - [x] Criterion benchmarks (`benches/datafusion_benchmarks.rs`) — snapshot register+plan+execute, filter-pushdown speedup, RecordBatch construction, multi-partition scan.
 
 ## Roadmap / next

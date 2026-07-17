@@ -5,7 +5,7 @@ use crate::schema::{affinity, Affinity};
 use crate::Result;
 use crate::{error::LimboError, function::MathFunc};
 use crate::{
-    types::Value,
+    types::{Text, TextSubtype, Value},
     util::{cast_text_to_integer, cast_text_to_numeric, cast_text_to_real, RoundToPrecision},
 };
 use regex::{Regex, RegexBuilder};
@@ -187,7 +187,15 @@ impl Value {
         match self {
             Value::Null => Value::build_text("NULL"),
             Value::Integer(_) | Value::Float(_) => self.to_owned(),
-            Value::Blob(_) => todo!(),
+            Value::Blob(b) => {
+                // SQLite: QUOTE() renders a BLOB as a hex literal X'...' with
+                // uppercase hex digit pairs, e.g. [0xDE, 0xAD] -> "X'DEAD'".
+                let mut quoted = String::with_capacity(b.len() * 2 + 3);
+                quoted.push_str("X'");
+                quoted.push_str(&hex::encode_upper(b));
+                quoted.push('\'');
+                Value::build_text(&quoted)
+            }
             Value::Text(s) => {
                 let mut quoted = String::with_capacity(s.as_str().len() + 2);
                 quoted.push('\'');
@@ -665,8 +673,34 @@ impl Value {
                 Value::build_text(&(lhs_float.to_string() + &rhs_float.to_string()))
             }
             (Value::Null, _) | (_, Value::Null) => Value::Null,
-            (Value::Blob(_), _) | (_, Value::Blob(_)) => {
-                todo!("TODO: Handle Blob conversion to String")
+            // SQLite: `||` stays a Blob only when BOTH operands are Blobs --
+            // this is a raw byte concatenation, no text is involved.
+            (Value::Blob(lhs_blob), Value::Blob(rhs_blob)) => {
+                let mut blob = Vec::with_capacity(lhs_blob.len() + rhs_blob.len());
+                blob.extend_from_slice(lhs_blob);
+                blob.extend_from_slice(rhs_blob);
+                Value::Blob(blob)
+            }
+            // SQLite: any other pairing (Blob||Text, Text||Blob, Blob||Integer, ...)
+            // coerces the Blob operand to Text. `Value::Text` already stores its
+            // content as raw bytes (see `types::Text`), so this is a direct
+            // byte-buffer reuse -- not a UTF-8 validation/conversion step --
+            // mirroring SQLite's own BLOB -> TEXT coercion.
+            (Value::Blob(lhs_blob), rhs_other) => {
+                let mut value = lhs_blob.clone();
+                value.extend_from_slice(rhs_other.to_string().as_bytes());
+                Value::Text(Text {
+                    value,
+                    subtype: TextSubtype::Text,
+                })
+            }
+            (lhs_other, Value::Blob(rhs_blob)) => {
+                let mut value = lhs_other.to_string().into_bytes();
+                value.extend_from_slice(rhs_blob);
+                Value::Text(Text {
+                    value,
+                    subtype: TextSubtype::Text,
+                })
             }
         }
     }
@@ -718,15 +752,24 @@ impl Value {
     }
 }
 pub(super) fn exec_concat_strings(registers: &[Register]) -> Value {
-    let mut result = String::new();
+    // SQLite (3.44+): concat() always returns a string. Unlike the `||`
+    // operator, there is no Blob+Blob-stays-Blob exception here -- every
+    // Blob argument unconditionally coerces to Text, even when every
+    // argument is a Blob. As with `exec_concat`, the coercion reuses the
+    // Blob's raw bytes directly (see `types::Text`) rather than performing
+    // any UTF-8 validation/conversion.
+    let mut result: Vec<u8> = Vec::new();
     for reg in registers {
         match reg.get_owned_value() {
             Value::Null => continue,
-            Value::Blob(_) => todo!("TODO concat blob"),
-            v => result.push_str(&format!("{}", v)),
+            Value::Blob(blob) => result.extend_from_slice(blob),
+            v => result.extend_from_slice(v.to_string().as_bytes()),
         }
     }
-    Value::build_text(&result)
+    Value::Text(Text {
+        value: result,
+        subtype: TextSubtype::Text,
+    })
 }
 pub(super) fn exec_concat_ws(registers: &[Register]) -> Value {
     if registers.is_empty() {

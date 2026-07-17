@@ -4,6 +4,7 @@
 
 use super::column::{Column, Type};
 use super::table::BTreeTable;
+use limbo_sqlite3_parser::ast::ResolveType;
 
 pub(super) const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 pub(super) const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
@@ -24,7 +25,9 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 notnull: false,
                 default: None,
                 unique: false,
+                unique_conflict: ResolveType::Abort,
                 collation: None,
+                is_generated: false,
             },
             Column {
                 name: Some("name".to_string()),
@@ -35,7 +38,9 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 notnull: false,
                 default: None,
                 unique: false,
+                unique_conflict: ResolveType::Abort,
                 collation: None,
+                is_generated: false,
             },
             Column {
                 name: Some("tbl_name".to_string()),
@@ -46,7 +51,9 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 notnull: false,
                 default: None,
                 unique: false,
+                unique_conflict: ResolveType::Abort,
                 collation: None,
+                is_generated: false,
             },
             Column {
                 name: Some("rootpage".to_string()),
@@ -57,7 +64,9 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 notnull: false,
                 default: None,
                 unique: false,
+                unique_conflict: ResolveType::Abort,
                 collation: None,
+                is_generated: false,
             },
             Column {
                 name: Some("sql".to_string()),
@@ -68,10 +77,13 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 notnull: false,
                 default: None,
                 unique: false,
+                unique_conflict: ResolveType::Abort,
                 collation: None,
+                is_generated: false,
             },
         ],
         unique_sets: None,
+        primary_key_conflict: ResolveType::Abort,
         foreign_keys: vec![],
     }
 }

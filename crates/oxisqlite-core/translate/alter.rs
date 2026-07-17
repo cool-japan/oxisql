@@ -70,9 +70,10 @@ pub fn translate_alter_table(
             }
 
             if column.unique
-                || btree.unique_sets.as_ref().is_some_and(|set| {
-                    set.iter().any(|set| {
-                        set.iter()
+                || btree.unique_sets.as_ref().is_some_and(|sets| {
+                    sets.iter().any(|set| {
+                        set.columns
+                            .iter()
                             .any(|(name, _)| name == &normalize_ident(&column_name))
                     })
                 })
@@ -177,9 +178,14 @@ pub fn translate_alter_table(
                             | ast::Literal::String(_)
                     )
                 ) {
-                    // TODO: This is slightly inaccurate since sqlite returns a `Runtime
-                    // error`.
-                    return Err(LimboError::ParseError(
+                    // Real SQLite classifies this as a runtime error, not a parse/syntax
+                    // error -- even though whether the DEFAULT expression is a literal is
+                    // fully knowable at translate time (it's syntactic, not
+                    // data-dependent), so there's no genuine need to defer the check into
+                    // a bytecode program. `LimboError::Constraint` is this crate's
+                    // "Runtime error: {0}" variant (see its #[error(...)] attribute in
+                    // error.rs), matching SQLite's own classification here.
+                    return Err(LimboError::Constraint(
                         "Cannot add a column with non-constant default".to_string(),
                     ));
                 }
@@ -397,4 +403,62 @@ pub fn translate_alter_table(
             program
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for `ALTER TABLE ... ADD COLUMN ... DEFAULT <non-constant>`.
+    //! The statement must still be rejected (this crate does not support
+    //! evaluating a non-constant `DEFAULT` for `ADD COLUMN`, matching real
+    //! SQLite), but its `LimboError` classification changed from `ParseError`
+    //! to `Constraint` ("Runtime error: ...") to match SQLite's own
+    //! classification of this failure. See the comment at the `Err(...)` site
+    //! above for details; this is purely a diagnostic-classification change,
+    //! not a behavior change.
+
+    use std::sync::Arc;
+
+    use crate::{Database, LimboError};
+
+    fn open_conn() -> (Arc<dyn crate::IO>, Arc<crate::Connection>) {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let db =
+            Database::open_file(io.clone(), ":memory:", false).expect("open in-memory database");
+        let conn = db.connect().expect("connect");
+        (io, conn)
+    }
+
+    #[test]
+    fn add_column_with_non_constant_default_is_rejected_as_constraint_error() {
+        let (_io, conn) = open_conn();
+        conn.execute("CREATE TABLE t(a INTEGER)")
+            .expect("create table");
+
+        // `random()` is a function call, not a literal, so it is rejected as a
+        // non-constant DEFAULT -- but now classified as LimboError::Constraint
+        // ("Runtime error: ...") instead of LimboError::ParseError, matching
+        // real SQLite's classification.
+        let err = conn
+            .execute("ALTER TABLE t ADD COLUMN b INTEGER DEFAULT (random())")
+            .expect_err("non-constant DEFAULT must still be rejected");
+        assert!(
+            matches!(err, LimboError::Constraint(_)),
+            "expected LimboError::Constraint (SQLite's \"Runtime error\" classification), got {err:?}"
+        );
+        assert!(
+            err.to_string().starts_with("Runtime error:"),
+            "expected the \"Runtime error:\" prefix from LimboError::Constraint's Display, got: {err}"
+        );
+    }
+
+    #[test]
+    fn add_column_with_constant_default_still_succeeds() {
+        // Unaffected control case: a literal DEFAULT must keep working exactly
+        // as before this classification-only change.
+        let (_io, conn) = open_conn();
+        conn.execute("CREATE TABLE t(a INTEGER)")
+            .expect("create table");
+        conn.execute("ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 42")
+            .expect("constant DEFAULT must still be accepted");
+    }
 }

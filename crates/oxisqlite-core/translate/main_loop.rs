@@ -1,5 +1,5 @@
-use limbo_ext::VTabKind;
-use limbo_sqlite3_parser::ast::{self, SortOrder};
+use limbo_ext::{OrderByInfo, VTabKind};
+use limbo_sqlite3_parser::ast::{self, SortOrder, TableInternalId};
 
 use std::sync::Arc;
 
@@ -151,6 +151,9 @@ pub fn init_distinct(program: &mut ProgramBuilder, plan: &mut SelectPlan) {
                 .collect(),
             unique: false,
             has_rowid: false,
+            // Ephemeral: never registered in `Schema`, never consulted by DML
+            // conflict-resolution codegen.
+            on_conflict: ast::ResolveType::Abort,
         });
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
         *ctx = Some(DistinctCtx {
@@ -204,6 +207,9 @@ pub fn init_loop(
             }],
             has_rowid: false,
             unique: false,
+            // Ephemeral: never registered in `Schema`, never consulted by DML
+            // conflict-resolution codegen.
+            on_conflict: ast::ResolveType::Abort,
         });
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
         if group_by.is_none() {
@@ -357,7 +363,13 @@ pub fn init_loop(
                         }
                     }
                     _ => {
-                        unimplemented!()
+                        unreachable!(
+                            "init_loop's cursor-opening switch is exhaustively reached only with \
+                             OperationMode::SELECT/DELETE/UPDATE (see the three call sites in \
+                             emitter.rs); INSERT builds its own cursors entirely in \
+                             translate/insert/mod.rs and never constructs a Plan/TranslateCtx that \
+                             reaches this function"
+                        )
                     }
                 }
 
@@ -384,7 +396,10 @@ pub fn init_loop(
                                 });
                             }
                             _ => {
-                                unimplemented!()
+                                unreachable!(
+                                    "same invariant as the cursor-opening switch above: mode is \
+                                     only ever SELECT/DELETE/UPDATE here, never INSERT"
+                                )
                             }
                         }
                     }
@@ -396,6 +411,81 @@ pub fn init_loop(
     Ok(())
 }
 
+/// Which clause produced a query-level ordering requirement offered to a virtual table's
+/// `xBestIndex` (see [`single_table_order_by_info`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderPushdownSource {
+    /// A plain `ORDER BY`, with no `GROUP BY` sorter sitting between the table scan and the
+    /// final result order. If the vtab reports `order_by_consumed`, [`emit_loop`]'s dispatch can
+    /// safely skip the separate ORDER BY sorter altogether (see
+    /// `TranslateCtx::vtab_order_by_consumed`), because a plain `ORDER BY` has exactly one
+    /// consumer of row order.
+    OrderBy,
+    /// A `GROUP BY` (with no residual `ORDER BY` -- the optimizer already folds a satisfiable
+    /// `ORDER BY` into the `GROUP BY` target, see `translate::optimizer::order`). The vtab is
+    /// still told, since pre-grouped input can help it choose a good scan order, but this file
+    /// does not act on `order_by_consumed` for this source: the choice between
+    /// `group_by::GroupByRowSource::Sorter` and `::MainLoop` is made by `init_group_by` *before*
+    /// `open_loop`/`xBestIndex` ever runs, so retroactively eliding the GROUP BY sorter here
+    /// would require restructuring that earlier decision -- out of scope for this pushdown.
+    GroupBy,
+}
+
+/// Restricts a query's residual ordering requirement -- whatever `ORDER BY`/`GROUP BY` the
+/// optimizer could *not* already satisfy via a real BTree index/access method (see
+/// `optimizer::order::compute_order_target`, which runs earlier and clears
+/// `order_by`/`group_by.sort_order` when the chosen join order+index already produces that order)
+/// -- to an [`OrderByInfo`] list usable by [`crate::VirtualTable::best_index`]. Returns `None`
+/// unless *every* term is a bare column reference to a *single* table: pushdown can only help
+/// when that one table's own scan order fully determines the requirement, not when the ordering
+/// spans multiple tables or contains a non-column expression.
+///
+/// Prefers `ORDER BY` over `GROUP BY` when both are (unusually) still present at this point,
+/// matching `compute_order_target`'s own precedence.
+fn single_table_order_by_info(
+    order_by: Option<&[(ast::Expr, SortOrder)]>,
+    group_by: Option<&GroupBy>,
+) -> Option<(TableInternalId, Vec<OrderByInfo>, OrderPushdownSource)> {
+    let (terms, source): (Vec<(&ast::Expr, SortOrder)>, OrderPushdownSource) =
+        if let Some(order_by) = order_by {
+            if order_by.is_empty() {
+                return None;
+            }
+            (
+                order_by.iter().map(|(e, o)| (e, *o)).collect(),
+                OrderPushdownSource::OrderBy,
+            )
+        } else if let Some(group_by) = group_by {
+            if group_by.exprs.is_empty() {
+                return None;
+            }
+            (
+                group_by.exprs.iter().map(|e| (e, SortOrder::Asc)).collect(),
+                OrderPushdownSource::GroupBy,
+            )
+        } else {
+            return None;
+        };
+
+    let mut table_id: Option<TableInternalId> = None;
+    let mut columns = Vec::with_capacity(terms.len());
+    for (expr, order) in terms {
+        let ast::Expr::Column { table, column, .. } = expr else {
+            return None;
+        };
+        match table_id {
+            None => table_id = Some(*table),
+            Some(id) if id == *table => {}
+            Some(_) => return None,
+        }
+        columns.push(OrderByInfo {
+            column_index: *column as u32,
+            desc: order == SortOrder::Desc,
+        });
+    }
+    table_id.map(|id| (id, columns, source))
+}
+
 /// Set up the main query execution loop
 /// For example in the case of a nested table scan, this means emitting the Rewind instruction
 /// for all tables involved, outermost first.
@@ -405,7 +495,16 @@ pub fn open_loop(
     table_references: &TableReferences,
     join_order: &[JoinOrderMember],
     predicates: &[WhereTerm],
+    order_by: Option<&[(ast::Expr, SortOrder)]>,
+    group_by: Option<&GroupBy>,
 ) -> Result<()> {
+    // Computed once for the whole loop: at most one table's own scan order can stand in for the
+    // query's residual `ORDER BY`/`GROUP BY` (see `single_table_order_by_info`). Consulted below
+    // only when the loop reaches that specific table, at the outermost join position (mirroring
+    // `plan_satisfies_order_target`'s equivalent restriction for real BTree indexes: a table's
+    // local scan order can only stand in for the *whole* result order when nothing joined before
+    // it could have re-shuffled the rows).
+    let order_pushdown_target = single_table_order_by_info(order_by, group_by);
     for (join_index, join) in join_order.iter().enumerate() {
         let joined_table_index = join.original_idx;
         let table = &table_references.joined_tables()[joined_table_index];
@@ -482,9 +581,34 @@ pub fn open_loop(
                                         .unwrap_or(None)
                                     })
                                     .collect::<Vec<_>>();
-                                // TODO: get proper order_by information to pass to the vtab.
-                                // maybe encode more info on t_ctx? we need: [col_idx, is_descending]
-                                let index_info = vtab.best_index(&converted_constraints, &[]);
+                                // Offer the vtab this query's residual ordering requirement (see
+                                // `single_table_order_by_info`), restricted to the case where it
+                                // refers exclusively to this table's own columns and this is the
+                                // outermost loop in the join.
+                                let (order_by_info, order_by_elision_eligible) =
+                                    match &order_pushdown_target {
+                                        Some((target_table_id, cols, source))
+                                            if *target_table_id == table.internal_id
+                                                && join_index == 0 =>
+                                        {
+                                            (cols.clone(), *source == OrderPushdownSource::OrderBy)
+                                        }
+                                        _ => (Vec::new(), false),
+                                    };
+                                let index_info =
+                                    vtab.best_index(&converted_constraints, &order_by_info);
+                                if order_by_elision_eligible && index_info.order_by_consumed {
+                                    // The vtab already produces rows in exactly the order the
+                                    // (single-table, outermost-loop) `ORDER BY` demands. The
+                                    // separately-allocated ORDER BY sorter was already opened by
+                                    // `init_order_by` before this function ran (it runs earlier in
+                                    // `emit_query`, before cursors are opened), so it is left
+                                    // allocated but untouched: `emit_loop`'s dispatch and
+                                    // `emit_query`'s post-loop `order_by_necessary` check both
+                                    // consult this flag and route straight to the result instead
+                                    // of the sorter.
+                                    t_ctx.vtab_order_by_consumed = true;
+                                }
 
                                 // Determine the number of VFilter arguments (constraints with an argv_index).
                                 let args_needed = index_info
@@ -579,12 +703,14 @@ pub fn open_loop(
                     }
                     Table::FromClauseSubquery(from_clause_subquery) => {
                         let (yield_reg, coroutine_implementation_start) =
-                            match &from_clause_subquery.plan.query_destination {
-                                QueryDestination::CoroutineYield {
+                            match from_clause_subquery.query_destination() {
+                                Some(QueryDestination::CoroutineYield {
                                     yield_reg,
                                     coroutine_implementation_start,
-                                } => (*yield_reg, *coroutine_implementation_start),
-                                _ => unreachable!("Subquery table with non-subquery query type"),
+                                }) => (*yield_reg, *coroutine_implementation_start),
+                                _ => crate::bail_parse_error!(
+                                    "subquery table has no coroutine destination"
+                                ),
                             };
                         // In case the subquery is an inner loop, it needs to be reinitialized on each iteration of the outer loop.
                         program.emit_insn(Insn::InitCoroutine {
@@ -603,6 +729,9 @@ pub fn open_loop(
                         });
                     }
                     Table::Pseudo(_) => panic!("Pseudo tables should not loop"),
+                    Table::View(_) => crate::bail_parse_error!(
+                        "view must be expanded into a subquery before the main loop"
+                    ),
                 }
 
                 if let Some(table_cursor_id) = table_cursor_id {
@@ -799,7 +928,11 @@ pub fn emit_loop<'a>(
         return emit_loop_source(program, t_ctx, plan, LoopEmitTarget::AggStep);
     }
     // if we DONT have a group by, but we have an order by, we emit a record into the order by sorter.
-    if plan.order_by.is_some() {
+    // Exception: a vtab scan at the outermost join position may already report (via
+    // `open_loop`'s xBestIndex call) that it produces rows in exactly this order, in which case
+    // `t_ctx.vtab_order_by_consumed` is set and the sorter round trip is redundant -- go straight
+    // to the result, exactly like the "no ORDER BY at all" case below.
+    if plan.order_by.is_some() && !t_ctx.vtab_order_by_consumed {
         return emit_loop_source(program, t_ctx, plan, LoopEmitTarget::OrderBySorter);
     }
     // if we have neither, we emit a ResultRow. In that case, if we have a Limit, we handle that with DecrJumpZero.
@@ -968,7 +1101,7 @@ fn emit_loop_source<'a>(
                 .result_columns
                 .iter()
                 .enumerate()
-                .filter(|(_, rc)| !rc.contains_aggregates);
+                .filter(|(_, rc)| rc.contains_aggregates.is_empty());
 
             for (i, rc) in non_agg_columns {
                 let reg = col_start + i;

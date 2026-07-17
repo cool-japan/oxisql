@@ -15,6 +15,7 @@ keywords = ["database", "sql", "pure-rust", "cooljapan", "oxisql"]
 default = []
 embedded = ["dep:oxisql-embedded"]
 postgres = ["dep:oxisql-postgres"]
+postgres-replication = ["postgres", "oxisql-postgres/replication"]
 mysql = ["dep:oxisql-mysql"]
 datafusion = ["dep:oxisql-datafusion", "dep:arrow"]
 # Persistent embedded backends — each also enables the base `embedded` feature

@@ -130,6 +130,12 @@ pub struct TranslateCtx<'a> {
     pub meta_group_by: Option<GroupByMetadata>,
     // metadata for the order by operator
     pub meta_sort: Option<SortMetadata>,
+    /// Set by `main_loop::open_loop` when a virtual table scan's `xBestIndex` reports
+    /// (`order_by_consumed`) that it already produces rows in exactly the order the query's
+    /// `ORDER BY` demands. When true, `emit_loop`'s dispatch and `emit_query`'s
+    /// `order_by_necessary` computation both skip the ORDER BY sorter -- it stays allocated
+    /// (opened by `init_order_by` before `open_loop` runs) but is left empty and unused.
+    pub vtab_order_by_consumed: bool,
     /// mapping between table loop index and associated metadata (for left joins only)
     /// this metadata exists for the right table in a given left join
     pub meta_left_joins: Vec<Option<LeftJoinMetadata>>,
@@ -163,6 +169,7 @@ impl<'a> TranslateCtx<'a> {
             meta_group_by: None,
             meta_left_joins: (0..table_count).map(|_| None).collect(),
             meta_sort: None,
+            vtab_order_by_consumed: false,
             result_column_indexes_in_orderby_sorter: (0..result_column_count).collect(),
             result_columns_to_skip_in_orderby_sorter: None,
             resolver: Resolver::new(schema, syms),
@@ -292,7 +299,10 @@ pub fn emit_query<'a>(
     // This flag helps track whether we've already emitted these columns.
     if !plan.aggregates.is_empty()
         && plan.group_by.is_none()
-        && plan.result_columns.iter().any(|c| !c.contains_aggregates)
+        && plan
+            .result_columns
+            .iter()
+            .any(|c| c.contains_aggregates.is_empty())
     {
         let flag = program.alloc_register();
         program.emit_int(0, flag); // Initialize flag to 0 (not yet emitted)
@@ -364,6 +374,8 @@ pub fn emit_query<'a>(
         &plan.table_references,
         &plan.join_order,
         &mut plan.where_clause,
+        plan.order_by.as_deref(),
+        plan.group_by.as_ref(),
     )?;
 
     // Process result columns and expressions in the inner loop
@@ -374,7 +386,9 @@ pub fn emit_query<'a>(
 
     program.preassign_label_to_next_insn(after_main_loop_label);
 
-    let mut order_by_necessary = plan.order_by.is_some() && !plan.contains_constant_false_condition;
+    let mut order_by_necessary = plan.order_by.is_some()
+        && !plan.contains_constant_false_condition
+        && !t_ctx.vtab_order_by_consumed;
     let order_by = plan.order_by.as_ref();
 
     // Handle GROUP BY and aggregation processing
@@ -474,6 +488,8 @@ fn emit_program_for_delete(
         &plan.table_references,
         &[JoinOrderMember::default()],
         &mut plan.where_clause,
+        None,
+        None,
     )?;
 
     emit_delete_insns(program, &mut t_ctx, &plan.table_references)?;
@@ -708,8 +724,10 @@ fn emit_program_for_update(
         &plan.table_references,
         &[JoinOrderMember::default()],
         &mut plan.where_clause,
+        None,
+        None,
     )?;
-    emit_update_insns(&plan, &t_ctx, program, index_cursors)?;
+    emit_update_insns(&plan, &mut t_ctx, program, index_cursors)?;
 
     close_loop(
         program,
@@ -739,7 +757,7 @@ fn emit_program_for_update(
 #[instrument(skip_all, level = Level::TRACE)]
 fn emit_update_insns(
     plan: &UpdatePlan,
-    t_ctx: &TranslateCtx,
+    t_ctx: &mut TranslateCtx,
     program: &mut ProgramBuilder,
     index_cursors: Vec<(usize, usize)>,
 ) -> crate::Result<()> {
@@ -1046,6 +1064,7 @@ fn emit_update_insns(
         emit_conflict_halt(
             program,
             &plan.or_conflict,
+            index.on_conflict,
             SQLITE_CONSTRAINT_PRIMARYKEY, // TODO: distinct between primary key and unique index
             column_names,
         );
@@ -1084,6 +1103,7 @@ fn emit_update_insns(
             emit_conflict_halt(
                 program,
                 &plan.or_conflict,
+                btree_table.primary_key_conflict,
                 SQLITE_CONSTRAINT_PRIMARYKEY,
                 format!(
                     "{}.{}",
@@ -1176,6 +1196,93 @@ fn emit_update_insns(
         });
     }
 
+    // RETURNING: emit one result row per updated row, evaluating the RETURNING
+    // expressions against the row that was just written by the `Insert`/`VUpdate`
+    // above.
+    //
+    // Naively re-reading the new values via `Column`/`RowId` against `cursor_id`
+    // at this point does *not* work: empirically (see the regression tests in
+    // tests/update_returning.rs) a cursor's cached record is not guaranteed to
+    // reflect a `Insert` that was just performed through the same cursor, so a
+    // post-Insert `Column` read can observe the *old* pre-update value. This is
+    // exactly the hazard `upsert::emit_upsert_do_update` already works around
+    // for `excluded.*`/old-value references in `DO UPDATE` — instead of reading
+    // back through the cursor, it redirects column-expression lookups to the
+    // registers that were used to build the new record. We do the same here:
+    // every new column value (and the new rowid) is already sitting in a fixed
+    // register from the "scan a column at a time" loop / rowid computation
+    // above, so we temporarily register those registers as resolver overrides
+    // and let `translate_expr` (via `Resolver::resolve_cached_expr_reg`) pick
+    // them up for any `Expr::Column`/`Expr::RowId` leaf in the RETURNING
+    // expressions — the same mechanism `result_row::emit_select_result` feeds
+    // into for ordinary SELECT result columns, just with these overrides ahead
+    // of it in the lookup order.
+    //
+    // This must be emitted *before* the LIMIT decrement below: the row that
+    // causes the LIMIT counter to hit zero has still been updated and therefore
+    // must still produce a RETURNING row, but `DecrJumpZero` jumps straight to
+    // `label_main_loop_end` — the end of the whole UPDATE loop, since UPDATE has
+    // no post-loop processing — so anything emitted after it would never run for
+    // that final row (exactly the ordering `emit_result_row_and_limit` uses for
+    // SELECT). Rows skipped entirely (via OFFSET, the WHERE filter, or the
+    // `check_rowid_not_exists_label` jumps below, all of which land after this
+    // point) never reach this code, so they correctly produce no RETURNING row.
+    if let Some(returning) = plan.returning.as_ref().filter(|r| !r.is_empty()) {
+        // The new rowid lives in `rowid_set_clause_reg` only when the rowid-alias
+        // column was itself SET *and* the table is a real btree table (virtual
+        // tables never populate that register — see the per-column loop above).
+        // Otherwise the rowid is unchanged, so the pre-update `beg` is still
+        // correct (and, for virtual tables, is the best information available
+        // since `VUpdate` is opaque to this emitter).
+        let new_rowid_reg = if has_user_provided_rowid && !is_virtual {
+            rowid_set_clause_reg.unwrap_or(beg)
+        } else {
+            beg
+        };
+
+        t_ctx.resolver.upsert_reg_overrides.clear();
+        for (idx, table_column) in table_ref.columns().iter().enumerate() {
+            let new_value_reg = if table_column.is_rowid_alias && !is_virtual {
+                new_rowid_reg
+            } else {
+                start + idx
+            };
+            t_ctx.resolver.upsert_reg_overrides.push((
+                ast::Expr::Column {
+                    database: None,
+                    table: table_ref.internal_id,
+                    column: idx,
+                    is_rowid_alias: table_column.is_rowid_alias,
+                },
+                new_value_reg,
+            ));
+        }
+        t_ctx.resolver.upsert_reg_overrides.push((
+            ast::Expr::RowId {
+                database: None,
+                table: table_ref.internal_id,
+            },
+            new_rowid_reg,
+        ));
+
+        let reg_result_cols_start = program.alloc_registers(returning.len());
+        for (i, rc) in returning.iter().enumerate() {
+            translate_expr(
+                program,
+                Some(&plan.table_references),
+                &rc.expr,
+                reg_result_cols_start + i,
+                &t_ctx.resolver,
+            )?;
+        }
+        t_ctx.resolver.upsert_reg_overrides.clear();
+
+        program.emit_insn(Insn::ResultRow {
+            start_reg: reg_result_cols_start,
+            count: returning.len(),
+        });
+    }
+
     if let Some(limit_ctx) = t_ctx.limit_ctx {
         program.emit_insn(Insn::DecrJumpZero {
             reg: limit_ctx.reg_limit,
@@ -1184,7 +1291,6 @@ fn emit_update_insns(
             })?,
         })
     }
-    // TODO(pthorpe): handle RETURNING clause
 
     if let Some(label) = check_rowid_not_exists_label {
         program.preassign_label_to_next_insn(label);
@@ -1193,21 +1299,42 @@ fn emit_update_insns(
     Ok(())
 }
 
-/// Emit the appropriate conflict-halt instructions for INSERT/UPDATE conflict resolution.
+/// Emit the appropriate conflict-halt instructions for UPDATE conflict resolution.
 ///
-/// For ABORT (default) and ROLLBACK, emits a `Savepoint RollbackTo "_stmt"` before `Halt`
-/// so that partial writes by the current statement are undone.
-/// For FAIL, emits only `Halt` (prior writes are kept).
+/// `stmt_conflict` is the statement-level `UPDATE OR <action>` clause, if any.
+/// `constraint_default` is the specific UNIQUE/PRIMARY KEY constraint's own
+/// `ON CONFLICT <action>` (already defaulted to [`ResolveType::Abort`] by the
+/// schema layer when the constraint didn't declare one — see
+/// `BTreeTable::primary_key_conflict` / `Index::on_conflict`). Per SQLite's
+/// precedence rules, an explicit statement-level clause wins if present;
+/// otherwise the constraint's own resolution applies.
+///
+/// For an effective action of ABORT or ROLLBACK, this emits a
+/// `Savepoint RollbackTo "_stmt"` before `Halt` so that partial writes by the
+/// current statement are undone. For FAIL, it emits only `Halt` (prior writes
+/// are kept).
+///
+/// NOTE: unlike `INSERT`, this engine does not yet implement true row-skipping
+/// (IGNORE) or victim-replacement (REPLACE) semantics for `UPDATE` conflicts —
+/// that would require the same kind of dedicated machinery `translate::insert`
+/// has for locating and deleting/skipping a specific victim row, which does
+/// not exist for the generic UPDATE main-loop today. An effective IGNORE/
+/// REPLACE therefore still falls back to `Halt` (matching this engine's
+/// pre-existing behavior for a statement-level `UPDATE OR IGNORE`/
+/// `UPDATE OR REPLACE`, which has the same limitation) rather than silently
+/// mismatching the requested semantics in a different way.
 fn emit_conflict_halt(
     program: &mut ProgramBuilder,
-    or_conflict: &Option<limbo_sqlite3_parser::ast::ResolveType>,
+    stmt_conflict: &Option<limbo_sqlite3_parser::ast::ResolveType>,
+    constraint_default: limbo_sqlite3_parser::ast::ResolveType,
     err_code: usize,
     description: String,
 ) {
     use crate::vdbe::insn::SavepointOp;
     use limbo_sqlite3_parser::ast::ResolveType;
-    match or_conflict {
-        None | Some(ResolveType::Abort) | Some(ResolveType::Rollback) => {
+    let effective = stmt_conflict.unwrap_or(constraint_default);
+    match effective {
+        ResolveType::Abort | ResolveType::Rollback => {
             program.emit_insn(Insn::Savepoint {
                 op: SavepointOp::RollbackTo,
                 name: "_stmt".to_string(),
@@ -1217,14 +1344,9 @@ fn emit_conflict_halt(
                 description,
             });
         }
-        Some(ResolveType::Fail) => {
-            program.emit_insn(Insn::Halt {
-                err_code,
-                description,
-            });
-        }
-        // IGNORE and REPLACE are handled by caller; fall back to halt
-        _ => {
+        // FAIL, and (for now, see doc comment above) IGNORE/REPLACE: halt
+        // without rolling back prior writes from this statement.
+        ResolveType::Fail | ResolveType::Ignore | ResolveType::Replace => {
             program.emit_insn(Insn::Halt {
                 err_code,
                 description,

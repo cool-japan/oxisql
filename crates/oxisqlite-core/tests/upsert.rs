@@ -652,3 +652,66 @@ fn composite_pk_target_do_update() {
         Some("updated")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Generated column rejection (ON CONFLICT DO UPDATE SET)
+// ---------------------------------------------------------------------------
+
+/// `DO UPDATE SET` targeting a `GENERATED ALWAYS AS (...)` column must be
+/// rejected with a clear parse error naming the column -- not silently
+/// accepted (which would either be a no-op or leave the generated column out
+/// of sync with the expression it's supposed to always reflect).
+///
+/// `x` is declared `INTEGER PRIMARY KEY` (a rowid alias) so `ON CONFLICT(x)`
+/// is a valid, matching conflict target reachable under default features:
+/// without a real PK/UNIQUE constraint on some column, the conflict-target
+/// resolver rejects the statement before ever reaching the SET-clause check
+/// this test exercises (see `on_conflict_no_matching_constraint_errors`
+/// above), which would make the test pass for the wrong reason.
+#[test]
+fn set_generated_column_errors() {
+    let (io, conn) = new_mem_db();
+    exec(
+        &io,
+        &conn,
+        "CREATE TABLE t (x INTEGER PRIMARY KEY, y INT GENERATED ALWAYS AS (x + 1))",
+    );
+    let result = conn.prepare("INSERT INTO t (x) VALUES (1) ON CONFLICT(x) DO UPDATE SET y = 5");
+    let err = match result {
+        Ok(_) => panic!("SET on a generated column must be rejected, not accepted"),
+        Err(e) => e,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("generated column"),
+        "expected a clear generated-column error, got: {message}"
+    );
+    assert!(
+        message.contains('y'),
+        "expected the error to name the offending column, got: {message}"
+    );
+}
+
+/// Companion regression: a non-generated column in the very same table must
+/// still work normally in the SET clause -- the rejection above is specific
+/// to the generated column, not an overly broad guard on the whole table.
+#[test]
+fn set_non_generated_column_in_same_table_still_works() {
+    let (io, conn) = new_mem_db();
+    exec(
+        &io,
+        &conn,
+        "CREATE TABLE t (x INTEGER PRIMARY KEY, label TEXT, y INT GENERATED ALWAYS AS (x + 1))",
+    );
+    exec(&io, &conn, "INSERT INTO t (x, label) VALUES (1, 'a')");
+    exec(
+        &io,
+        &conn,
+        "INSERT INTO t (x, label) VALUES (1, 'b') ON CONFLICT(x) DO UPDATE SET label = excluded.label",
+    );
+    assert_eq!(count_rows(&io, &conn, "t"), 1);
+    assert_eq!(
+        query_one_text(&io, &conn, "SELECT label FROM t WHERE x = 1").as_deref(),
+        Some("b")
+    );
+}

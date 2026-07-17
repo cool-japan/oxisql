@@ -12,8 +12,9 @@
 //! `mysql_async` 0.36 builds its own `rustls::ClientConfig` internally via
 //! `SslOpts::build_tls_connector`, which calls `ClientConfig::builder()`.
 //! That call requires a process-global `CryptoProvider` to be installed.
-//! When [`TlsMode::Rustls`] is requested we install the `rustls-rustcrypto`
-//! provider guarded by `CryptoProvider::get_default().is_none()` so that
+//! When [`TlsMode::Rustls`] is requested we install the pure-Rust RustCrypto
+//! provider (`oxitls::pure_provider()`) guarded by
+//! `CryptoProvider::get_default().is_none()` so that
 //! multiple calls in the same test binary do not panic.
 //!
 //! The `Arc<rustls::ClientConfig>` carried in `TlsMode::Rustls` is used only to
@@ -126,21 +127,21 @@ pub enum TlsMode {
     ///
     /// Note: to construct a suitable `ClientConfig` use
     /// `oxitls_adapter_rustls_rustcrypto::client_config(root_store)` or
-    /// `rustls_rustcrypto::provider()` directly.
+    /// `oxitls::pure_provider()` directly.
     #[allow(dead_code)]
     Rustls(Arc<rustls::ClientConfig>),
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Install the rustls-rustcrypto provider as the process default, guarded so
-/// a second call in the same process does not panic.
+/// Install the pure-Rust RustCrypto provider (via `oxitls`) as the process
+/// default, guarded so a second call in the same process does not panic.
 fn ensure_crypto_provider() {
     use rustls::crypto::CryptoProvider;
     if CryptoProvider::get_default().is_none() {
         // install_default returns Err if another thread won the race; either
         // way the default is set after this point.
-        let _ = rustls_rustcrypto::provider().install_default();
+        let _ = std::sync::Arc::unwrap_or_clone(oxitls::pure_provider()).install_default();
     }
 }
 
@@ -254,7 +255,7 @@ impl MyConnection {
     ///
     /// - [`TlsMode::Disabled`] — plain-text connection.
     /// - [`TlsMode::Rustls`] — TLS via the process-default `CryptoProvider`
-    ///   (installed lazily from `rustls-rustcrypto` on first use).
+    ///   (installed lazily from `oxitls::pure_provider()` on first use).
     pub async fn connect(url: &str, tls: TlsMode) -> Result<Self, MysqlError> {
         let ssl_opts = match tls {
             TlsMode::Disabled => None,
@@ -312,6 +313,46 @@ impl MyConnection {
     /// as a prepared-statement cache key.
     pub fn normalize_query(sql: &str) -> String {
         oxisql_parse::normalize(sql)
+    }
+
+    // ── connection metadata ───────────────────────────────────────────────────
+
+    /// Return the MySQL/MariaDB server version reported by the server,
+    /// formatted as a dotted version string (`"{major}.{minor}.{patch}"`,
+    /// e.g. `"8.0.35"`).
+    ///
+    /// Unlike the `oxisql-postgres` backend's `PgConnection::server_version`
+    /// (a cheap, cached field read), this cannot avoid I/O: `MyConnection`
+    /// wraps a `mysql_async::Pool`, which checks connections out **per call**
+    /// rather than holding one persistently (see this module's doc comment),
+    /// so there is no single live connection whose handshake data could be
+    /// captured once up front. This method acquires a connection from the
+    /// pool and reads `mysql_async::Conn::server_version`, which returns a
+    /// `(u16, u16, u16)` tuple, then formats it as a dotted string to match
+    /// `oxisql::BackendInfo::version`'s `Option<String>` shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MysqlError::Connection`] if a connection cannot be acquired
+    /// from the pool (e.g. the server is unreachable).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use oxisql_mysql::{MyConnection, TlsMode};
+    ///
+    /// let conn = MyConnection::connect("mysql://root:@localhost/mydb", TlsMode::Disabled).await?;
+    /// let version = conn.server_version().await?;
+    /// println!("connected to MySQL/MariaDB {version}");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn server_version(&self) -> Result<String, MysqlError> {
+        let conn = self.pool.get_conn().await.map_err(MysqlError::Connection)?;
+        let (major, minor, patch) = conn.server_version();
+        Ok(format!("{major}.{minor}.{patch}"))
     }
 }
 
@@ -1220,7 +1261,7 @@ impl MyConnectionBuilder {
     /// Production code should use [`ssl_with_ca_pem`][Self::ssl_with_ca_pem] or
     /// supply a trusted root certificate store instead.
     ///
-    /// Installs the `rustls-rustcrypto` provider (guarded) and configures
+    /// Installs the pure-Rust RustCrypto provider (guarded) and configures
     /// `SslOpts` to accept invalid certificates and skip domain validation.
     pub fn ssl_skip_verify(mut self) -> Self {
         ensure_crypto_provider();
@@ -1237,7 +1278,7 @@ impl MyConnectionBuilder {
     /// `ca_pem` must be a PEM-encoded certificate authority certificate.
     /// Multiple certificates may be concatenated in a single `Vec<u8>`.
     ///
-    /// Installs the `rustls-rustcrypto` provider (guarded).
+    /// Installs the pure-Rust RustCrypto provider (guarded).
     pub fn ssl_with_ca_pem(mut self, ca_pem: Vec<u8>) -> Self {
         ensure_crypto_provider();
         // PathOrBuf<'static> is not re-exported from mysql_async's public API,

@@ -20,12 +20,12 @@ By default it runs entirely in memory (`MemoryStorage`, reset on drop). Three op
 
 ```toml
 [dependencies]
-oxisql-embedded = "0.1.2"
+oxisql-embedded = "0.3.3"
 
 # Optional persistent backends (pick any subset):
-# oxisql-embedded = { version = "0.1.2", features = ["fjall-storage"] }
-# oxisql-embedded = { version = "0.1.2", features = ["redb-storage"] }
-# oxisql-embedded = { version = "0.1.2", features = ["sled-storage"] }
+# oxisql-embedded = { version = "0.3.3", features = ["fjall-storage"] }
+# oxisql-embedded = { version = "0.3.3", features = ["redb-storage"] }
+# oxisql-embedded = { version = "0.3.3", features = ["sled-storage"] }
 ```
 
 ## Quick start
@@ -116,8 +116,8 @@ let conn = oxisql::connect("memory://").await?;
 | `import_csv(table, csv)` / `export_table_to_csv(table)` | Pure-Rust RFC 4180 CSV round-trip (`csv.rs`). |
 | `import_from_sql(sql)` / `export_as_sql()` | SQL-dump import (via `execute_batch`) and export (via `fetch_all_schemas()` + `Schema::to_ddl()`). |
 | `explain(sql)` | Pattern-based query plan string. |
-| `UdfRegistry` — `register_udf` / `call_udf` | Host-side scalar functions (Rust API, not SQL level). |
-| `AggregateUdf` — `register_aggregate` / `apply_aggregate` | `init → step* → finalize` aggregates. |
+| `UdfRegistry` (`register`/`call`), driven via `EmbeddedConnection::register_udf` / `call_udf` | Host-side scalar functions (Rust API, not SQL level). |
+| `AggregateUdf` (`init`/`step`/`finalize` fields), driven via `EmbeddedConnection::register_aggregate` / `apply_aggregate` | `init → step* → finalize` aggregates. |
 | `VirtualTableRegistry` | Register in-process virtual tables scanned at query time. |
 | `FtsIndex` | Inverted-index full-text search (`MATCH` interception). |
 | `BTreeIndex` / `IndexKey` / `IndexRegistry` | Host-side ordered secondary indexes. |
@@ -153,7 +153,7 @@ Named placeholders (`:name`, `$name`, `@name`) are provided by `oxisql_core` def
 
 ## Test coverage
 
-**278 tests pass** with `--all-features` (unit + integration; CSV, schema introspection, persistence round-trips, parameter binding, UDFs, FTS, virtual tables, and more). The crate is part of a workspace where **2,030 tests pass** in total.
+**263 tests pass** with default features and **281 tests pass** with `--all-features` (unit + integration; CSV, schema introspection, persistence round-trips, parameter binding, UDFs, FTS, virtual tables, and more). The extra all-features tests are mostly the `fjall-storage` / `redb-storage` / `sled-storage` persistence-round-trip suites, whose `#[test]` functions are individually feature-gated (the files themselves always compile). The crate is part of a workspace where **2,157 tests pass** in total (**2,651** with `--all-features`).
 
 ## Part of the OxiSQL workspace
 

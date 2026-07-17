@@ -22,15 +22,15 @@ The SQLite pool is **100% Pure Rust** — it is backed by the `oxisqlite` engine
 `rusqlite` dependency have been **removed**; there are no C/C++ dependencies on the
 SQLite path.
 
-## Installation (0.1.2)
+## Installation (0.3.3)
 
 ```toml
 [dependencies]
 # Choose the backends you need (all features are opt-in):
-oxisql-pool = { version = "0.1.2", features = ["embedded"] }
-oxisql-pool = { version = "0.1.2", features = ["postgres"] }
-oxisql-pool = { version = "0.1.2", features = ["mysql"] }
-oxisql-pool = { version = "0.1.2", features = ["sqlite"] }  # Pure-Rust oxisqlite engine
+oxisql-pool = { version = "0.3.3", features = ["embedded"] }
+oxisql-pool = { version = "0.3.3", features = ["postgres"] }
+oxisql-pool = { version = "0.3.3", features = ["mysql"] }
+oxisql-pool = { version = "0.3.3", features = ["sqlite"] }  # Pure-Rust oxisqlite engine
 ```
 
 - MSRV: **1.89** · edition **2021** · `#![forbid(unsafe_code)]`
@@ -218,9 +218,10 @@ All features are **opt-in**; the default set is empty.
 
 ## Test coverage
 
-With `--all-features`: **57 tests pass** (48 integration + 9 doc tests), **4 ignored**.
-The 4 ignored tests are live-server-gated MySQL/Postgres pool tests that require a
-running database server; they are skipped when no server is available.
+**35 tests pass** with default features; **62 tests pass** with `--all-features`
+(52 integration + 10 doc tests), **4 ignored**. The 4 ignored tests are
+live-server-gated MySQL/Postgres pool tests that require a running database
+server; they are skipped when no server is available.
 
 ## See also
 

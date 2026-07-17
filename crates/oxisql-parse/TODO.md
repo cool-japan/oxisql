@@ -2,12 +2,15 @@
 
 ## Status
 
-**Stable** · version 0.3.2 · **129 tests**.
+**Stable** · version 0.3.3 · **191 tests** (178 unit + 13 doc).
 
 A `sqlparser` facade with dialect-aware parsing, a fluent `QueryBuilder`, a
-logical planner, a rule-based optimizer, DML planning, a cost model, a schema
-validator, aggregate / window helpers, an `explain` pretty-printer, and an LRU
-parse cache. Pure Rust. **No feature flags.**
+logical planner with subquery decorrelation, a rule-based optimizer (plus an
+optional cost-based, statistics-driven join-reordering pipeline), DML
+planning, a cost model, a schema validator, aggregate / window helpers, plain
+/ verbose / JSON `explain` pretty-printers, and LRU caches for both parsed
+ASTs (`ParseCache`) and optimized plans (`PlanCache`). Pure Rust. **No
+feature flags.**
 
 ## Done
 
@@ -24,7 +27,7 @@ parse cache. Pure Rust. **No feature flags.**
 
 ### Logical planning
 - [x] `plan_query` / `plan_statement` → `LogicalPlan` (`Scan`, `Filter`, `Projection`, `Join`, `Aggregate`, `Sort`, `Limit`, `SetOp`, `Subquery`, `Values`, `Empty`)
-- [x] `JoinType` (`Inner` / `Left` / `Right` / `Full` / `Cross`)
+- [x] `JoinType` (`Inner` / `Left` / `Right` / `Full` / `Cross` / `LeftSemi` / `LeftAnti` — the last two produced by decorrelation)
 - [x] Aggregate planning — `extract_aggregates`, `AggFunc` (`Count`/`Sum`/`Avg`/`Min`/`Max`); HAVING → `Filter` over `Aggregate`
 - [x] Window functions — `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `NTILE` with `OVER (PARTITION BY … ORDER BY …)`
 - [x] Subqueries (scalar / EXISTS / IN / correlated) and CTEs (WITH, recursive)
@@ -32,18 +35,22 @@ parse cache. Pure Rust. **No feature flags.**
 
 ### Optimizer
 - [x] `optimize(plan)` default pipeline + `Optimizer` builder
-- [x] Passes: `PredicatePushdown`, `ProjectionPruning`, `ConstantFolding`, `LimitPushThrough`, `JoinAlgorithmPass` (all implement `OptPass`)
+- [x] Passes: `PredicatePushdown`, `ProjectionPruning`, `ConstantFolding`, `PredicateSimplification`, `CommonSubexprElimination`, `LimitPushThrough`, `JoinAlgorithmPass` (all implement `OptPass`)
 - [x] Join-algorithm selection hints (hash / merge / nested-loop)
+- [x] Statistics-driven join reordering via `Optimizer::with_cost_model(CostModel)` — DPccp DP for ≤12 relations, GOO greedy fallback above; outer joins left untouched
 
 ### DML planning
 - [x] `plan_dml` → `DmlPlan` (`Insert`, `InsertSelect`, `Update`, `Upsert`, `Delete`)
 - [x] INSERT … SELECT, UPDATE … FROM (Postgres multi-table), UPSERT (ON CONFLICT / ON DUPLICATE KEY UPDATE)
 
 ### Cost, validation, explain, cache
-- [x] Cost model — `CostModel`, `TableStats`, `CostEstimate`
-- [x] Schema validation — `SchemaValidator`, `ValidationError` (`UnknownTable` / `UnknownColumn` / `AmbiguousColumn`)
-- [x] `explain(plan, verbose)` — human-readable plan tree
+- [x] Cost model — `CostModel`, `TableStats`, `CostEstimate`, per-column `ColumnStats` (`ndv`, `null_fraction`, `min`, `max`)
+- [x] Schema validation — `SchemaValidator`, `ValidationError` (`TableNotFound` / `ColumnNotFound { table, column }` / `AmbiguousColumn`)
+- [x] `explain(plan)` — human-readable plan tree
+- [x] `explain_verbose(plan, &CostModel)` / `explain_json(plan, Option<&CostModel>)` — per-node `rows=`/`cost=` annotations, or JSON, via `CostModel::explain_costs` → `NodeCost`
 - [x] `ParseCache` — thread-safe LRU keyed by `(sql, dialect)`; `new` / `parse` / `len` / `is_empty` / `clear`
+- [x] `PlanCache` — thread-safe LRU of *optimized* `Arc<LogicalPlan>`s keyed by `parameterize`d SQL template + schema generation; `new` / `plan` / `plan_with` / `invalidate_schema` / `len` / `is_empty` / `clear`
+- [x] `parameterize(sql) -> ParameterizedSql { template, literals }` — lexical literal→`?` extraction (numbers/strings/booleans/NULL/negatives/floats/scientific), safe over quoted identifiers
 
 ### Testing & performance
 - [x] Parse tests for SELECT / INSERT / UPDATE / DELETE / CREATE / DROP / ALTER, positional params, complex JOIN / subquery / CTE / window queries, and malformed-SQL error messages

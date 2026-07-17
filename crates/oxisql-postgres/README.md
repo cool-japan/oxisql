@@ -35,7 +35,8 @@ backend selected when you open a `postgres://` URL through the `oxisql` facade.
 
 ```toml
 [dependencies]
-oxisql-postgres = "0.1.2"
+oxisql-postgres = "0.3.3"
+# oxisql-postgres = { version = "0.3.3", features = ["replication"] }  # PostgreSQL logical replication (pgoutput)
 ```
 
 MSRV 1.89 · edition 2021 · Apache-2.0.
@@ -128,6 +129,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `NotificationStream` / `PgNotification` | Async stream returned by `listen(channel)` |
 | `ColumnDescription` | Column name + type metadata via `describe(sql)` (no execution) |
 | `parse_pg_conn_str(s)` → `PgConnParts` | Parse a connection string / URL into its parts |
+| `PgConnection::server_version()` | Raw `server_version` runtime parameter captured from the connection handshake's `ParameterStatus` message (e.g. `"16.4 (Debian 16.4-1.pgdg120+1)"`); `None` for `from_client` connections |
+
+### Connection timeouts
+
+`PgConnection::connect` itself applies no timeout — connecting to an
+unreachable host can hang. `PgConnection::connect_with_timeout(conn_str, tls,
+duration)` wraps the same connect path in a `tokio::time::timeout`, and as of
+0.3.3 it is also what the `oxisql` facade calls into: `oxisql::connect()` /
+`connect_with_options` / `connect_with_tls` now go through
+`connect_with_timeout` with a 10-second default (overridable via the facade's
+`ConnectOptions::connect_timeout_ms`), so a connection attempt that used to
+hang indefinitely now fails with a typed timeout error instead. The fix lives
+here, in this crate's `connect_with_timeout`; what's new in 0.3.3 is that the
+facade's plain `connect()` applies it automatically rather than leaving the
+connection unbounded.
+
+## Feature flags
+
+| Feature | Default | Effect |
+|---------|---------|--------|
+| *(none)* | — | Core `Connection` impl, COPY, LISTEN/NOTIFY, pipeline batching, prepared statements, and the full type mapping — no extra dependencies |
+| `integration-postgres` | off | Compiles in the live-server integration test suites under `tests/`; every test they add is individually `#[ignore]`d and needs a running PostgreSQL server |
+| `replication` | off | PostgreSQL logical replication (`pgoutput`) support — see "Logical replication" under Capabilities below. Pulls in `postgres-protocol` + `fallible-iterator-02` |
 
 ## Capabilities
 
@@ -190,6 +214,89 @@ SQL hash, so re-preparing the same text reuses the server-side plan.
 Schema introspection (`tables`, `columns`, `indexes`, `foreign_keys`) is served
 from `information_schema` and `pg_indexes`.
 
+### Logical replication (`replication` feature, `src/replication/`)
+
+Behind the non-default `replication` Cargo feature, this crate can act as a
+**logical-replication client** speaking PostgreSQL's `pgoutput` output-plugin
+wire format directly. `tokio-postgres` cannot negotiate `CopyBoth`/replication
+mode, so this path never goes through it: `PgReplicationConnection` drives
+the wire protocol itself (via `postgres-protocol` + `fallible-iterator`),
+reusing the crate's own connection-string parsing and full TLS / SCRAM-SHA-256
+auth stack.
+
+```rust,no_run
+use futures::StreamExt;
+use oxisql_postgres::{LogicalReplicationMessage, PgReplicationConnection, ReplicationEvent, TlsMode};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut repl = PgReplicationConnection::connect(
+        "host=localhost user=postgres dbname=mydb",
+        TlsMode::Disabled,
+    ).await?;
+
+    let ident = repl.identify_system().await?;
+    println!("system id: {}", ident.systemid);
+
+    let slot = repl.create_replication_slot("my_slot", false).await?;
+    let mut stream = repl
+        .start_logical_replication("my_slot", &["my_publication"], slot.consistent_point)
+        .await?;
+
+    while let Some(event) = stream.next().await {
+        if let ReplicationEvent::Logical {
+            message: LogicalReplicationMessage::Commit { commit_lsn, .. },
+            ..
+        } = event?
+        {
+            stream.ack(commit_lsn).await?; // acknowledge after durably applying
+        }
+    }
+    Ok(())
+}
+```
+
+(Requires the `replication` feature; `cargo add oxisql-postgres --features replication`.)
+
+- **Connection setup** — `PgReplicationConnection::connect` performs the
+  `replication=database` handshake (a separate connection mode from ordinary
+  `PgConnection`), then `identify_system()` / `create_replication_slot(name,
+  temporary)` / `drop_replication_slot(name)` run over the simple-query
+  protocol.
+- **Streaming** — `start_logical_replication(slot_name, publication_names,
+  start_lsn)` consumes the connection and returns a `ReplicationStream`
+  (`impl futures::Stream<Item = Result<ReplicationEvent, PgError>>`), backed by
+  a background reader task plus a periodic Standby Status Update keepalive
+  task (every 10s).
+- **Events** — `ReplicationEvent::Logical` carries a decoded
+  `LogicalReplicationMessage` (`Begin` / `Commit` / `Origin` / `Relation` /
+  `Type` / `Insert` / `Update` / `Delete` / `Truncate` / `Message`);
+  `ReplicationEvent::KeepAlive` is a server liveness probe.
+- **Progress tracking** — `stream.ack(lsn)` (or the more general
+  `stream.standby_status_update(written, flushed, applied)`) after durably
+  applying a transaction.
+- **Tuple decoding** — `stream.relation(rel_id)` returns the cached
+  `RelationBody` schema; `stream.decode_tuple(rel_id, tuple)` maps a
+  `TupleData` to `Vec<CellValue>` (each cell either a decoded
+  `oxisql_core::Value` or `UnchangedToast`, for an un-retransmitted TOASTed
+  column). Both `pgoutput` wire formats are decoded — text (the format this
+  MVP always negotiates) and binary — including PostgreSQL's array-literal
+  text syntax (`{1,2,3}`, `{}`, `{NULL,2}`, quoting/escaping, multi-dimensional
+  arrays).
+- **LSN helpers** — `Lsn` wraps a WAL position and round-trips PostgreSQL's
+  canonical text form (`"16/B374D848"`) via `FromStr`/`Display`;
+  `pg_micros_to_unix_micros` / `unix_micros_to_pg_micros` convert between the
+  PostgreSQL-epoch and Unix-epoch timestamp conventions used on the wire.
+
+This is an MVP scoped to what a CDC (change-data-capture) consumer needs
+first: **not** implemented yet are streaming of large in-progress transactions
+(`streaming 'on'`), two-phase commit, and parallel streaming (see the crate's
+`TODO.md` for the tracked follow-ups); physical replication is out of scope
+entirely (a different protocol from `pgoutput` decoding). Live-server
+integration tests live in `tests/replication.rs`, gated behind
+`integration-postgres,replication` and individually `#[ignore]`d pending a
+real `wal_level=logical` server.
+
 ## Type mapping
 
 All 13 `oxisql_core::Value` variants round-trip. Parameters are encoded with
@@ -212,23 +319,30 @@ explicit type OIDs; results can be requested in binary format (`query_binary`).
 
 ## Test coverage
 
-**61 tests passing** under `cargo test` (which includes doctests). In addition,
-6 integration tests are live-server-gated (TLS live connect, COPY IN/OUT, and
-4× LISTEN/NOTIFY). These live-server tests are marked `#[ignore]` because they
-require a real PostgreSQL instance; the remaining `#[ignore]`d integration tests
-(CRUD cycles, isolation, reconnect, pooling) are also gated the same way and are
-skipped when no server is available. Enable them with a running server and the
-`integration-postgres` feature.
+**68 tests passing** under plain `cargo test` (no extra features; includes 15
+doctests), plus 6 `#[ignore]`d live-server tests (TLS live connect, COPY
+IN/OUT, 4× LISTEN/NOTIFY) that are skipped without a real PostgreSQL instance.
+
+With `--all-features` (adds `integration-postgres` + `replication`) the suite
+grows substantially: 393 tests run under `cargo nextest` (doctests excluded),
+plus 41 more that stay `#[ignore]`d pending a live server — the 6 above, a
+30-test CRUD/isolation/reconnect/pooling/prepared-statement/type-mapping
+integration suite, and the 5-test `tests/replication.rs` logical-replication
+suite (needs `wal_level=logical`; see "Logical replication" above). The
+`replication` feature's own unit-test suite alone (`cargo test -p
+oxisql-postgres --features replication --lib`) totals 339 tests, covering
+`pgoutput` message decoding, LSN parsing, `CopyBoth` framing, SCRAM-SHA-256
+auth, and text-/binary-format tuple and array decoding.
 
 ```bash
-cargo test -p oxisql-postgres                              # 61 passed (incl. doctests), live tests skipped
-cargo nextest run -p oxisql-postgres --run-ignored all     # also runs live-server tests (nextest excludes doctests)
+cargo test -p oxisql-postgres                                          # 68 passed (incl. doctests), live tests skipped
+cargo nextest run -p oxisql-postgres --all-features --run-ignored all  # also runs every live-server test (needs a real server)
 ```
 
 ## Part of the OxiSQL workspace
 
 This crate is one of 17 crates in the Pure-Rust [OxiSQL workspace](../../README.md)
-(1,720 workspace tests pass). It is the PostgreSQL backend behind the unified
+(2,157 workspace tests pass, 2,651 with `--all-features`). It is the PostgreSQL backend behind the unified
 `oxisql` facade; see the workspace README for the embedded engine, MySQL
 backend, connection pool, migrations, and DataFusion integration.
 

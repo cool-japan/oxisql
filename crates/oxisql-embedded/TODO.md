@@ -1,6 +1,6 @@
 # oxisql-embedded — TODO
 
-**Status:** Stable · v0.3.2 · 278 tests pass (`--all-features`).
+**Status:** Stable · v0.3.3 · 263 tests pass (default features), 281 tests pass (`--all-features`).
 
 In-memory SQL engine backed by GlueSQL `MemoryStorage`, with optional Pure-Rust persistent backends (fjall LSM-tree, redb B-tree, sled key-value). `EmbeddedConnection` implements `oxisql_core::Connection`; parameters are bound client-side via an `sqlparser` AST pass with a string-scan fallback. Full schema introspection, CSV/SQL import/export, host-side UDFs, virtual tables, full-text search, and B-tree secondary indexes are implemented.
 
@@ -36,7 +36,7 @@ In-memory SQL engine backed by GlueSQL `MemoryStorage`, with optional Pure-Rust 
 - [x] JSON helpers (`json_set` / `json_get`).
 
 ### Quality
-- [x] 278 tests (`--all-features`) — CSV round-trips, schema introspection, persistence (write → close → reopen), parameter-binding edge cases, transactions/rollback, UDFs/aggregates, FTS, virtual tables, NULL handling, large result sets.
+- [x] 263 tests (default features), 281 tests (`--all-features`) — CSV round-trips, schema introspection, persistence (write → close → reopen), parameter-binding edge cases, transactions/rollback, UDFs/aggregates, FTS, virtual tables, NULL handling, large result sets.
 - [x] Criterion benchmarks (`benches/embedded_benchmarks.rs`) — query throughput, parameter-binding overhead, mutex contention, persistent vs in-memory I/O.
 
 ## Roadmap / next

@@ -386,28 +386,43 @@ impl std::ops::Mul for DoubleDouble {
     ///   T. J. Dekker, "A Floating-Point Technique for Extending the Available Precision".
     ///   1971-07-26.
     ///
+    /// This is Dekker's classic two-step construction: first split each operand's head
+    /// double into non-overlapping high/low halves ("Veltkamp splitting") so that
+    /// multiplying the halves together loses no bits to rounding, then use those halves to
+    /// recover the *exact* product of the two head doubles as a (head, tail) pair (Dekker's
+    /// error-free transformation for multiplication, sometimes called "two-product"). The
+    /// tail is then corrected for the two operands' own double-double tails (`self.1`,
+    /// `rhs.1`) and the whole (head, tail) pair is renormalized with a quick two-sum.
     fn mul(self, rhs: Self) -> Self::Output {
-        // TODO: Better variable naming
+        let split_mask = u64::MAX << 26;
 
-        let mask = u64::MAX << 26;
+        // Veltkamp split of each head double into a high part representable in ~26 bits and
+        // the remaining low part, such that e.g. `self_head_hi + self_head_lo == self.0`
+        // exactly.
+        let self_head_hi = f64::from_bits(self.0.to_bits() & split_mask);
+        let self_head_lo = self.0 - self_head_hi;
 
-        let hx = f64::from_bits(self.0.to_bits() & mask);
-        let tx = self.0 - hx;
+        let rhs_head_hi = f64::from_bits(rhs.0.to_bits() & split_mask);
+        let rhs_head_lo = rhs.0 - rhs_head_hi;
 
-        let hy = f64::from_bits(rhs.0.to_bits() & mask);
-        let ty = rhs.0 - hy;
+        // Naive (rounded) product of the two high halves, and the cross terms needed to
+        // correct it.
+        let product_hi = self_head_hi * rhs_head_hi;
+        let cross_terms = self_head_hi * rhs_head_lo + self_head_lo * rhs_head_hi;
 
-        let p = hx * hy;
-        let q = hx * ty + tx * hy;
+        // `head` is the correctly-rounded product of `self.0 * rhs.0`; `tail` recovers the
+        // rounding error Dekker's transformation lets us compute exactly.
+        let head = product_hi + cross_terms;
+        let tail = product_hi - head + cross_terms + self_head_lo * rhs_head_lo;
+        // Fold in the contribution from each operand's own double-double tail, which the
+        // single-double two-product above doesn't see.
+        let tail = self.0 * rhs.1 + self.1 * rhs.0 + tail;
 
-        let c = p + q;
-        let cc = p - c + q + tx * ty;
-        let cc = self.0 * rhs.1 + self.1 * rhs.0 + cc;
+        // Quick two-sum: renormalize (head, tail) into canonical double-double form.
+        let result_hi = head + tail;
+        let result_lo = (head - result_hi) + tail;
 
-        let r = c + cc;
-        let rr = (c - r) + cc;
-
-        DoubleDouble(r, rr)
+        DoubleDouble(result_hi, result_lo)
     }
 }
 

@@ -159,9 +159,10 @@ impl Display for ast::RefArg {
             Self::Match(name) => format!("MATCH {}", name.0),
             Self::OnDelete(act) => format!("ON DELETE {}", act),
             Self::OnUpdate(act) => format!("ON UPDATE {}", act),
-            Self::OnInsert(..) => unimplemented!(
-                "On Insert does not exist in SQLite: https://www.sqlite.org/lang_altertable.html"
-            ),
+            // Not part of SQLite's own documented grammar, but this parser's
+            // `refarg` production does accept `ON INSERT <action>` in a
+            // foreign-key clause (see `parse.y`), so it must round-trip too.
+            Self::OnInsert(act) => format!("ON INSERT {}", act),
         };
         write!(f, "{}", value)
     }
@@ -246,6 +247,16 @@ mod tests {
     to_sql_string_test!(
         test_alter_table_add_column_foreign_key,
         "ALTER TABLE t ADD COLUMN c INTEGER REFERENCES t2(id) ON DELETE CASCADE;"
+    );
+
+    to_sql_string_test!(
+        test_alter_table_add_column_foreign_key_on_insert,
+        "ALTER TABLE t ADD COLUMN c INTEGER REFERENCES t2(id) ON INSERT CASCADE;"
+    );
+
+    to_sql_string_test!(
+        test_alter_table_add_column_foreign_key_on_insert_and_update,
+        "ALTER TABLE t ADD COLUMN c INTEGER REFERENCES t2(id) ON INSERT CASCADE ON UPDATE SET NULL;"
     );
 
     to_sql_string_test!(

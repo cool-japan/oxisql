@@ -90,11 +90,80 @@ path = "tests/without_rowid.rs"
 name = "group_by_having"
 path = "tests/group_by_having.rs"
 
+[[test]]
+name = "delete_update_index_safety"
+path = "tests/delete_update_index_safety.rs"
+
+[[test]]
+name = "ctas"
+path = "tests/ctas.rs"
+
+[[test]]
+name = "auto_vacuum"
+path = "tests/auto_vacuum.rs"
+
+[[test]]
+name = "update_returning"
+path = "tests/update_returning.rs"
+
+[[test]]
+name = "alter_rename"
+path = "tests/alter_rename.rs"
+
+[[test]]
+name = "translate_expr_value_fixes"
+path = "tests/translate_expr_value_fixes.rs"
+
+[[test]]
+name = "cte_and_joins"
+path = "tests/cte_and_joins.rs"
+
+[[test]]
+name = "vtab_order_by_pushdown"
+path = "tests/vtab_order_by_pushdown.rs"
+
+[[test]]
+name = "vtab_schema_columns"
+path = "tests/vtab_schema_columns.rs"
+
+[[test]]
+name = "compound_select_set_ops"
+path = "tests/compound_select_set_ops.rs"
+
+[[test]]
+name = "regexp_operator"
+path = "tests/regexp_operator.rs"
+
+[[test]]
+name = "autoindex_balance"
+path = "tests/autoindex_balance.rs"
+
+[[test]]
+name = "views"
+path = "tests/views.rs"
+
 [dependencies.bitflags]
 workspace = true
 
 [dependencies.chrono]
 workspace = true
+# "clock" (not just "now") is genuinely required here: functions/datetime/mod.rs's
+# `Modifier::Localtime`/`Modifier::Utc` handling implements SQLite's
+# `datetime('now','localtime')`/`'utc'` modifiers, which perform a real
+# host-OS-timezone conversion via `chrono::Local` — that needs the full
+# "clock" feature (`iana-time-zone`, and on macOS `core-foundation-sys`), not
+# just "now". All *other* call sites in this crate that previously used
+# `chrono::Local::now()` merely to read the current instant (io/*.rs's
+# `Clock::now()`, and 'now' time-value parsing) have been switched to
+# `chrono::Utc::now()`, since SQLite's own 'now' time-value is UTC and
+# `Instant::{secs,micros}` are timezone-independent — but the crate as a
+# whole cannot drop "clock" while the localtime/utc modifiers still need it.
+# Note: even if this crate could drop "clock", the workspace's default build
+# would still pull `iana-time-zone`/`core-foundation-sys` in transitively via
+# `arrow-arith`/`arrow-array`/`arrow-cast`/`arrow-csv`/`arrow-json` (through
+# `oxisql-datafusion` → `datafusion` → `arrow`), which each independently
+# request chrono's "clock" feature in their own manifests — confirmed via
+# `cargo tree -i core-foundation-sys`.
 features = ["clock"]
 
 [dependencies.crossbeam-skiplist]
@@ -117,15 +186,11 @@ optional = true
 version = "0.2"
 
 [dependencies.limbo_ext]
-package = "oxisqlite-ext"
-version = "0.3"
-path = "../oxisqlite-ext"
+workspace = true
 features = ["core_only"]
 
 [dependencies.limbo_macros]
-package = "oxisqlite-macros"
-version = "0.3"
-path = "../oxisqlite-macros"
+workspace = true
 
 [dependencies.limbo_sqlite3_parser]
 package = "oxisqlite-sqlite3-parser"
@@ -289,3 +354,13 @@ optional = true
 [target.'cfg(target_os = "linux")'.dependencies.io-uring]
 version = "0.7.13"
 optional = true
+
+# Windows file-locking backend (io/windows.rs): LockFileEx/UnlockFileEx via
+# windows-sys. `WindowsIO`/`WindowsFile` are compiled unconditionally on
+# `target_os = "windows"` (see io/mod.rs), so this is a mandatory (non
+# `optional`) dependency for that target only; it never enters the
+# dependency graph for any other target.
+[target.'cfg(target_os = "windows")'.dependencies.windows-sys]
+workspace = true
+
+

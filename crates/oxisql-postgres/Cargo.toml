@@ -15,6 +15,9 @@ keywords = ["database", "postgresql", "pure-rust", "cooljapan", "oxisql"]
 default = []
 # Gate the integration tests (require a live Postgres instance).
 integration-postgres = []
+# Logical replication (CDC) support — parses the Postgres replication wire
+# protocol via postgres-protocol.
+replication = ["dep:postgres-protocol", "dep:fallible-iterator-02"]
 
 [dependencies]
 oxisql-core.workspace = true
@@ -24,11 +27,12 @@ futures.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
 tokio-postgres-rustls.workspace = true
+postgres-protocol = { workspace = true, optional = true }
+fallible-iterator-02 = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pki-types.workspace = true
 rustls-pemfile.workspace = true
 tokio-rustls.workspace = true
-rustls-rustcrypto.workspace = true
 oxitls.workspace = true
 bytes.workspace = true
 time.workspace = true

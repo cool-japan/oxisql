@@ -27,6 +27,10 @@ pub enum PgError {
     Notify(String),
     /// A connection-level error (e.g. cancel request failed).
     Connection(String),
+    /// A replication-protocol error (slot management, negotiation, or unexpected server state).
+    Replication(String),
+    /// A malformed or truncated wire-protocol message was received (decoder bounds-check failure).
+    Protocol(String),
 }
 
 impl std::fmt::Display for PgError {
@@ -43,6 +47,8 @@ impl std::fmt::Display for PgError {
             PgError::Copy(msg) => write!(f, "postgres COPY error: {msg}"),
             PgError::Notify(msg) => write!(f, "postgres NOTIFY error: {msg}"),
             PgError::Connection(msg) => write!(f, "postgres connection error: {msg}"),
+            PgError::Replication(msg) => write!(f, "postgres replication error: {msg}"),
+            PgError::Protocol(msg) => write!(f, "postgres protocol error: {msg}"),
         }
     }
 }
@@ -58,7 +64,9 @@ impl std::error::Error for PgError {
             | PgError::PoolExhausted(_)
             | PgError::Copy(_)
             | PgError::Notify(_)
-            | PgError::Connection(_) => None,
+            | PgError::Connection(_)
+            | PgError::Replication(_)
+            | PgError::Protocol(_) => None,
         }
     }
 }
@@ -79,6 +87,12 @@ impl From<tokio_postgres::Error> for PgError {
             }
         }
         PgError::Postgres(e)
+    }
+}
+
+impl From<std::io::Error> for PgError {
+    fn from(e: std::io::Error) -> Self {
+        PgError::Connection(e.to_string())
     }
 }
 
@@ -105,6 +119,12 @@ impl From<PgError> for oxisql_core::OxiSqlError {
             PgError::Notify(msg) => oxisql_core::OxiSqlError::Other(format!("NOTIFY error: {msg}")),
             PgError::Connection(msg) => {
                 oxisql_core::OxiSqlError::Other(format!("connection error: {msg}"))
+            }
+            PgError::Replication(msg) => {
+                oxisql_core::OxiSqlError::Other(format!("replication error: {msg}"))
+            }
+            PgError::Protocol(msg) => {
+                oxisql_core::OxiSqlError::Other(format!("protocol error: {msg}"))
             }
         }
     }

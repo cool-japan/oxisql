@@ -415,7 +415,7 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
 ///
 ///   fn get_current_time(&self) -> String {
 ///    // (optional) method to generate random number. Used for testing
-///        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+///        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
 ///    }
 ///
 ///

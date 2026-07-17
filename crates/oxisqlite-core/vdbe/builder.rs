@@ -12,19 +12,28 @@ use crate::{
     translate::{
         collate::CollationSeq,
         emitter::TransactionMode,
-        plan::{ResultSetColumn, TableReferences},
+        plan::{AggregateMask, ResultSetColumn, TableReferences},
     },
     types::Text,
     Connection, Value, VirtualTable,
 };
+/// The maximum depth of nested view expansion. A view referencing (transitively)
+/// itself, or an unreasonably deep legitimate nesting, is rejected once this many
+/// levels have been entered, turning what would otherwise be an unbounded
+/// recursion (stack overflow) into a clean parse error.
+pub const MAX_VIEW_EXPANSION_DEPTH: u32 = 32;
+
 pub struct TableRefIdCounter {
     next_free: TableInternalId,
+    /// Current view-expansion nesting depth, guarded against reference cycles.
+    view_expansion_depth: u32,
 }
 
 impl TableRefIdCounter {
     pub fn new() -> Self {
         Self {
             next_free: TableInternalId::default(),
+            view_expansion_depth: 0,
         }
     }
 
@@ -32,6 +41,24 @@ impl TableRefIdCounter {
         let id = self.next_free;
         self.next_free += 1;
         id
+    }
+
+    /// Enter one level of view expansion, erroring if the depth limit is reached
+    /// (a probable circular view definition). Pair with [`Self::exit_view`].
+    pub fn enter_view(&mut self) -> crate::Result<()> {
+        if self.view_expansion_depth >= MAX_VIEW_EXPANSION_DEPTH {
+            crate::bail_parse_error!(
+                "too many levels of view nesting (possible circular view definition)"
+            );
+        }
+        self.view_expansion_depth += 1;
+        Ok(())
+    }
+
+    /// Leave one level of view expansion. Saturating so a stray call can never
+    /// underflow.
+    pub fn exit_view(&mut self) {
+        self.view_expansion_depth = self.view_expansion_depth.saturating_sub(1);
     }
 }
 
@@ -294,7 +321,7 @@ impl ProgramBuilder {
         self.result_columns.push(ResultSetColumn {
             expr,
             alias: Some(col_name),
-            contains_aggregates: false,
+            contains_aggregates: AggregateMask::EMPTY,
         });
     }
 

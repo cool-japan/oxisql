@@ -37,7 +37,7 @@ selected when you open a `mysql://` URL through the `oxisql` facade.
 
 ```toml
 [dependencies]
-oxisql-mysql = "0.1.2"
+oxisql-mysql = "0.3.3"
 ```
 
 MSRV 1.89 · edition 2021 · Apache-2.0.
@@ -134,6 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `call_procedure_multi(name, params)` | Call a stored procedure; returns **all** result sets |
 | `mysql_url_parts(url)` → `MysqlUrlParts` | Parse `host` / `port` / `dbname` / `user` from a `mysql://` URL |
 | `is_reconnect_error(err)` | Identify transient errors (`CR_SERVER_GONE`, `CR_SERVER_LOST`, I/O, …) that are safe to retry |
+| `MyConnection::server_version()` | `async` — acquire a pooled connection and return the MySQL/MariaDB server version as `"{major}.{minor}.{patch}"` (e.g. `"8.0.35"`) |
 
 ## Capabilities
 
@@ -199,20 +200,21 @@ rather than panicking.
 
 ## Test coverage
 
-**95 tests passing** under `cargo test`. The live-server integration tests are
-`#[ignore]`-gated (they need a real MySQL 8.x server) and so are skipped when no
-server is available. Enable them with a running server and the
-`integration-mysql` feature.
+**102 tests passing** under `cargo test` (96 unit/integration tests plus 6
+doctests). The live-server integration tests are individually gated behind
+**both** `#[cfg(feature = "integration-mysql")]` and `#[ignore]` (they need a
+real MySQL 8.x server), so they are not merely skipped but not even compiled
+in without the feature.
 
 ```bash
-cargo test -p oxisql-mysql                              # 95 passed, live tests skipped
-cargo test -p oxisql-mysql -- --include-ignored         # also runs live-server tests
+cargo test -p oxisql-mysql                                                    # 102 passed (incl. doctests), live tests absent
+cargo test -p oxisql-mysql --features integration-mysql -- --include-ignored  # also runs live-server tests
 ```
 
 ## Part of the OxiSQL workspace
 
 This crate is one of 17 crates in the Pure-Rust [OxiSQL workspace](../../README.md)
-(1,720 workspace tests pass). It is the MySQL backend behind the unified `oxisql`
+(2,157 workspace tests pass, 2,651 with `--all-features`). It is the MySQL backend behind the unified `oxisql`
 facade; see the workspace README for the embedded engine, PostgreSQL backend,
 connection pool, migrations, and DataFusion integration.
 

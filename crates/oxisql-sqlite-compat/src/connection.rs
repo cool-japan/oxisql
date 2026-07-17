@@ -333,6 +333,51 @@ impl SqliteConnection {
         Self::open(":memory:").await
     }
 
+    /// Open a Limbo-backed connection from an in-memory SQLite database image.
+    ///
+    /// The `bytes` are copied into an in-memory page store; no temporary file
+    /// is ever created, so this works on WASI, in the browser, and on
+    /// read-only filesystems. Mirrors SQLite's `sqlite3_deserialize()` /
+    /// rusqlite's `Connection::deserialize`. See
+    /// [`limbo::Database::open_from_bytes`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # async fn run() -> Result<(), oxisql_core::OxiSqlError> {
+    /// use oxisql_core::Connection;
+    /// use oxisql_sqlite_compat::SqliteConnection;
+    ///
+    /// // `image` is a complete SQLite database file loaded into memory,
+    /// // e.g. `include_bytes!("../data/app.db")`.
+    /// let image: &[u8] = get_database_image();
+    /// let conn = SqliteConnection::open_from_bytes(image).await?;
+    /// let rows = conn.query("SELECT count(*) FROM sqlite_master", &[]).await?;
+    /// # let _ = rows;
+    /// # Ok(())
+    /// # }
+    /// # fn get_database_image() -> &'static [u8] { &[] }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OxiSqlError`] if `bytes` is not a valid SQLite database image
+    /// (too short, wrong magic header, or an invalid page size). Never panics
+    /// on malformed input.
+    pub async fn open_from_bytes(bytes: &[u8]) -> Result<Self, OxiSqlError> {
+        let db = limbo::Database::open_from_bytes(bytes)
+            .map_err(|e| OxiSqlError::Other(format!("limbo open_from_bytes error: {e}")))?;
+        let conn = db
+            .connect()
+            .map_err(|e| OxiSqlError::Other(format!("limbo connect error: {e}")))?;
+        Ok(Self {
+            conn,
+            txn_lock: Arc::new(TokioMutex::new(())),
+            stmt_cache: new_stmt_cache(),
+            path: "<memory:bytes>".to_owned(),
+        })
+    }
+
     /// Return the path this connection was opened with.
     pub fn path(&self) -> &str {
         &self.path

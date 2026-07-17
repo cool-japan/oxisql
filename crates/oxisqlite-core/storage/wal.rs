@@ -38,12 +38,17 @@ pub const NO_LOCK: u32 = 0;
 pub const SHARED_LOCK: u32 = 1;
 pub const WRITE_LOCK: u32 = 2;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub struct CheckpointResult {
     /// number of frames in WAL
     pub num_wal_frames: u64,
     /// number of frames moved successfully from WAL to db file after checkpoint
     pub num_checkpointed_frames: u64,
+    /// Page ids actually backfilled (WAL -> main db file) during this
+    /// checkpoint pass. Lets a caller invalidate exactly these pages from its
+    /// page cache instead of evicting everything (see
+    /// `Pager::wal_checkpoint`/`Pager::wal_checkpoint_mode`).
+    pub checkpointed_page_ids: Vec<u64>,
 }
 
 impl Default for CheckpointResult {
@@ -57,6 +62,7 @@ impl CheckpointResult {
         Self {
             num_wal_frames: 0,
             num_checkpointed_frames: 0,
+            checkpointed_page_ids: Vec::new(),
         }
     }
 }
@@ -311,7 +317,15 @@ impl Wal for DummyWAL {
         _frame: *mut u8,
         _frame_len: u32,
     ) -> Result<Arc<Completion>> {
-        todo!();
+        // `DummyWAL` backs ephemeral/in-memory indexes that never have a real
+        // on-disk WAL, so there is no frame data to read raw bytes for. This
+        // method is only reachable via `Pager::wal_get_frame` (the
+        // `sqlite3_wal_frame`-style API meant for real, file-backed WALs), so
+        // a descriptive error is the correct outcome here, not a real
+        // implementation.
+        Err(crate::error::LimboError::InternalError(
+            "DummyWAL::read_frame_raw: ephemeral in-memory WAL has no frames to read".to_string(),
+        ))
     }
 
     fn append_frame(
@@ -395,7 +409,7 @@ pub enum WalFsyncStatus {
     IO,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub enum CheckpointStatus {
     Done(CheckpointResult),
     IO,
@@ -415,6 +429,11 @@ struct OngoingCheckpoint {
     min_frame: u64,
     max_frame: u64,
     current_page: u64,
+    /// Page ids actually selected for backfill (`WritePage`'d) so far during
+    /// the checkpoint pass currently in progress. Reset in `CheckpointState::Start`,
+    /// appended to in `CheckpointState::ReadFrame`, and drained into
+    /// `CheckpointResult::checkpointed_page_ids` in `CheckpointState::Done`.
+    touched_pages: Vec<u64>,
 }
 
 impl fmt::Debug for OngoingCheckpoint {
@@ -424,6 +443,7 @@ impl fmt::Debug for OngoingCheckpoint {
             .field("min_frame", &self.min_frame)
             .field("max_frame", &self.max_frame)
             .field("current_page", &self.current_page)
+            .field("touched_pages_count", &self.touched_pages.len())
             .finish()
     }
 }
@@ -761,6 +781,7 @@ impl Wal for WalFile {
                     }
                     self.ongoing_checkpoint.max_frame = max_safe_frame;
                     self.ongoing_checkpoint.current_page = 0;
+                    self.ongoing_checkpoint.touched_pages.clear();
                     self.ongoing_checkpoint.state = CheckpointState::ReadFrame;
                     tracing::trace!(
                         "checkpoint_start(min_frame={}, max_frame={})",
@@ -796,6 +817,7 @@ impl Wal for WalFile {
                                 *frame
                             );
                             self.ongoing_checkpoint.page.get().id = page as usize;
+                            self.ongoing_checkpoint.touched_pages.push(page);
 
                             self.read_frame(
                                 *frame,
@@ -842,6 +864,13 @@ impl Wal for WalFile {
                     if *write_counter.borrow() > 0 {
                         return Ok(CheckpointStatus::IO);
                     }
+                    // Taken before `self.get_shared()` below: `get_shared`'s
+                    // return value keeps an (elided) immutable borrow of
+                    // `self` alive for the rest of this arm, which would
+                    // otherwise conflict with this mutable borrow of a
+                    // different field of `self`.
+                    let checkpointed_page_ids =
+                        std::mem::take(&mut self.ongoing_checkpoint.touched_pages);
                     let shared = self.get_shared();
 
                     // Record two num pages fields to return as checkpoint result to caller.
@@ -849,29 +878,40 @@ impl Wal for WalFile {
                     let checkpoint_result = CheckpointResult {
                         num_wal_frames: shared.max_frame.load(Ordering::SeqCst),
                         num_checkpointed_frames: self.ongoing_checkpoint.max_frame,
+                        checkpointed_page_ids,
                     };
                     let everything_backfilled = shared.max_frame.load(Ordering::SeqCst)
                         == self.ongoing_checkpoint.max_frame;
                     if everything_backfilled {
-                        if !matches!(mode, CheckpointMode::Passive) {
-                            // Everything was backfilled into the db file, so it is
-                            // safe to reset the WAL bookkeeping.
-                            shared.frame_cache.lock().clear();
-                            shared.pages_in_frames.lock().clear();
-                            shared.max_frame.store(0, Ordering::SeqCst);
-                            shared.nbackfills.store(0, Ordering::SeqCst);
-                            // For Restart/Truncate, physically reset the on-disk WAL:
-                            // rewrite a fresh header (new salt) so leftover frames are
-                            // rejected by future recovery, and for Truncate shrink the
-                            // file to zero bytes first.
-                            if matches!(mode, CheckpointMode::Restart | CheckpointMode::Truncate) {
-                                self.reset_wal_file(matches!(mode, CheckpointMode::Truncate))?;
-                            }
-                        }
+                        // Everything currently in the WAL has been safely
+                        // copied into the main db file, so it is safe to start
+                        // a brand new WAL "generation" here -- regardless of
+                        // checkpoint mode. This drops the now fully-redundant
+                        // frame bookkeeping and evolves checkpoint_seq/salts
+                        // via `reset_wal_file`, matching the `WalHeader` field
+                        // doc comments and mirroring how SQLite restarts the
+                        // physical log once it has been fully backfilled.
+                        // Only `Truncate` additionally shrinks the on-disk
+                        // file to zero bytes.
+                        shared.frame_cache.lock().clear();
+                        shared.pages_in_frames.lock().clear();
+                        shared.max_frame.store(0, Ordering::SeqCst);
+                        shared.nbackfills.store(0, Ordering::SeqCst);
+                        self.reset_wal_file(matches!(mode, CheckpointMode::Truncate))?;
                     } else {
+                        // Not everything could be backfilled this pass (e.g.
+                        // an active reader is still pinned to an older
+                        // snapshot). Advance the backfill watermark to
+                        // whatever we *did* manage to checkpoint just now...
                         shared
                             .nbackfills
                             .store(self.ongoing_checkpoint.max_frame, Ordering::SeqCst);
+                        // ...and opportunistically discard frame_cache /
+                        // pages_in_frames entries that are now durably in the
+                        // main db file, so these structures don't grow
+                        // without bound for the lifetime of a long-running
+                        // WAL connection (see `trim_backfilled_frames`).
+                        self.trim_backfilled_frames(self.ongoing_checkpoint.max_frame);
                     }
                     self.ongoing_checkpoint.state = CheckpointState::Start;
                     return Ok(CheckpointStatus::Done(checkpoint_result));
@@ -1005,6 +1045,7 @@ impl WalFile {
                 min_frame: 0,
                 max_frame: 0,
                 current_page: 0,
+                touched_pages: Vec::new(),
             },
             checkpoint_threshold: 1000,
             page_size,
@@ -1037,22 +1078,46 @@ impl WalFile {
         }
     }
 
-    /// Reset the on-disk WAL after a Restart/Truncate checkpoint.
+    /// Reset the on-disk WAL after a checkpoint that fully backfilled the log
+    /// into the main database file.
     ///
-    /// Rewrites the 32-byte WAL header with a freshly generated salt (so any
-    /// leftover frames still on disk are rejected by a future recovery via the
-    /// salt-mismatch check) and resets the in-memory cumulative checksum. When
-    /// `truncate` is true, the WAL file is also physically shrunk to zero bytes
-    /// and a fresh empty 32-byte header is rewritten, so the on-disk `-wal`
-    /// carries no frames (max_frame 0) and a byte-level reader sees a
-    /// self-contained database file.
+    /// This is called for every [`CheckpointMode`] once a checkpoint achieves
+    /// a full backfill (see the `everything_backfilled` branch in
+    /// [`WalFile::checkpoint`]), not just `Restart`/`Truncate`: any checkpoint
+    /// that catches the WAL up completely starts a brand new WAL "generation",
+    /// exactly like SQLite restarting its log once nothing is left to
+    /// checkpoint.
+    ///
+    /// Evolves the 32-byte WAL header so any leftover frames still physically
+    /// on disk (we don't necessarily truncate the file -- see below) are
+    /// rejected by a future recovery via the salt-mismatch check:
+    /// `checkpoint_seq` is incremented, `salt_1` is incremented (not
+    /// re-randomized), and `salt_2` gets a fresh random value. This matches
+    /// the doc comments on the `WalHeader` fields and mirrors SQLite's own
+    /// convention for distinguishing WAL generations during crash recovery.
+    /// The in-memory cumulative checksum is reset to match. When `truncate` is
+    /// true, the WAL file is also physically shrunk to zero bytes and a fresh
+    /// empty 32-byte header is rewritten, so the on-disk `-wal` carries no
+    /// frames (max_frame 0) and a byte-level reader sees a self-contained
+    /// database file.
+    ///
+    /// Correctness note: it is only safe to bump the salt here because the
+    /// caller only invokes this once every frame currently in the WAL has
+    /// already been durably copied into the main database file (i.e.
+    /// `shared.max_frame` has just been reset to 0 and `frame_cache`/
+    /// `pages_in_frames` have just been cleared by the caller). Bumping the
+    /// salt while older, not-yet-backfilled frames were still relied upon
+    /// would strand them: they'd carry the OLD salt while the header now
+    /// advertises the NEW one, so a crash-recovery pass would reject them at
+    /// the first mismatch and silently lose data that was never checkpointed.
     fn reset_wal_file(&self, truncate: bool) -> Result<()> {
         let shared = self.get_shared();
-        // Generate a new salt so any leftover frames become unrecoverable, and
-        // recompute the header checksum over the first 24 bytes.
+        // Evolve the header for the new WAL generation and recompute the
+        // checksum over the first 24 bytes.
         {
             let mut header = shared.wal_header.lock();
-            header.salt_1 = self.io.generate_random_number() as u32;
+            header.checkpoint_seq = header.checkpoint_seq.wrapping_add(1);
+            header.salt_1 = header.salt_1.wrapping_add(1);
             header.salt_2 = self.io.generate_random_number() as u32;
             let native = cfg!(target_endian = "big");
             let checksums = checksum_wal(
@@ -1096,6 +1161,56 @@ impl WalFile {
             sqlite3_ondisk::begin_write_wal_header(&shared.file, &header)?;
         }
         Ok(())
+    }
+
+    /// Discard `frame_cache`/`pages_in_frames` entries for frames that are now
+    /// durably present in the main database file, i.e. frames at or below
+    /// `backfilled_up_to`.
+    ///
+    /// This is called after a checkpoint pass that could *not* fully backfill
+    /// the WAL (some frames above `backfilled_up_to` are still needed), so
+    /// unlike the full reset in [`WalFile::checkpoint`]'s `everything_backfilled`
+    /// branch, this only prunes the *safe* prefix rather than clearing
+    /// everything. Without this, `frame_cache`/`pages_in_frames` would grow
+    /// without bound for the lifetime of any long-running WAL-mode connection
+    /// that has at least one reader briefly outliving a checkpoint (every
+    /// `Passive` checkpoint would otherwise only ever append, never reclaim).
+    ///
+    /// Safety argument: `backfilled_up_to` is always
+    /// `self.ongoing_checkpoint.max_frame`, the `max_safe_frame` a checkpoint
+    /// pass computes for itself in `CheckpointState::Start`. That computation
+    /// already walks every slot in `shared.read_locks` and clamps the value
+    /// down to the pinned snapshot of any *currently active* reader, so it can
+    /// never exceed an active reader's `max_frame`. Consequently, for every
+    /// currently (or future, since new readers only ever adopt a mark
+    /// `>= backfilled_up_to`, see `begin_read_tx`) active reader:
+    ///   * a frame above `backfilled_up_to` that the reader still needs
+    ///     remains untouched in `frame_cache` (we only remove frames
+    ///     `<= backfilled_up_to`), so `find_frame` keeps finding it directly, or
+    ///   * the reader needs "the latest frame `<= backfilled_up_to`" for a
+    ///     page, which is *exactly* the version this checkpoint pass just
+    ///     copied into the main db file (see `CheckpointState::ReadFrame`'s
+    ///     `frame >= min_frame && frame <= max_frame` selection) -- so once
+    ///     `find_frame` returns `None` for the trimmed entries, falling back
+    ///     to reading the main db file yields identical content.
+    ///
+    /// Frames above `backfilled_up_to` are left completely untouched: they
+    /// have not been copied to the db file yet and may still be needed by the
+    /// writer or by any reader.
+    fn trim_backfilled_frames(&self, backfilled_up_to: u64) {
+        if backfilled_up_to == 0 {
+            // Nothing has been backfilled yet -- frame ids are 1-based, so
+            // there is nothing safe to trim.
+            return;
+        }
+        let shared = self.get_shared();
+        let mut frame_cache = shared.frame_cache.lock();
+        let mut pages_in_frames = shared.pages_in_frames.lock();
+        frame_cache.retain(|_page_id, frames| {
+            frames.retain(|&frame| frame > backfilled_up_to);
+            !frames.is_empty()
+        });
+        pages_in_frames.retain(|page_id| frame_cache.contains_key(page_id));
     }
 }
 
@@ -1219,5 +1334,457 @@ impl WalFileShared {
             loaded: AtomicBool::new(true),
         };
         Ok(Arc::new(UnsafeCell::new(shared)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::{MemoryIO, OpenFlags};
+    use crate::storage::database::{DatabaseFile, DatabaseStorage};
+    use crate::storage::page_cache::DumbLruPageCache;
+    use crate::storage::pager::{Pager, PagerCacheflushStatus};
+    use crate::storage::sqlite3_ondisk::DatabaseHeader;
+    use parking_lot::RwLock;
+
+    const TEST_PAGE_SIZE: u32 = 4096;
+
+    /// Shared plumbing for a single in-memory database: an `IO`, the main
+    /// `.db` file storage, the WAL's cross-connection shared state, and the
+    /// database header. Calling [`TestDb::connect`] multiple times simulates
+    /// multiple independent connections to the *same* database, the way
+    /// `Database::connect()` would -- each gets its own `WalFile` view (own
+    /// `min_frame`/`max_frame`/read-lock slot) and its own page cache, but
+    /// all share the same underlying WAL bookkeeping and main db file.
+    struct TestDb {
+        io: Arc<dyn IO>,
+        db_storage: Arc<dyn DatabaseStorage>,
+        wal_shared: Arc<UnsafeCell<WalFileShared>>,
+        db_header: Arc<SpinLock<DatabaseHeader>>,
+    }
+
+    impl TestDb {
+        fn new(page_size: u32) -> Self {
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let db_file_raw = io
+                .open_file("wal_test.db", OpenFlags::Create, false)
+                .expect("open_file should succeed against MemoryIO");
+            let db_storage: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(db_file_raw));
+            let wal_shared = WalFileShared::open_shared(&io, "wal_test.db-wal", page_size)
+                .expect("open_shared should succeed for a fresh in-memory WAL");
+            let mut header_data = DatabaseHeader::default();
+            header_data.update_page_size(page_size);
+            let db_header = Arc::new(SpinLock::new(header_data));
+            Self {
+                io,
+                db_storage,
+                wal_shared,
+                db_header,
+            }
+        }
+
+        /// Open a new independent "connection" to the same underlying
+        /// database: a fresh `WalFile` view (its own read-lock slot / frame
+        /// bounds once it begins a transaction) and a fresh, empty page
+        /// cache, so a `read_page` call is guaranteed to consult the WAL /
+        /// main db file rather than an already-cached copy.
+        fn connect(&self, page_size: u32) -> Pager {
+            let buffer_pool = Rc::new(BufferPool::new(page_size as usize));
+            let page_cache = Arc::new(RwLock::new(DumbLruPageCache::new(1000)));
+            let wal = Rc::new(RefCell::new(WalFile::new(
+                self.io.clone(),
+                page_size,
+                self.wal_shared.clone(),
+                buffer_pool.clone(),
+            )));
+            Pager::finish_open(
+                self.db_header.clone(),
+                self.db_storage.clone(),
+                wal,
+                self.io.clone(),
+                page_cache,
+                buffer_pool,
+            )
+            .expect("finish_open should succeed")
+        }
+
+        fn shared(&self) -> &WalFileShared {
+            unsafe { &*self.wal_shared.get() }
+        }
+    }
+
+    /// Begin a fresh read+write transaction on `pager`, run `f`, then drive
+    /// `Pager::end_tx` to completion so every page `f` dirtied is appended to
+    /// the WAL as a frame. Mirrors the begin_read_tx -> ... -> end_tx sequence
+    /// the VDBE drives around every statement (see
+    /// `vdbe/execute/txn_schema.rs`).
+    fn with_write_txn(pager: &Pager, f: impl FnOnce(&Pager)) {
+        assert!(matches!(
+            pager.begin_read_tx().expect("begin_read_tx"),
+            LimboResult::Ok
+        ));
+        assert!(matches!(
+            pager.begin_write_tx().expect("begin_write_tx"),
+            LimboResult::Ok
+        ));
+        f(pager);
+        while let PagerCacheflushStatus::IO = pager.end_tx().expect("end_tx") {
+            pager.io.run_once().expect("run_once");
+        }
+    }
+
+    /// Allocate a brand new page, stamp `marker` into its first byte, and
+    /// return its page id. Must be called inside `with_write_txn` (the page
+    /// must be flushed for the marker to become a WAL frame).
+    fn allocate_marked_page(pager: &Pager, marker: u8) -> usize {
+        let page = pager.allocate_page().expect("allocate_page");
+        let id = page.get().id;
+        page.get().contents.as_ref().expect("contents").as_ptr()[0] = marker;
+        id
+    }
+
+    /// Re-read an existing page, stamp `marker` into its first byte, and mark
+    /// it dirty again. Must be called inside `with_write_txn`.
+    fn rewrite_marked_page(pager: &Pager, page_id: usize, marker: u8) {
+        let page = pager.read_page(page_id).expect("read_page");
+        let mut spins = 0;
+        while page.is_locked() {
+            pager.io.run_once().expect("run_once");
+            spins += 1;
+            assert!(spins < 10_000, "page {page_id} stuck locked");
+        }
+        page.get().contents.as_ref().expect("contents").as_ptr()[0] = marker;
+        page.set_dirty();
+        pager.add_dirty(page_id);
+    }
+
+    /// Read a page's first byte through `pager`, driving any pending I/O
+    /// first. `pager` must not already have `page_id` loaded in its own page
+    /// cache from an earlier call, or this would just return the stale cached
+    /// copy instead of exercising `find_frame` / the main db file fallback.
+    fn read_marker(pager: &Pager, page_id: usize) -> u8 {
+        let page = pager.read_page(page_id).expect("read_page");
+        let mut spins = 0;
+        while page.is_locked() {
+            pager.io.run_once().expect("run_once");
+            spins += 1;
+            assert!(spins < 10_000, "page {page_id} stuck locked");
+        }
+        page.get().contents.as_ref().expect("contents").as_ptr()[0]
+    }
+
+    /// Drive a blocking checkpoint of `mode` to completion.
+    fn checkpoint(pager: &Pager, mode: CheckpointMode) -> CheckpointResult {
+        pager
+            .wal_checkpoint_mode(mode)
+            .expect("checkpoint should succeed")
+    }
+
+    #[test]
+    fn dummy_wal_read_frame_raw_returns_err_instead_of_todo() {
+        let dummy = DummyWAL;
+        let buffer_pool = Rc::new(BufferPool::new(TEST_PAGE_SIZE as usize));
+        let mut buf = [0u8; 16];
+        let result = dummy.read_frame_raw(1, buffer_pool, buf.as_mut_ptr(), buf.len() as u32);
+        assert!(
+            result.is_err(),
+            "DummyWAL::read_frame_raw must return an Err instead of panicking via todo!()"
+        );
+    }
+
+    /// Directly exercises `WalFile::trim_backfilled_frames`'s boundary
+    /// semantics without going through a full checkpoint: frames at or below
+    /// the boundary are removed, frames above it are untouched, and a page
+    /// whose every frame was trimmed is dropped from `pages_in_frames` too.
+    #[test]
+    fn trim_backfilled_frames_boundary_is_inclusive() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let buffer_pool = Rc::new(BufferPool::new(TEST_PAGE_SIZE as usize));
+        let shared = WalFileShared::open_shared(&io, "trim_test.db-wal", TEST_PAGE_SIZE)
+            .expect("open_shared");
+        let wal_file = WalFile::new(io.clone(), TEST_PAGE_SIZE, shared.clone(), buffer_pool);
+
+        {
+            let s = unsafe { &*shared.get() };
+            let mut frame_cache = s.frame_cache.lock();
+            frame_cache.insert(1, vec![1, 3, 5]); // page 1 seen at frames 1, 3, 5
+            frame_cache.insert(2, vec![2, 4]); // page 2 seen at frames 2, 4
+            frame_cache.insert(3, vec![10]); // page 3 only ever seen at frame 10
+            drop(frame_cache);
+            s.pages_in_frames.lock().extend_from_slice(&[1, 2, 3]);
+        }
+
+        // Trim everything at or below frame 4: page 1 keeps only frame 5;
+        // page 2 has nothing left above the boundary and must be dropped
+        // entirely (both from frame_cache and pages_in_frames); page 3's
+        // frame 10 is untouched.
+        wal_file.trim_backfilled_frames(4);
+
+        let s = unsafe { &*shared.get() };
+        {
+            let frame_cache = s.frame_cache.lock();
+            assert_eq!(frame_cache.get(&1), Some(&vec![5]));
+            assert_eq!(
+                frame_cache.get(&2),
+                None,
+                "page 2 had no frames left above the boundary, its key must be removed"
+            );
+            assert_eq!(frame_cache.get(&3), Some(&vec![10]));
+        }
+        {
+            let mut pages_in_frames = s.pages_in_frames.lock().clone();
+            pages_in_frames.sort_unstable();
+            assert_eq!(
+                pages_in_frames,
+                vec![1, 3],
+                "page 2 must be removed from pages_in_frames once its frame_cache entry is gone"
+            );
+        }
+
+        // A boundary of 0 (nothing backfilled yet) must be a strict no-op.
+        wal_file.trim_backfilled_frames(0);
+        let frame_cache = s.frame_cache.lock();
+        assert_eq!(frame_cache.get(&1), Some(&vec![5]));
+        assert_eq!(frame_cache.get(&3), Some(&vec![10]));
+    }
+
+    /// checkpoint_seq/salt_1/salt_2 must evolve on *every* checkpoint mode
+    /// that fully backfills the WAL, not just Restart/Truncate -- matching
+    /// the `WalHeader` field doc comments.
+    #[test]
+    fn checkpoint_evolves_checkpoint_seq_and_salts_for_every_mode() {
+        let db = TestDb::new(TEST_PAGE_SIZE);
+        let p1 = db.connect(TEST_PAGE_SIZE);
+
+        let (mut prev_seq, mut prev_salt1, mut prev_salt2) = {
+            let header = db.shared().wal_header.lock();
+            (header.checkpoint_seq, header.salt_1, header.salt_2)
+        };
+
+        let modes = [
+            CheckpointMode::Passive,
+            CheckpointMode::Passive,
+            CheckpointMode::Restart,
+            CheckpointMode::Passive,
+            CheckpointMode::Truncate,
+            CheckpointMode::Passive,
+        ];
+        for (i, mode) in modes.into_iter().enumerate() {
+            with_write_txn(&p1, |pager| {
+                let _ = allocate_marked_page(pager, i as u8);
+            });
+            checkpoint(&p1, mode);
+
+            let (seq, salt1, salt2) = {
+                let header = db.shared().wal_header.lock();
+                (header.checkpoint_seq, header.salt_1, header.salt_2)
+            };
+            assert_eq!(
+                seq,
+                prev_seq.wrapping_add(1),
+                "checkpoint_seq must increase on checkpoint #{i} (mode {mode:?})"
+            );
+            assert_eq!(
+                salt1,
+                prev_salt1.wrapping_add(1),
+                "salt_1 must be incremented (not re-randomized) on checkpoint #{i} (mode {mode:?})"
+            );
+            assert_ne!(
+                salt2, prev_salt2,
+                "salt_2 must take a fresh random value on checkpoint #{i} (mode {mode:?})"
+            );
+
+            prev_seq = seq;
+            prev_salt1 = salt1;
+            prev_salt2 = salt2;
+        }
+    }
+
+    /// The real bug fix: with no active readers, every `Passive` checkpoint
+    /// fully backfills the WAL, so `frame_cache`/`pages_in_frames` must be
+    /// reclaimed after *every single cycle* -- i.e. bounded at (in fact,
+    /// exactly) zero -- rather than growing linearly with the number of
+    /// write+checkpoint cycles that have run over the connection's lifetime.
+    #[test]
+    fn passive_checkpoint_reclaims_frame_cache_with_no_active_readers() {
+        let db = TestDb::new(TEST_PAGE_SIZE);
+        let p1 = db.connect(TEST_PAGE_SIZE);
+
+        const CYCLES: usize = 300;
+        for i in 0..CYCLES {
+            with_write_txn(&p1, |pager| {
+                let _ = allocate_marked_page(pager, (i % 256) as u8);
+            });
+            checkpoint(&p1, CheckpointMode::Passive);
+
+            let (frame_cache_len, pages_len) = {
+                let shared = db.shared();
+                (
+                    shared.frame_cache.lock().len(),
+                    shared.pages_in_frames.lock().len(),
+                )
+            };
+            assert_eq!(
+                frame_cache_len, 0,
+                "frame_cache must be empty after cycle {i} (no active readers pinned an old snapshot)"
+            );
+            assert_eq!(
+                pages_len, 0,
+                "pages_in_frames must be empty after cycle {i} (no active readers pinned an old snapshot)"
+            );
+        }
+    }
+
+    /// The safety property the bounded-growth fix depends on: a reader
+    /// pinned to an old snapshot must keep seeing correct content across many
+    /// intervening write+Passive-checkpoint cycles (which trim frame_cache
+    /// down to that reader's own safe boundary), and once the reader
+    /// releases its snapshot, the next checkpoint must reclaim everything --
+    /// proving growth was bounded by the reader's lifetime, not unbounded.
+    #[test]
+    fn concurrent_reader_snapshot_survives_checkpoints_and_frame_cache_is_reclaimed_after_release()
+    {
+        let db = TestDb::new(TEST_PAGE_SIZE);
+        let p1 = db.connect(TEST_PAGE_SIZE);
+
+        let mut hot_page_id = 0usize;
+        with_write_txn(&p1, |pager| {
+            hot_page_id = allocate_marked_page(pager, 0xAA);
+        });
+
+        // A second connection begins a read transaction now, pinning its
+        // snapshot to include the write above but nothing that follows.
+        let p2 = db.connect(TEST_PAGE_SIZE);
+        assert!(matches!(
+            p2.begin_read_tx().expect("begin_read_tx"),
+            LimboResult::Ok
+        ));
+
+        const CYCLES: usize = 150;
+        for i in 0..CYCLES {
+            with_write_txn(&p1, |pager| {
+                rewrite_marked_page(pager, hot_page_id, (i % 256) as u8);
+            });
+            checkpoint(&p1, CheckpointMode::Passive);
+        }
+
+        // p2 is still pinned to the old snapshot: it must still see the
+        // ORIGINAL marker, not any of the CYCLES subsequent rewrites, even
+        // though many Passive checkpoints ran while it was active and
+        // trimmed frame_cache down to the safe boundary in the meantime.
+        assert_eq!(
+            read_marker(&p2, hot_page_id),
+            0xAA,
+            "a reader pinned to an old snapshot must be unaffected by later writes/checkpoints"
+        );
+
+        // Release the reader and checkpoint once more: nothing pins an old
+        // snapshot anymore, so this checkpoint must fully reclaim
+        // frame_cache/pages_in_frames.
+        p2.end_read_tx().expect("end_read_tx");
+        checkpoint(&p1, CheckpointMode::Passive);
+
+        let (frame_cache_len, pages_len) = {
+            let shared = db.shared();
+            (
+                shared.frame_cache.lock().len(),
+                shared.pages_in_frames.lock().len(),
+            )
+        };
+        assert_eq!(
+            frame_cache_len, 0,
+            "frame_cache must be reclaimed once the blocking reader is gone"
+        );
+        assert_eq!(
+            pages_len, 0,
+            "pages_in_frames must be reclaimed once the blocking reader is gone"
+        );
+    }
+
+    /// Stress-tests the multi-reader `max_safe_frame` computation in
+    /// `CheckpointState::Start` (the ":741" logic): three readers pinned at
+    /// three different snapshots must each keep seeing exactly the content
+    /// that was current when they began, independent of each other and of
+    /// the many write+checkpoint cycles that run after all three are active.
+    #[test]
+    fn multiple_readers_at_different_snapshots_each_see_correct_content() {
+        let db = TestDb::new(TEST_PAGE_SIZE);
+        let p1 = db.connect(TEST_PAGE_SIZE);
+
+        let mut hot_page_id = 0usize;
+        with_write_txn(&p1, |pager| {
+            hot_page_id = allocate_marked_page(pager, 0);
+        });
+
+        // Reader A pins the snapshot right after the initial write (marker 0).
+        let reader_a = db.connect(TEST_PAGE_SIZE);
+        assert!(matches!(
+            reader_a.begin_read_tx().expect("begin_read_tx"),
+            LimboResult::Ok
+        ));
+
+        with_write_txn(&p1, |pager| {
+            rewrite_marked_page(pager, hot_page_id, 1);
+        });
+        checkpoint(&p1, CheckpointMode::Passive);
+
+        // Reader B pins the snapshot after marker 1 was written+checkpointed.
+        let reader_b = db.connect(TEST_PAGE_SIZE);
+        assert!(matches!(
+            reader_b.begin_read_tx().expect("begin_read_tx"),
+            LimboResult::Ok
+        ));
+
+        with_write_txn(&p1, |pager| {
+            rewrite_marked_page(pager, hot_page_id, 2);
+        });
+        checkpoint(&p1, CheckpointMode::Passive);
+
+        // Reader C pins the snapshot after marker 2.
+        let reader_c = db.connect(TEST_PAGE_SIZE);
+        assert!(matches!(
+            reader_c.begin_read_tx().expect("begin_read_tx"),
+            LimboResult::Ok
+        ));
+
+        // Churn through many more writes + Passive checkpoints while all
+        // three readers stay pinned to their own snapshots.
+        const CYCLES: usize = 100;
+        for i in 0..CYCLES {
+            with_write_txn(&p1, |pager| {
+                rewrite_marked_page(pager, hot_page_id, (3 + i % 250) as u8);
+            });
+            checkpoint(&p1, CheckpointMode::Passive);
+        }
+
+        // Each reader must still see EXACTLY the marker that was current
+        // when it began its read transaction, regardless of everything that
+        // happened afterwards (and the trimming those checkpoints performed).
+        assert_eq!(read_marker(&reader_a, hot_page_id), 0, "reader_a snapshot");
+        assert_eq!(read_marker(&reader_b, hot_page_id), 1, "reader_b snapshot");
+        assert_eq!(read_marker(&reader_c, hot_page_id), 2, "reader_c snapshot");
+
+        // Release all readers and checkpoint once more: memory must be
+        // reclaimed now that nothing pins an old snapshot.
+        reader_a.end_read_tx().expect("end_read_tx");
+        reader_b.end_read_tx().expect("end_read_tx");
+        reader_c.end_read_tx().expect("end_read_tx");
+        checkpoint(&p1, CheckpointMode::Passive);
+
+        let (frame_cache_len, pages_len) = {
+            let shared = db.shared();
+            (
+                shared.frame_cache.lock().len(),
+                shared.pages_in_frames.lock().len(),
+            )
+        };
+        assert_eq!(
+            frame_cache_len, 0,
+            "frame_cache must be reclaimed once all readers are gone"
+        );
+        assert_eq!(
+            pages_len, 0,
+            "pages_in_frames must be reclaimed once all readers are gone"
+        );
     }
 }

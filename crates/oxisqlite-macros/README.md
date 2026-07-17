@@ -15,7 +15,13 @@ built on:
   engine.
 
 - **Role:** proc-macros for the oxisqlite extension API.
-- **Approx LOC:** ~900.
+- **Version:** 0.3.3 (2026-07-17).
+- **Tests:** 0 dedicated `nextest` unit tests in this crate; validated
+  indirectly through `oxisqlite-core`'s integration test suite (which depends
+  on `oxisqlite-ext`, which in turn depends on this crate). 3 doctests are
+  marked `ignore` — proc-macro crates typically cannot doctest their own
+  macros directly (verified 2026-07-17).
+- **Approx LOC:** ~908 (tokei `src/`).
 - **Pure Rust / no C:** 100% Rust. No C allocator, no C parser generator, no
   `cc` / `build.rs`.
 - **Internal:** private member of the OxiSQL workspace; not published separately.

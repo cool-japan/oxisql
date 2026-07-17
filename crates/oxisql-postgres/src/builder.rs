@@ -47,7 +47,7 @@ impl TlsMode {
     ///
     /// Returns [`PgError::Tls`] if the `rustls` `ClientConfig` cannot be built.
     pub fn skip_verify() -> Result<Self, PgError> {
-        let provider = Arc::new(rustls_rustcrypto::provider());
+        let provider = oxitls::pure_provider();
         let verifier = Arc::new(NoCertVerifier);
         let cfg = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
@@ -88,7 +88,7 @@ impl TlsMode {
                 .map_err(|e| PgError::Tls(format!("bad CA cert: {e}")))?;
         }
 
-        let provider = Arc::new(rustls_rustcrypto::provider());
+        let provider = oxitls::pure_provider();
         let cfg = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .map_err(|e| PgError::Tls(e.to_string()))?
@@ -139,7 +139,7 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        Arc::new(rustls_rustcrypto::provider())
+        oxitls::pure_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }

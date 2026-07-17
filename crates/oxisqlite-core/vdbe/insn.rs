@@ -1141,7 +1141,11 @@ impl Insn {
     }
 }
 
-// TODO: Add remaining cookies.
+// All 8 standard SQLite database-header cookies are declared below.
+// `ReadCookie` (`op_read_cookie`) handles every variant. `SetCookie`
+// (`op_set_cookie`) still only implements a subset (SchemaVersion,
+// LargestRootPageNumber, IncrementalVacuum, ApplicationId, UserVersion) and
+// returns a runtime error, rather than panicking, for the rest.
 #[derive(Description, Debug, Clone, Copy)]
 pub enum Cookie {
     /// The schema cookie.

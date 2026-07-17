@@ -235,7 +235,7 @@ fn test_rollback() {
         .unwrap()
         .unwrap();
     assert_eq!(row3, row4);
-    db.rollback_tx(tx1);
+    db.rollback_tx(tx1).unwrap();
     let tx2 = db.begin_tx();
     let row5 = db
         .read(
@@ -517,6 +517,103 @@ fn test_lost_update() {
         .unwrap()
         .unwrap();
     assert_eq!(tx2_row, row);
+}
+
+// Regression tests for `commit_tx`'s persist-before-visible/persist-before-remove
+// durability ordering: a `LogRecord` must be durably persisted *before* a
+// transaction's writes are made visible to others or it is removed from
+// `self.txs`, so that a persist failure (standing in for a crash) never leaves a
+// transaction reported committed, visible, or forgotten.
+#[test]
+fn test_commit_tx_persist_failure_is_not_committed() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let clock = LocalClock::new();
+    let should_fail = Arc::new(AtomicBool::new(true));
+    let storage = crate::mvcc::persistent_storage::Storage::new_flaky(should_fail.clone());
+    let db = MvStore::new(clock, storage);
+
+    let tx1 = db.begin_tx();
+    let row = Row {
+        id: RowID {
+            table_id: 1,
+            row_id: 1,
+        },
+        data: "Hello".to_string().into_bytes(),
+    };
+    db.insert(tx1, row.clone()).unwrap();
+
+    // Persisting the LogRecord fails (simulating a crash between "became visible
+    // in-memory" and "persisted"): commit_tx must surface the error...
+    let err = db.commit_tx(tx1).unwrap_err();
+    assert_eq!(
+        err,
+        DatabaseError::Io("injected log_tx failure".to_string())
+    );
+
+    // ...must NOT have removed tx1 from tracking...
+    assert!(
+        db.txs.contains_key(&tx1),
+        "tx1 must still be tracked after a failed persist"
+    );
+
+    // ...must NOT have made tx1's write visible to a concurrent transaction...
+    let tx2 = db.begin_tx();
+    assert_eq!(db.read(tx2, row.id).unwrap(), None);
+
+    // ...and tx1 itself must still be usable (not poisoned by the failed attempt):
+    // it can still see its own write, and can still be explicitly rolled back or
+    // have `commit_tx` retried.
+    assert_eq!(db.read(tx1, row.id).unwrap(), Some(row.clone()));
+
+    // Once persistence starts succeeding, retrying commit_tx on the very same
+    // transaction goes through cleanly...
+    should_fail.store(false, Ordering::SeqCst);
+    db.commit_tx(tx1).unwrap();
+
+    // ...tx1 is now gone from tracking...
+    assert!(
+        !db.txs.contains_key(&tx1),
+        "tx1 must be removed after a successful commit"
+    );
+
+    // ...and its write is now visible to everyone.
+    let tx3 = db.begin_tx();
+    assert_eq!(db.read(tx3, row.id).unwrap(), Some(row));
+}
+
+#[test]
+fn test_commit_tx_persist_failure_can_be_rolled_back() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let clock = LocalClock::new();
+    let should_fail = Arc::new(AtomicBool::new(true));
+    let storage = crate::mvcc::persistent_storage::Storage::new_flaky(should_fail);
+    let db = MvStore::new(clock, storage);
+
+    let tx1 = db.begin_tx();
+    let row = Row {
+        id: RowID {
+            table_id: 1,
+            row_id: 1,
+        },
+        data: "Hello".to_string().into_bytes(),
+    };
+    db.insert(tx1, row.clone()).unwrap();
+    assert!(db.commit_tx(tx1).is_err());
+
+    // A failed persist must leave the transaction in a state where an explicit
+    // rollback still works cleanly (i.e. `commit_tx` reverted it to `Active`
+    // rather than leaving it stuck in `Preparing`, which would fail the
+    // `assert_eq!(tx.state, TransactionState::Active)` inside `rollback_tx`).
+    db.rollback_tx(tx1).unwrap();
+    assert!(!db.txs.contains_key(&tx1));
+
+    // The insert never became durable or visible, so nothing comes back.
+    let tx2 = db.begin_tx();
+    assert_eq!(db.read(tx2, row.id).unwrap(), None);
 }
 
 // Test for the visibility to check if a new transaction can see old committed values.

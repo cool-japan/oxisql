@@ -24,7 +24,7 @@ futures.workspace = true
 tokio.workspace = true
 mysql_async.workspace = true
 rustls.workspace = true
-rustls-rustcrypto.workspace = true
+oxitls.workspace = true
 chrono.workspace = true
 
 [dev-dependencies]

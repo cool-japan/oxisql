@@ -97,12 +97,15 @@ pub type YYCODETYPE = u16; // unsigned
 const YYNOCODE: YYCODETYPE = 294;
 type YYACTIONTYPE = u16; // unsigned
 const YYWILDCARD: YYCODETYPE = 102;
+// `Token` no longer borrows from the input (its lexeme is `Cow<'static, str>`),
+// so neither this alias nor `YYMINORTYPE`/`yyStackEntry` (whose only lifetime
+// dependency was this alias) need a lifetime parameter anymore.
 #[expect(non_camel_case_types)]
-type sqlite3ParserTOKENTYPE<'i> = Token<'i>;
+type sqlite3ParserTOKENTYPE = Token;
 #[expect(non_camel_case_types)]
-enum YYMINORTYPE<'i> {
+enum YYMINORTYPE {
     yyinit(),
-    yy0(sqlite3ParserTOKENTYPE<'i>),
+    yy0(sqlite3ParserTOKENTYPE),
     yy4(Option<FrameClause>),
     yy13(Window),
     yy18(Option<DistinctNames>),
@@ -181,13 +184,13 @@ enum YYMINORTYPE<'i> {
     yy577(JoinOperator),
     yy578(Option<JoinConstraint>),
 }
-impl<'i> Default for YYMINORTYPE<'i> {
-    fn default() -> YYMINORTYPE<'i> {
+impl Default for YYMINORTYPE {
+    fn default() -> YYMINORTYPE {
         YYMINORTYPE::yyinit()
     }
 }
-impl<'i> yyStackEntry<'i> {
-    fn yy0(self) -> sqlite3ParserTOKENTYPE<'i> {
+impl yyStackEntry {
+    fn yy0(self) -> sqlite3ParserTOKENTYPE {
         if let YYMINORTYPE::yy0(v) = self.minor {
             v
         } else {
@@ -2257,11 +2260,11 @@ static yyFallback: [YYCODETYPE; 168] = [
 */
 #[expect(non_camel_case_types)]
 #[derive(Default)]
-pub struct yyStackEntry<'i> {
+pub struct yyStackEntry {
     stateno: YYACTIONTYPE, /* The state-number, or reduce action in SHIFTREDUCE */
     major: YYCODETYPE,     /* The major token value.  This is the code
                             ** number for the token at this stack level */
-    minor: YYMINORTYPE<'i>, /* The user-supplied minor token value.  This
+    minor: YYMINORTYPE, /* The user-supplied minor token value.  This
                          ** is the value of the token  */
 }
 
@@ -2275,7 +2278,7 @@ pub struct yyParser<'input> {
     //#[cfg(not(feature = "YYNOERRORRECOVERY"))]
     yyerrcnt: i32, /* Shifts left before out of the error */
     pub ctx: Context<'input>,
-    yystack: Vec<yyStackEntry<'input>>, /* The parser's stack */
+    yystack: Vec<yyStackEntry>, /* The parser's stack */
 }
 
 use std::cmp::Ordering;
@@ -2298,13 +2301,13 @@ impl<'input> yyParser<'input> {
         }
     }
 
-    fn yy_move(&mut self, shift: i8) -> yyStackEntry<'input> {
+    fn yy_move(&mut self, shift: i8) -> yyStackEntry {
         use std::mem::take;
         let idx = self.shift(shift);
         take(&mut self.yystack[idx])
     }
 
-    fn push(&mut self, entry: yyStackEntry<'input>) {
+    fn push(&mut self, entry: yyStackEntry) {
         if self.yyidx == self.yystack.len() {
             self.yystack.push(entry);
         } else {
@@ -2315,15 +2318,15 @@ impl<'input> yyParser<'input> {
 
 use std::ops::{Index, IndexMut};
 impl<'input> Index<i8> for yyParser<'input> {
-    type Output = yyStackEntry<'input>;
+    type Output = yyStackEntry;
 
-    fn index(&self, shift: i8) -> &yyStackEntry<'input> {
+    fn index(&self, shift: i8) -> &yyStackEntry {
         let idx = self.shift(shift);
         &self.yystack[idx]
     }
 }
 impl<'input> IndexMut<i8> for yyParser<'input> {
-    fn index_mut(&mut self, shift: i8) -> &mut yyStackEntry<'input> {
+    fn index_mut(&mut self, shift: i8) -> &mut yyStackEntry {
         let idx = self.shift(shift);
         &mut self.yystack[idx]
     }
@@ -3311,7 +3314,7 @@ impl<'input> yyParser<'input> {
         &mut self,
         mut yyNewState: YYACTIONTYPE,    /* The new state to shift in */
         yyMajor: YYCODETYPE,             /* The major token to shift in */
-        yyMinor: sqlite3ParserTOKENTYPE<'input>, /* The minor token to shift in */
+        yyMinor: sqlite3ParserTOKENTYPE, /* The minor token to shift in */
     ) {
         self.yyidx_shift(1);
         self.yyhwm_incr();
@@ -4173,7 +4176,7 @@ impl yyParser<'_> {
         let _ = yy_look_ahead;
         let _ = yy_lookahead_token;
 
-        let yylhsminor: YYMINORTYPE<'_>;
+        let yylhsminor: YYMINORTYPE;
         match yyruleno {
   /* Beginning here are the reduction cases.  A typical example
   ** follows:
@@ -5983,7 +5986,7 @@ impl yyParser<'_> {
      => {
 //line 1278 "src/parser/parse.y"
 {
-  self.ctx.stmt = Some(Stmt::Attach{ expr: Box::new(self.yy_move(-3).yy480()), db_name: Box::new(self.yy_move(-1).yy480()), key: self.yy_move(0).yy479().map(Box::new) });
+  self.ctx.stmt = Some(Stmt::Attach{ expr: Box::new(self.yy_move(-3).yy480()), db_name: Box::new(self.yy_move(-1).yy480()), key: self.yy_move(0).yy479().map(Box::new), database_kw: self.yy_move(-4).yy173() });
 }
         }
       314 /* cmd ::= DETACH database_kw_opt expr */
@@ -6352,6 +6355,16 @@ impl yyParser<'_> {
 //line 1491 "src/parser/parse.y"
 { self[-4] .minor= YYMINORTYPE::yy480( self.yy_move(-1).yy480()); }
         }
+      395 /* database_kw_opt ::= DATABASE */
+     => {
+//line 1290 "src/parser/parse.y"
+{self[0] .minor= YYMINORTYPE::yy173( true);}
+        }
+      396 /* database_kw_opt ::= */
+     => {
+//line 1291 "src/parser/parse.y"
+{self[1] .minor= YYMINORTYPE::yy173( false);}
+        }
       _ => {
       /* (376) input ::= cmdlist * debug_assert_eq!(yyruleno, 376); */
       /* (377) cmdlist ::= cmdlist ecmd * debug_assert_eq!(yyruleno, 377); */
@@ -6372,8 +6385,6 @@ impl yyParser<'_> {
       /* (392) nmnum ::= plus_num (OPTIMIZED OUT) */ debug_assert_ne!(yyruleno, 392);
       /* (393) trnm ::= nm * debug_assert_eq!(yyruleno, 393); */
       /* (394) tridxby ::= * debug_assert_eq!(yyruleno, 394); */
-      /* (395) database_kw_opt ::= DATABASE * debug_assert_eq!(yyruleno, 395); */
-      /* (396) database_kw_opt ::= * debug_assert_eq!(yyruleno, 396); */
       /* (397) kwcolumn_opt ::= * debug_assert_eq!(yyruleno, 397); */
       /* (398) kwcolumn_opt ::= COLUMNKW * debug_assert_eq!(yyruleno, 398); */
       /* (399) vtabarglist ::= vtabarg * debug_assert_eq!(yyruleno, 399); */
@@ -6446,7 +6457,7 @@ impl yyParser<'_> {
     self.ctx.error = Some(ParserError::UnexpectedEof);
   } else {
     trace!(target: TARGET, "near \"{:?}\": syntax error", yyminor);
-    self.ctx.error = Some(ParserError::SyntaxError(from_bytes(yyminor.1)));
+    self.ctx.error = Some(ParserError::SyntaxError(from_bytes(yyminor.1.as_bytes())));
   }
         /************ End %syntax_error code ******************************************/
     }
@@ -6496,7 +6507,7 @@ impl<'input> yyParser<'input> {
     pub fn sqlite3Parser(
         &mut self,
         yymajor: TokenType,                  /* The major token code number */
-        yyminor: sqlite3ParserTOKENTYPE<'input>, /* The value for the token */
+        yyminor: sqlite3ParserTOKENTYPE, /* The value for the token */
     ) -> Result<(), sqlite3ParserError> {
         let mut yymajor = yymajor as YYCODETYPE;
         //#[cfg(all(not(feature = "YYERRORSYMBOL"), not(feature = "YYNOERRORRECOVERY")))]
@@ -6631,7 +6642,11 @@ impl<'input> yyParser<'input> {
                             }
                             yymajor = YYNOCODE;
                         } else if yymx != YYERRORSYMBOL {
-                            self.yy_shift(yyact, YYERRORSYMBOL, yyminor);
+                            // `Token` is no longer `Copy` (its lexeme is a `Cow`), and this
+                            // error-recovery path may loop back around to another use of
+                            // `yyminor` (e.g. another `yy_syntax_error(yymajor, &yyminor)`
+                            // call), so it must be cloned rather than moved here.
+                            self.yy_shift(yyact, YYERRORSYMBOL, yyminor.clone());
                         }
                     }
                     self.yyerrcnt = 3;

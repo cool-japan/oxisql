@@ -19,12 +19,58 @@ use limbo_sqlite3_parser::ast::TableInternalId;
 
 use super::{emitter::OperationMode, planner::determine_where_to_eval_term};
 
+/// Bitmask over indices into `SelectPlan::aggregates` (or the working
+/// `aggs: &mut Vec<Aggregate>` accumulator during planning, in
+/// `planner::resolve_aggregates`): bit `i` set means the owning
+/// [`ResultSetColumn`]'s expression references `aggregates[i]`. An empty
+/// mask means the column contains no aggregate.
+///
+/// This replaces a plain `bool` so that codegen can identify exactly *which*
+/// aggregate(s) a result column references, instead of merely whether it
+/// references any. `plan.aggregates` is append-only once planning begins
+/// (result columns are planned first; the only later mutation is
+/// `select.rs`'s ORDER BY pass, which may *append* more aggregates but never
+/// reorders or removes existing ones), so a bit recorded while planning a
+/// result column stays valid for the lifetime of the plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AggregateMask(u64);
+
+impl AggregateMask {
+    /// No aggregates referenced.
+    pub const EMPTY: Self = Self(0);
+
+    /// A mask with only the bit for `aggregates[index]` set.
+    ///
+    /// `index` is clamped to the mask's bit width: a pathologically wide
+    /// result column (more than 64 distinct aggregate references) saturates
+    /// to "some aggregate is referenced" rather than panicking or silently
+    /// dropping the reference, which preserves correctness for every
+    /// existing (boolean) consumer of this type.
+    pub fn from_index(index: usize) -> Self {
+        match u32::try_from(index) {
+            Ok(bit) if bit < u64::BITS => Self(1u64 << bit),
+            _ => Self(u64::MAX),
+        }
+    }
+
+    /// Whether this mask references no aggregates at all.
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Combine two masks, keeping every bit set in either.
+    pub fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResultSetColumn {
     pub expr: ast::Expr,
     pub alias: Option<String>,
-    // TODO: encode which aggregates (e.g. index bitmask of plan.aggregates) are present in this column
-    pub contains_aggregates: bool,
+    /// Which aggregate(s) in the owning plan's `aggregates` vector (if any)
+    /// this column's expression references. See [`AggregateMask`].
+    pub contains_aggregates: AggregateMask,
 }
 
 impl ResultSetColumn {
@@ -324,6 +370,29 @@ pub enum QueryDestination {
         /// The index that will be used to store the results.
         index: Arc<Index>,
     },
+    /// The results of the query are materialized into a shared `Sorter` cursor instead of being
+    /// yielded/emitted directly. Used only for a compound SELECT (`UNION`/`UNION ALL`/
+    /// `INTERSECT`/`EXCEPT` chain) that has an `ORDER BY`: since the sort applies to the *entire*
+    /// combined result rather than to any single arm, every arm's (post set-operation) rows are
+    /// routed here first, and a single sort + LIMIT/OFFSET pass runs once over the combined,
+    /// materialized rows afterwards. See `translate::compound_select`.
+    Sorter {
+        /// The cursor ID of the `Sorter` (see [`CursorType::Sorter`]) that rows are inserted into.
+        cursor_id: CursorID,
+        /// The register `Insn::SorterData` reads a sorted row's packed record into on read-back,
+        /// and (via `MakeRecord`) that `Insn::SorterInsert` reads the packed record to insert
+        /// from -- see `order_by::sorter_insert`, which this destination reuses verbatim.
+        reg_sorter_data: usize,
+        /// 0-based ordinal positions (into the producing [`SelectPlan::result_columns`]) of the
+        /// compound SELECT's `ORDER BY` sort keys, in `ORDER BY` clause order. Every arm of a
+        /// compound SELECT has the same number of result columns in the same positions (checked
+        /// in `select::prepare_select_plan`), so this list is shared verbatim across every arm:
+        /// whichever arm is currently producing a row copies its own values at these positions
+        /// out as the sort key (see `result_row::emit_result_row_and_limit`'s `Sorter` branch and
+        /// `compound_select::emit_forward_row`'s `Sorter` branch, the two places a row actually
+        /// reaches this destination).
+        sort_key_ordinals: Rc<Vec<usize>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,6 +514,17 @@ pub struct SelectPlan {
     pub distinctness: Distinctness,
     /// values: https://sqlite.org/syntax/select-core.html
     pub values: Vec<Vec<Expr>>,
+    /// The original `WITH ...` clause AST, if this `SELECT` had one, retained
+    /// purely for debug-printing fidelity (`ToSqlString` / `tracing::debug!`
+    /// / `EXPLAIN QUERY PLAN`, see `translate::display`). By the time this
+    /// plan is built, `translate::planner::parse_from` has already desugared
+    /// every CTE into an ordinary `Table::FromClauseSubquery` wherever it's
+    /// referenced, so without this the pretty-printer can't tell a
+    /// `WITH x AS (...) SELECT ... FROM x` apart from a hand-written
+    /// `SELECT ... FROM (...) AS x` — both produce an identical desugared
+    /// `table_references` shape. Not consulted anywhere in real query
+    /// execution.
+    pub with: Option<ast::With>,
 }
 
 impl SelectPlan {
@@ -466,7 +546,7 @@ impl SelectPlan {
         self.result_columns
             .iter()
             .filter(|c| {
-                !c.contains_aggregates
+                c.contains_aggregates.is_empty()
                     && !self.group_by.as_ref().map_or(false, |group_by| {
                         group_by
                             .exprs
@@ -576,7 +656,7 @@ pub struct UpdatePlan {
     pub limit_expr: Option<Box<ast::Expr>>,
     /// runtime offset expression (when OFFSET is a parameter or expression, not a literal)
     pub offset_expr: Option<Box<ast::Expr>>,
-    // TODO: optional RETURNING clause
+    /// Optional `RETURNING` clause result columns.
     pub returning: Option<Vec<ResultSetColumn>>,
     // whether the WHERE clause is always false
     pub contains_constant_false_condition: bool,
@@ -623,7 +703,7 @@ pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn
                         column: i,
                         is_rowid_alias: col.is_rowid_alias,
                     },
-                    contains_aggregates: false,
+                    contains_aggregates: AggregateMask::EMPTY,
                 }),
         );
     }
@@ -951,28 +1031,75 @@ impl JoinedTable {
         }
     }
 
+    /// The `(type, type_str)` of a subquery result column when it is a direct
+    /// column reference, so a derived table / view inherits the underlying
+    /// column's affinity. Returns `None` for any non-column expression.
+    fn source_column_type_for(
+        expr: &ast::Expr,
+        name_source: &SelectPlan,
+    ) -> Option<(Type, String)> {
+        if let ast::Expr::Column { table, column, .. } = expr {
+            let table_ref = name_source
+                .table_references
+                .find_table_by_internal_id(*table)?;
+            let col = table_ref.get_column_at(*column)?;
+            return Some((col.ty, col.ty_str.clone()));
+        }
+        None
+    }
+
     /// Creates a new TableReference for a subquery.
+    ///
+    /// `plan` may be a plain [`Plan::Select`] or a [`Plan::CompoundSelect`] (for
+    /// a `UNION [ALL]`/`INTERSECT`/`EXCEPT` body). Output column names follow the
+    /// left-most SELECT arm, matching SQLite's compound-SELECT naming rule.
     pub fn new_subquery(
         identifier: String,
-        plan: SelectPlan,
+        plan: Plan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
     ) -> Self {
-        let columns = plan
-            .result_columns
-            .iter()
-            .map(|rc| Column {
-                name: rc.name(&plan.table_references).map(String::from),
-                ty: Type::Blob, // FIXME: infer proper type
-                ty_str: "BLOB".to_string(),
-                is_rowid_alias: false,
-                primary_key: false,
-                notnull: false,
-                default: None,
-                unique: false,
-                collation: None, // FIXME: infer collation from subquery
+        // The SELECT arm whose result-column names/count describe the subquery's
+        // output: the plan itself for a plain SELECT, else the left-most arm of a
+        // compound SELECT. A FROM-clause subquery body is never DELETE/UPDATE.
+        let name_source: Option<&SelectPlan> = match &plan {
+            Plan::Select(select) => Some(select),
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => Some(left.first().map(|(p, _)| p).unwrap_or(right_most)),
+            Plan::Delete(_) | Plan::Update(_) => None,
+        };
+        let columns = name_source
+            .map(|name_source| {
+                name_source
+                    .result_columns
+                    .iter()
+                    .map(|rc| {
+                        // Propagate the underlying column's type (hence affinity)
+                        // when a result column is a direct column reference -- so
+                        // e.g. `WHERE code = '1074'` against a view still applies
+                        // numeric affinity exactly as it would against the base
+                        // table. Non-column expressions keep the conservative
+                        // BLOB/NONE default (no affinity coercion).
+                        let (ty, ty_str) = Self::source_column_type_for(&rc.expr, name_source)
+                            .unwrap_or((Type::Blob, "BLOB".to_string()));
+                        Column {
+                            name: rc.name(&name_source.table_references).map(String::from),
+                            ty,
+                            ty_str,
+                            is_rowid_alias: false,
+                            primary_key: false,
+                            notnull: false,
+                            default: None,
+                            unique: false,
+                            unique_conflict: ast::ResolveType::Abort,
+                            collation: None, // FIXME: infer collation from subquery
+                            is_generated: false,
+                        }
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
         let table = Table::FromClauseSubquery(FromClauseSubquery {
             name: identifier.clone(),
@@ -1062,6 +1189,9 @@ impl JoinedTable {
             }
             Table::Pseudo(_) => Ok((None, None)),
             Table::FromClauseSubquery(..) => Ok((None, None)),
+            // A view is always expanded into a `FromClauseSubquery` before this
+            // point; it never owns a cursor of its own.
+            Table::View(_) => Ok((None, None)),
         }
     }
 

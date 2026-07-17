@@ -1,6 +1,9 @@
 //! Check for additional syntax error
+use crate::ast::fmt::ToTokens;
+use crate::ast::macros::TableOptions;
 use crate::ast::*;
 use crate::custom_err;
+use crate::parser::ParserError;
 use std::fmt::{Display, Formatter};
 
 impl Cmd {

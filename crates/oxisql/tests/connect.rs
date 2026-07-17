@@ -1061,3 +1061,110 @@ fn backend_info_sqlite_compat_has_version() {
         "sqlite-compat version string must not be empty"
     );
 }
+
+// ── connect() network timeout tests (no more indefinite hangs) ──────────────
+//
+// Regression coverage for the bug where `oxisql::connect()` had no
+// connection timeout at all: `postgres://.../@192.0.2.1:5432/...` used to
+// hang for the full duration of a `timeout(1)`-wrapped test run (bounded
+// only by the OS TCP stack, often 60-130+ seconds in the real world) with
+// zero output. See `oxisql::DEFAULT_CONNECT_TIMEOUT` and
+// `oxisql_postgres::PgConnection::connect_with_timeout`.
+
+/// `oxisql::connect_with_options` must bound a PostgreSQL connection attempt
+/// by `connect_timeout_ms` rather than hanging for however long the OS TCP
+/// stack takes to give up on an unroutable host.
+///
+/// `192.0.2.1` is TEST-NET-1 (RFC 5737): reserved for documentation and
+/// guaranteed never to be routed on the public internet, so a real
+/// connection attempt against it either hangs (most sandboxed/containerised
+/// environments silently drop the packets — confirmed empirically for this
+/// workspace's CI sandbox) or fails fast (some network policies actively
+/// reject it outbound). This test accepts either outcome as long as it is
+/// an `Err` within the bounded wall-clock window, so it cannot be flaky
+/// across different network environments while still proving the property
+/// that matters: `connect` no longer hangs indefinitely. The 2-second
+/// override (well under `DEFAULT_CONNECT_TIMEOUT`'s 10s) keeps the test
+/// itself fast while still exercising the real timeout-firing code path
+/// end-to-end through the facade.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn connect_to_unroutable_host_does_not_hang() {
+    let opts = oxisql::ConnectOptions::new().timeout_ms(2_000);
+    let start = std::time::Instant::now();
+    let result = oxisql::connect_with_options(
+        "postgres://baduser:badpass@192.0.2.1:5432/nonexistent",
+        opts,
+    )
+    .await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_err(),
+        "connecting to an unroutable host must fail, not hang or succeed; took {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "connect must respect the 2s timeout override rather than hang; took {elapsed:?}"
+    );
+}
+
+/// `ConnectOptions::from_uri`'s existing `connect_timeout=<secs>` query
+/// parameter (already covered for parsing alone by `query_string_multi_param`
+/// above) is honoured end-to-end by `connect_with_options` — not just parsed
+/// and discarded.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn connect_timeout_query_param_is_honoured_end_to_end() {
+    let uri = "postgres://baduser:badpass@192.0.2.1:5432/nonexistent?connect_timeout=2";
+    let opts = oxisql::ConnectOptions::from_uri(uri);
+    assert_eq!(opts.connect_timeout_ms, Some(2_000));
+
+    let start = std::time::Instant::now();
+    let result = oxisql::connect_with_options(uri, opts).await;
+    let elapsed = start.elapsed();
+
+    assert!(result.is_err(), "must fail against an unroutable host");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "must respect the query-string timeout override; took {elapsed:?}"
+    );
+}
+
+/// `oxisql::DEFAULT_CONNECT_TIMEOUT` is 10 seconds — see its doc comment for
+/// why this deliberately differs from `oxisql_pool::PoolConfig`'s more
+/// generous 30-second default. This only asserts the constant's value (so
+/// CI never waits out the real 10s); the timeout actually firing is covered
+/// by `connect_to_unroutable_host_does_not_hang` above (via a short
+/// override) and by `oxisql-postgres`'s own `connect_with_timeout` tests.
+#[test]
+fn default_connect_timeout_is_ten_seconds() {
+    assert_eq!(
+        oxisql::DEFAULT_CONNECT_TIMEOUT,
+        std::time::Duration::from_secs(10)
+    );
+}
+
+/// The clean, typed-error requirement for a connection timeout: a
+/// `PgError::Timeout` must map to `OxiSqlError::Timeout` (not a generic
+/// `Other`/execution dump), with a message that clearly says "timeout" so
+/// REPL users get useful feedback instead of an opaque failure. This is a
+/// pure, deterministic check of the error-mapping logic `oxisql::connect`
+/// and `connect_with_options` rely on for their PostgreSQL branch — it needs
+/// no network access, so unlike the black-hole-IP tests above it cannot be
+/// flaky.
+#[cfg(feature = "postgres")]
+#[test]
+fn pg_timeout_error_maps_to_clean_oxisql_timeout_variant() {
+    let pg_err =
+        oxisql::postgres::PgError::Timeout("connection timed out after 2000ms".to_string());
+    let oxi_err: oxisql::OxiSqlError = pg_err.into();
+    assert!(
+        matches!(oxi_err, oxisql::OxiSqlError::Timeout(_)),
+        "a PgError::Timeout must map to OxiSqlError::Timeout"
+    );
+    assert_eq!(
+        oxi_err.to_string(),
+        "timeout: connection timed out after 2000ms"
+    );
+}

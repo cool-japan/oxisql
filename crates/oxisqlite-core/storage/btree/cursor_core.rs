@@ -97,6 +97,9 @@ impl BTreeCursor {
             return_if_locked_maybe_load!(self.pager, page);
             let page = page.get();
             let contents = page.get().contents.as_ref().unwrap();
+            // Validate the (untrusted) page-type byte before interpreting the
+            // page; it may have been reached via a corrupt child pointer.
+            contents.validate_btree_page_type()?;
             let cell_count = contents.cell_count();
             let cell_idx = self.stack.current_cell_index();
             if self.stack.current_cell_index() == i32::MAX && !self.going_upwards {
@@ -313,8 +316,7 @@ impl BTreeCursor {
                 payload_overflow_threshold_max(contents.page_type(), usable_size as u16),
                 payload_overflow_threshold_min(contents.page_type(), usable_size as u16),
                 usable_size,
-            )
-            .unwrap();
+            )?;
         let (payload, payload_size, first_overflow_page) = match cell {
             BTreeCell::TableLeafCell(cell) => {
                 (cell._payload, cell.payload_size, cell.first_overflow_page)
@@ -333,7 +335,14 @@ impl BTreeCursor {
                 );
             }
         };
-        assert!(offset + amount <= payload_size as u32);
+        // `payload_size` comes from the (untrusted) cell header; a corrupt value
+        // smaller than the requested range would make the copy below read out of
+        // bounds. Reject it with a typed error instead of panicking.
+        if offset + amount > payload_size as u32 {
+            return Err(LimboError::Corrupt(
+                "payload read range exceeds cell payload size".into(),
+            ));
+        }
         let (local_size, _) = self
             .parse_cell_info(payload_size as usize, contents.page_type(), usable_size)?;
         let mut bytes_processed: u32 = 0;
@@ -559,10 +568,13 @@ impl BTreeCursor {
             let mem_page_rc = self.stack.top();
             return_if_locked_maybe_load!(self.pager, mem_page_rc);
             let mem_page = mem_page_rc.get();
-            let contents = mem_page.get().contents.as_ref().unwrap();
+            let contents = mem_page.get_contents();
+            // Validate the (untrusted) page-type byte before interpreting the
+            // page; it may have been reached via a corrupt child pointer.
+            contents.validate_btree_page_type()?;
             let cell_count = contents.cell_count();
             tracing::debug!(
-                id = mem_page_rc.get().get().id, cell = self.stack.current_cell_index(),
+                id = mem_page_rc.get().get_ref().id, cell = self.stack.current_cell_index(),
                 cell_count, "current_before_advance",
             );
             let is_index = mem_page_rc.get().is_index();
@@ -571,7 +583,7 @@ impl BTreeCursor {
                 && self.stack.current_cell_index() < cell_count as i32;
             if should_skip_advance {
                 tracing::debug!(
-                    going_upwards = self.going_upwards, page = mem_page_rc.get().get()
+                    going_upwards = self.going_upwards, page = mem_page_rc.get().get_ref()
                     .id, cell_idx = self.stack.current_cell_index(), "skipping advance",
                 );
                 self.going_upwards = false;
@@ -579,7 +591,7 @@ impl BTreeCursor {
             }
             self.stack.advance();
             let cell_idx = self.stack.current_cell_index() as usize;
-            tracing::debug!(id = mem_page_rc.get().get().id, cell = cell_idx, "current");
+            tracing::debug!(id = mem_page_rc.get().get_ref().id, cell = cell_idx, "current");
             if cell_idx == cell_count {
                 let has_parent = self.stack.has_parent();
                 match contents.rightmost_pointer() {
@@ -612,7 +624,11 @@ impl BTreeCursor {
                     return Ok(CursorResult::Ok(false));
                 }
             }
-            assert!(cell_idx < contents.cell_count());
+            if cell_idx >= contents.cell_count() {
+                return Err(LimboError::Corrupt(
+                    "cell index out of bounds during traversal".into(),
+                ));
+            }
             let cell = contents
                 .cell_get(
                     cell_idx,
@@ -720,6 +736,11 @@ impl BTreeCursor {
             return_if_locked_maybe_load!(self.pager, page);
             let page = page.get();
             let contents = page.get().contents.as_ref().unwrap();
+            // This page was reached by following an (untrusted) child/rightmost
+            // pointer; validate its page-type byte so a corrupt pointer to a
+            // non-b-tree page yields a Corrupt error rather than panicking in the
+            // infallible `is_leaf()`/`page_type()` below.
+            contents.validate_btree_page_type()?;
             if contents.is_leaf() {
                 self.seek_state = CursorSeekState::FoundLeaf {
                     eq_seen: Cell::new(false),
@@ -819,6 +840,9 @@ impl BTreeCursor {
             return_if_locked_maybe_load!(self.pager, page);
             let page = page.get();
             let contents = page.get().contents.as_ref().unwrap();
+            // Validate the (untrusted) page-type byte before interpreting the
+            // page: a corrupt child pointer may reference a non-b-tree page.
+            contents.validate_btree_page_type()?;
             if contents.is_leaf() {
                 let eq_seen = match &self.seek_state {
                     CursorSeekState::MovingBetweenPages { eq_seen } => eq_seen.get(),
@@ -994,7 +1018,15 @@ impl BTreeCursor {
             return_if_locked_maybe_load!(self.pager, page);
             let page = page.get();
             let contents = page.get().contents.as_ref().unwrap();
-            assert!(contents.is_leaf(), "tablebtree_seek() called on non-leaf page");
+            // The page was reached by following (untrusted) child pointers; a
+            // corrupt interior pointer could land us on a non-leaf or invalid
+            // page. Validate the page type instead of asserting.
+            contents.validate_btree_page_type()?;
+            if !contents.is_leaf() {
+                return Err(LimboError::Corrupt(
+                    "tablebtree_seek() reached a non-leaf page".into(),
+                ));
+            }
             let cell_count = contents.cell_count();
             if cell_count == 0 {
                 self.stack.set_cell_index(0);

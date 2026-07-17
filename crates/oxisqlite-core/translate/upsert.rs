@@ -129,6 +129,19 @@ pub fn emit_upsert_do_update(
                     .map_or(false, |n| n.eq_ignore_ascii_case(&col_name_norm))
             });
             match found {
+                Some((_, col)) if col.is_generated => {
+                    // Mirrors SQLite's own `update.c` wording
+                    // ("cannot UPDATE generated column \"%s\"") for a `SET`
+                    // targeting a generated column — real SQLite rejects
+                    // this identically for a plain `UPDATE` and for the
+                    // `DO UPDATE SET` clause of an upsert, and identically
+                    // for `STORED` and `VIRTUAL` generated columns. Use the
+                    // canonical schema name (not necessarily the case the
+                    // user typed) for the error, same as the NOT NULL
+                    // violation message a few lines below.
+                    let name = col.name.as_deref().unwrap_or(col_name_struct.0.as_str());
+                    crate::bail_parse_error!("cannot UPDATE generated column \"{}\"", name);
+                }
                 Some((col_idx, col)) if col.is_rowid_alias => {
                     new_rowid_expr = Some(set.expr.clone());
                     let _ = col_idx;
@@ -137,7 +150,6 @@ pub fn emit_upsert_do_update(
                     set_exprs[col_idx] = Some(set.expr.clone());
                 }
                 None => {
-                    // TODO: reject SET on generated columns once schema.Column exposes an is_generated flag
                     crate::bail_parse_error!(
                         "no such column in DO UPDATE SET: {}",
                         col_name_struct.0

@@ -50,8 +50,21 @@ pub fn emit_subqueries(
     for table_reference in tables.joined_tables_mut() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
             // Emit the subquery and get the start register of the result columns.
-            let result_columns_start =
-                emit_subquery(program, &mut from_clause_subquery.plan, t_ctx)?;
+            // A plain SELECT body is wrapped in a coroutine by `emit_subquery`; a
+            // compound (`UNION [ALL]`/`INTERSECT`/`EXCEPT`) body -- e.g. a
+            // `UNION ALL` view -- goes through `emit_compound_subquery`.
+            let result_columns_start = match from_clause_subquery.plan.as_mut() {
+                Plan::Select(select) => emit_subquery(program, select, t_ctx)?,
+                Plan::CompoundSelect { .. } => super::compound_select::emit_compound_subquery(
+                    program,
+                    from_clause_subquery.plan.as_mut(),
+                    t_ctx.resolver.schema,
+                    t_ctx.resolver.symbol_table,
+                )?,
+                Plan::Delete(_) | Plan::Update(_) => {
+                    crate::bail_parse_error!("FROM-clause subquery body must be a SELECT")
+                }
+            };
             // Set the start register of the subquery's result columns.
             // This is done so that translate_expr() can read the result columns of the subquery,
             // as if it were reading from a regular table.
@@ -103,6 +116,7 @@ pub fn emit_subquery<'a>(
         meta_group_by: None,
         meta_left_joins: (0..plan.joined_tables().len()).map(|_| None).collect(),
         meta_sort: None,
+        vtab_order_by_consumed: false,
         reg_agg_start: None,
         reg_nonagg_emit_once_flag: None,
         reg_result_cols_start: None,
@@ -351,6 +365,9 @@ pub fn emit_in_subquery(
         }],
         unique: false,
         has_rowid: false,
+        // Ephemeral: never registered in `Schema`, never consulted by DML
+        // conflict-resolution codegen.
+        on_conflict: ast::ResolveType::Abort,
     });
     let index_cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
 

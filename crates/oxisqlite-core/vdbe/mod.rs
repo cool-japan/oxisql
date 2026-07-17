@@ -168,6 +168,7 @@ macro_rules! return_if_io {
 struct RegexCache {
     like: HashMap<String, Regex>,
     glob: HashMap<String, Regex>,
+    regexp: HashMap<String, Regex>,
 }
 
 impl RegexCache {
@@ -175,6 +176,7 @@ impl RegexCache {
         Self {
             like: HashMap::new(),
             glob: HashMap::new(),
+            regexp: HashMap::new(),
         }
     }
 }
@@ -656,8 +658,17 @@ impl Row {
 
     pub fn get_values(&self) -> impl Iterator<Item = &Value> {
         let values = unsafe { std::slice::from_raw_parts(self.values, self.count) };
-        // This should be ownedvalues
-        // TODO: add check for this
+        // A row must be formed of values only (never `Register::Aggregate`/`Register::Record`).
+        // `get`/`get_value` above enforce this per-element via an inline `unreachable!()`, and
+        // `Register::get_owned_value()` (see below) enforces it one layer down for whichever
+        // element actually gets consumed from the iterator this returns. Assert it eagerly here
+        // too, for the whole row at once, so a violation is caught (in debug builds) right when
+        // the row's contents are accessed rather than only if/when a specific lazily-pulled
+        // element happens to be consumed.
+        debug_assert!(
+            values.iter().all(|v| matches!(v, Register::Value(_))),
+            "a row should be formed of values only"
+        );
         values.iter().map(|v| v.get_owned_value())
     }
 

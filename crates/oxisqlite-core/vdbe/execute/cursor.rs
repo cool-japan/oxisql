@@ -443,7 +443,12 @@ pub fn op_result_row(
         unreachable!("unexpected Insn {:?}", insn)
     };
     let row = Row {
-        values: &state.registers[*start_reg] as *const Register,
+        // SAFETY-relevant: `Row::get`/`get_value`/`get_values` index/slice up to `count`
+        // elements starting at `values`, so the pointer's provenance must cover the whole
+        // `count`-element range, not just the single `Register` at `start_reg`. Slicing here
+        // (rather than `&state.registers[*start_reg] as *const Register`) is what grants that
+        // provenance under Stacked Borrows.
+        values: state.registers[*start_reg..*start_reg + *count].as_ptr(),
         count: *count,
     };
     state.result_row = Some(row);

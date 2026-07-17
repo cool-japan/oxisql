@@ -286,7 +286,7 @@ pub use PlatformIO as SyscallIO;
 mod memory;
 #[cfg(feature = "fs")]
 mod vfs;
-pub use memory::MemoryIO;
+pub use memory::{MemoryFile, MemoryIO};
 pub mod clock;
 // `common` (file-lock env knob + cross-process lock test helpers) is only used
 // by the native `unix` / `io_uring` backends, so it is gated with them to keep

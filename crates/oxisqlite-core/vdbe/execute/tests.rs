@@ -1,6 +1,6 @@
 #![allow(unused_variables)]
 use super::numeric::{apply_numeric_affinity, execute_sqlite_version};
-use super::values::exec_char;
+use super::values::{exec_char, exec_concat_strings};
 
 #[cfg(test)]
 mod tests_2 {
@@ -406,7 +406,7 @@ mod tests_2 {
             );
         }
     }
-    use super::{exec_char, execute_sqlite_version};
+    use super::{exec_char, exec_concat_strings, execute_sqlite_version};
     use crate::vdbe::{Bitfield, Register};
     use std::collections::HashMap;
     #[test]
@@ -435,6 +435,97 @@ mod tests_2 {
         let input = Value::build_text("hello''world");
         let expected = Value::build_text("'hello''''world'");
         assert_eq!(input.exec_quote(), expected);
+        // QUOTE() renders a BLOB as an uppercase hex literal: X'...'.
+        let input = Value::Blob(vec![0xde, 0xad, 0xbe, 0xef]);
+        let expected = Value::build_text("X'DEADBEEF'");
+        assert_eq!(input.exec_quote(), expected);
+        let input = Value::Blob(vec![]);
+        let expected = Value::build_text("X''");
+        assert_eq!(input.exec_quote(), expected);
+    }
+    #[test]
+    fn test_exec_concat_blob_rules() {
+        // Blob || Blob stays a Blob: raw byte concatenation, no text involved.
+        let lhs = Value::Blob(vec![0x01, 0x02]);
+        let rhs = Value::Blob(vec![0x03, 0x04]);
+        assert_eq!(
+            lhs.exec_concat(&rhs),
+            Value::Blob(vec![0x01, 0x02, 0x03, 0x04])
+        );
+
+        // Blob || Text coerces the Blob operand to Text (byte-buffer reuse).
+        let lhs = Value::Blob(vec![0x41, 0x42]); // "AB"
+        let rhs = Value::build_text("CD");
+        assert_eq!(lhs.exec_concat(&rhs), Value::build_text("ABCD"));
+
+        // Text || Blob coerces the Blob operand to Text (byte-buffer reuse),
+        // in the opposite operand order.
+        let lhs = Value::build_text("AB");
+        let rhs = Value::Blob(vec![0x43, 0x44]); // "CD"
+        assert_eq!(lhs.exec_concat(&rhs), Value::build_text("ABCD"));
+
+        // Blob || Integer / Float and their reverses also coerce to Text.
+        let lhs = Value::Blob(vec![0x41]); // "A"
+        let rhs = Value::Integer(1);
+        assert_eq!(lhs.exec_concat(&rhs), Value::build_text("A1"));
+        let lhs = Value::Integer(1);
+        let rhs = Value::Blob(vec![0x41]); // "A"
+        assert_eq!(lhs.exec_concat(&rhs), Value::build_text("1A"));
+
+        // NULL still short-circuits to NULL even when the other side is a Blob.
+        assert_eq!(
+            Value::Null.exec_concat(&Value::Blob(vec![1, 2])),
+            Value::Null
+        );
+        assert_eq!(
+            Value::Blob(vec![1, 2]).exec_concat(&Value::Null),
+            Value::Null
+        );
+
+        // The Blob||Text result must actually be a Text variant (not a Blob),
+        // matching SQLite's `typeof(x'4142' || 'CD')` = 'text'.
+        assert!(matches!(
+            Value::Blob(vec![0x41, 0x42]).exec_concat(&Value::build_text("CD")),
+            Value::Text(_)
+        ));
+        // The Blob||Blob result must actually be a Blob variant (not Text),
+        // matching SQLite's `typeof(x'0102' || x'0304')` = 'blob'.
+        assert!(matches!(
+            Value::Blob(vec![1, 2]).exec_concat(&Value::Blob(vec![3, 4])),
+            Value::Blob(_)
+        ));
+    }
+    #[test]
+    fn test_exec_concat_strings_blob_rules() {
+        // concat() (SQLite 3.44+) ALWAYS returns a string -- unlike `||`,
+        // Blob+Blob does NOT stay a Blob; every Blob argument coerces to Text.
+        let result = exec_concat_strings(&[
+            Register::Value(Value::Blob(vec![0x41, 0x42])), // "AB"
+            Register::Value(Value::Blob(vec![0x43, 0x44])), // "CD"
+        ]);
+        assert_eq!(result, Value::build_text("ABCD"));
+        assert!(matches!(result, Value::Text(_)));
+
+        // Mixed Blob/Text arguments all coerce to Text and concatenate in order.
+        let result = exec_concat_strings(&[
+            Register::Value(Value::Blob(vec![0x41])), // "A"
+            Register::Value(Value::build_text("B")),
+            Register::Value(Value::Blob(vec![0x43])), // "C"
+        ]);
+        assert_eq!(result, Value::build_text("ABC"));
+
+        // NULL arguments are skipped (treated as empty), consistent with the
+        // pre-existing non-Blob behavior of concat().
+        let result = exec_concat_strings(&[
+            Register::Value(Value::Null),
+            Register::Value(Value::Blob(vec![0x41])), // "A"
+        ]);
+        assert_eq!(result, Value::build_text("A"));
+
+        // A lone Blob argument also coerces to Text, not Blob.
+        let result = exec_concat_strings(&[Register::Value(Value::Blob(vec![0x41, 0x42]))]);
+        assert_eq!(result, Value::build_text("AB"));
+        assert!(matches!(result, Value::Text(_)));
     }
     #[test]
     fn test_typeof() {

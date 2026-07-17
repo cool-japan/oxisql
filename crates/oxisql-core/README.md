@@ -3,21 +3,23 @@
 [![Crates.io](https://img.shields.io/crates/v/oxisql-core.svg)](https://crates.io/crates/oxisql-core)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 
-> Core async traits, the 13-variant `Value` enum, error types, and middleware shared by all OxiSQL backends.
+> Core async traits, the 14-variant `Value` enum, error types, and middleware shared by all OxiSQL backends.
 
 ## What it is
 
 `oxisql-core` defines the public API surface that every OxiSQL backend must
 implement. It contains no storage logic — concrete backends live in
 `oxisql-embedded`, `oxisql-postgres`, `oxisql-mysql`, `oxisql-sqlite-compat`,
-and `oxisql-datafusion`. The crate is Pure Rust, has **no feature flags**, and
-contains **zero `unsafe`**.
+and `oxisql-datafusion`. The crate is Pure Rust and contains **zero
+`unsafe`**; its default build has no dependencies beyond `async-trait`,
+`futures`, `log`, and `tokio` — `chrono`, `time`, and `tracing` support are
+all opt-in feature flags.
 
 ## Installation
 
 ```toml
 [dependencies]
-oxisql-core = "0.1.2"
+oxisql-core = "0.3.3"
 ```
 
 MSRV 1.89 · edition 2021 · Apache-2.0.
@@ -85,6 +87,7 @@ async fn demo(conn: &dyn Connection) -> Result<(), oxisql_core::OxiSqlError> {
 | `indexes(table)` | List indexes on a named table |
 | `foreign_keys(table)` | List FK constraints on a named table |
 | `query_stream(...)` | SELECT → `Pin<Box<dyn Stream<Item = ...>>>` |
+| `last_warnings()` | Non-fatal warnings from the last `execute`/`query` (default method: empty `Vec`; MySQL populates it via `SHOW WARNINGS`) |
 
 Positional parameters use `$1`, `$2`, … with `params: &[&dyn ToSqlValue]`.
 Named-parameter methods take `&[(&str, &dyn ToSqlValue)]`.
@@ -116,7 +119,7 @@ Object-safe (`Box<dyn ConnectionPool>` is valid).
 | `health_check()` | Verify the pool is healthy |
 | `close()` | Drain idle connections, prevent new checkouts |
 
-### `Value` enum — 13 variants
+### `Value` enum — 14 variants
 
 | Variant | Rust type | SQL type |
 |---------|-----------|----------|
@@ -133,9 +136,14 @@ Object-safe (`Box<dyn ConnectionPool>` is valid).
 | `Uuid(u128)` | 128-bit UUID | UUID |
 | `Json(String)` | UTF-8 JSON string | JSON / JSONB |
 | `Array(Vec<Value>)` | ordered collection | e.g. INTEGER[] |
+| `TypedArray { element_type, values }` | `ArrayElementType` + `Vec<Value>` | array with the nominal element type preserved, e.g. Postgres `int4[]` |
 
 `Value` implements `Display`, `PartialOrd` (cross-type comparisons return
 `None`), and `From<bool/i32/i64/f64/String/&str/Vec<u8>/Option<T>>`.
+
+`ArrayElementType` (the `TypedArray` element tag, `#[non_exhaustive]`) —
+`Bool`, `Int2`, `Int4`, `Int8`, `Float4`, `Float8`, `Text`, `Bytea`, `Date`,
+`Time`, `Timestamp`, `TimestampTz`, `Uuid`, `Json`, `Jsonb`, `Decimal`.
 
 ### `Row` and `RowSet`
 
@@ -218,28 +226,37 @@ Composable wrappers over any `Connection`:
 - `LoggingConnection` — logs every SQL operation with timing.
 - `MetricsConnection` — per-operation counters and latencies, snapshot via `MetricsSnapshot`.
 - `RetryConnection` — retries transient failures with a configurable `RetryPolicy` (`RetryPredicate` decides which errors are retryable).
+- `TracingConnection` — mirrors `LoggingConnection` but emits `tracing` spans/events instead of `log` records (requires the `tracing` feature).
 
 ### Other public types
 
 - `Cursor` — forward-only row cursor (`advance`, `peek`, `reset`, `skip_by`); implements `Iterator<Item = Row>`.
 - `PreparedStatement` — compiled statement for repeated execution.
 - `SelectBuilder` / `InsertBuilder` / `UpdateBuilder` / `DeleteBuilder` — type-safe query builders producing a `BuiltQuery`.
-- `Migrator` — async migration trait (`apply`, `rollback`, `status`, `pending`).
+- `Migrator` — async migration trait (`apply`, `rollback`, `status`, `pending`); `status`/`pending` report `MigrationInfo` (`version`, `name`, `status: MigrationStatus`, `applied_at`).
+- `SqlWarning` / `SqlWarningLevel` — non-fatal SQL warnings surfaced via `Connection::last_warnings()`; `parse_warning_level(&str)` parses a `SHOW WARNINGS` level string (unrecognised input defaults to `Warning`).
 
 ## Feature flags
 
-None. `oxisql-core` is dependency-light and always Pure Rust.
+| Feature | Adds | Description |
+|---------|------|--------------|
+| `chrono` | `dep:chrono` | `FromValue` for `NaiveDate` / `NaiveTime` / `NaiveDateTime` / `DateTime<Utc>` |
+| `time` | `dep:time` | `FromValue` for `time::Date` / `Time` / `PrimitiveDateTime` / `OffsetDateTime` |
+| `tracing` | `dep:tracing` | `TracingConnection<C>` middleware — `tracing` spans/events instead of `log` records |
+
+All three are additive and off by default; the default build stays
+dependency-light and Pure Rust.
 
 ## Test coverage
 
-**114 tests** pass.
+**155 tests pass** (142 unit + 13 doc), 0 failed, with `--all-features`.
 
 ## Part of the OxiSQL workspace
 
 `oxisql-core` is the foundation crate of the OxiSQL workspace (17 crates: 10
 facade/driver crates plus a 7-crate C-free `oxisqlite-*` engine). See the
-[workspace README](../../README.md) for the full architecture and the 1,720
-workspace tests.
+[workspace README](../../README.md) for the full architecture and the 2,157
+workspace tests (2,651 with `--all-features`).
 
 ## License
 

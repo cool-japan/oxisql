@@ -673,6 +673,7 @@ mod tests {
             ephemeral: false,
             root_page: 1,
             has_rowid: true,
+            on_conflict: ast::ResolveType::Abort,
         });
         available_indexes.insert("test_table".to_string(), vec![index]);
 
@@ -745,6 +746,7 @@ mod tests {
             ephemeral: false,
             root_page: 1,
             has_rowid: true,
+            on_conflict: ast::ResolveType::Abort,
         });
         available_indexes.insert("table1".to_string(), vec![index1]);
 
@@ -865,6 +867,7 @@ mod tests {
                     ephemeral: false,
                     root_page: 1,
                     has_rowid: true,
+                    on_conflict: ast::ResolveType::Abort,
                 });
                 available_indexes.insert(table_name.to_string(), vec![index]);
             });
@@ -882,6 +885,7 @@ mod tests {
             ephemeral: false,
             root_page: 1,
             has_rowid: true,
+            on_conflict: ast::ResolveType::Abort,
         });
         let order_id_idx = Arc::new(Index {
             name: "order_items_order_id_idx".to_string(),
@@ -897,6 +901,7 @@ mod tests {
             ephemeral: false,
             root_page: 1,
             has_rowid: true,
+            on_conflict: ast::ResolveType::Abort,
         });
 
         available_indexes
@@ -1331,6 +1336,7 @@ mod tests {
             root_page: 2,
             ephemeral: false,
             has_rowid: true,
+            on_conflict: ast::ResolveType::Abort,
         });
 
         let mut available_indexes = HashMap::new();
@@ -1428,6 +1434,7 @@ mod tests {
             root_page: 2,
             ephemeral: false,
             has_rowid: true,
+            on_conflict: ast::ResolveType::Abort,
         });
         available_indexes.insert("t1".to_string(), vec![index]);
 
@@ -1548,6 +1555,7 @@ mod tests {
             ephemeral: false,
             has_rowid: true,
             unique: false,
+            on_conflict: ast::ResolveType::Abort,
         });
         available_indexes.insert("t1".to_string(), vec![index]);
 
@@ -1657,7 +1665,9 @@ mod tests {
             notnull: false,
             default: None,
             unique: false,
+            unique_conflict: ast::ResolveType::Abort,
             collation: None,
+            is_generated: false,
         }
     }
     fn _create_column_of_type(name: &str, ty: Type) -> Column {
@@ -1693,6 +1703,7 @@ mod tests {
             has_rowid: true,
             is_strict: false,
             unique_sets: None,
+            primary_key_conflict: ast::ResolveType::Abort,
             foreign_keys: vec![],
         })
     }

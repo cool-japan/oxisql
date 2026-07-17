@@ -127,7 +127,8 @@ pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring"))]
 pub use io::UringIO;
 pub use io::{
-    Buffer, Completion, File, MemoryIO, OpenFlags, PlatformIO, SyscallIO, WriteCompletion, IO,
+    Buffer, Completion, File, MemoryFile, MemoryIO, OpenFlags, PlatformIO, SyscallIO,
+    WriteCompletion, IO,
 };
 use limbo_sqlite3_parser::{ast, ast::Cmd, lexer::sql::Parser};
 use parking_lot::RwLock;
@@ -155,12 +156,15 @@ pub use storage::{
     wal::{CheckpointMode, CheckpointResult, CheckpointStatus, Wal, WalFile, WalFileShared},
 };
 use storage::{
+    database::FileMemoryStorage,
     page_cache::DumbLruPageCache,
     pager::allocate_page,
-    sqlite3_ondisk::{DatabaseHeader, DATABASE_HEADER_SIZE},
+    sqlite3_ondisk::{DatabaseHeader, DATABASE_HEADER_SIZE, MIN_PAGE_SIZE},
 };
 use tracing::{instrument, Level};
+use translate::delete::prepare_delete_plan;
 use translate::select::prepare_select_plan;
+use translate::update::prepare_update_plan;
 pub use types::RefValue;
 pub use types::Value;
 use util::parse_schema_rows;
@@ -392,6 +396,59 @@ impl Database {
         let db = Self::open_file(io.clone(), path, false)?;
         Ok((io, db))
     }
+
+    /// Open a database directly from an in-memory SQLite database image
+    /// (e.g. the output of `include_bytes!`, `VACUUM INTO`, or
+    /// `sqlite3_serialize()`).
+    ///
+    /// The bytes are copied into a fresh in-memory page store backed by
+    /// [`MemoryIO`] / [`MemoryFile`]; `bytes` is never mutated and no file
+    /// I/O ever occurs. This entry point is deliberately **not** gated by the
+    /// `fs` feature, so it works on `wasm32`/WASI and read-only filesystems
+    /// where materializing a temp file is impossible.
+    ///
+    /// The database is treated as pre-existing (see [`Database::open`]): any
+    /// companion `-wal` is irrelevant because [`MemoryIO`] always hands back a
+    /// fresh empty WAL file, so a fresh WAL header is created and nothing is
+    /// replayed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LimboError::NotADB`] if `bytes` is shorter than the 100-byte
+    /// header or does not start with the `"SQLite format 3\0"` magic, and
+    /// [`LimboError::Corrupt`] if the header encodes an invalid page size.
+    /// Never panics on malformed input.
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub fn open_from_bytes(bytes: &[u8], enable_mvcc: bool) -> Result<Arc<Database>> {
+        const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+        // Mirrors the private `sqlite3_ondisk::MAX_PAGE_SIZE`.
+        const SQLITE_MAX_PAGE_SIZE: u32 = 65536;
+
+        if bytes.len() < DATABASE_HEADER_SIZE || &bytes[0..16] != SQLITE_MAGIC {
+            return Err(LimboError::NotADB);
+        }
+        // Page size lives at header offset 16..18, big-endian. The value 1
+        // encodes the 65536 maximum (which does not fit in a u16).
+        let raw = u16::from_be_bytes([bytes[16], bytes[17]]);
+        let page_size = if raw == 1 {
+            SQLITE_MAX_PAGE_SIZE
+        } else {
+            u32::from(raw)
+        };
+        if page_size < MIN_PAGE_SIZE
+            || page_size > SQLITE_MAX_PAGE_SIZE
+            || page_size.count_ones() != 1
+        {
+            return Err(LimboError::Corrupt(format!(
+                "invalid page size {page_size} in database header"
+            )));
+        }
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let file: Arc<dyn File> = Arc::new(MemoryFile::from_bytes(bytes));
+        let db_file: Arc<dyn DatabaseStorage> = Arc::new(FileMemoryStorage::new(file));
+        Self::open(io, ":memory:", db_file, enable_mvcc)
+    }
 }
 
 /// Initialize a brand-new database file (write the bootstrap page 1) if the
@@ -522,8 +579,44 @@ impl Connection {
                     self.pager.clone(),
                 ))
             }
-            Cmd::Explain(_stmt) => todo!(),
-            Cmd::ExplainQueryPlan(_stmt) => todo!(),
+            // `QueryMode::Explain` only gates comment-capture during code
+            // generation (see `ProgramBuilder::new` in `vdbe::builder`); it
+            // does not change which opcodes get emitted, so the compiled
+            // program is the very same executable statement `Cmd::Stmt`
+            // would produce. Stepping the returned `Statement` therefore
+            // *runs the real statement* rather than listing bytecode --
+            // callers must call `Statement::explain()` to get the `EXPLAIN`
+            // text, exactly as `Connection::execute()`'s own `Cmd::Explain`
+            // arm does (it builds the program and calls `.explain()`
+            // without ever stepping it).
+            Cmd::Explain(stmt) => {
+                let program = Rc::new(translate::translate(
+                    self.schema
+                        .try_read()
+                        .ok_or(LimboError::SchemaLocked)?
+                        .deref(),
+                    stmt,
+                    self.header.clone(),
+                    self.pager.clone(),
+                    self.clone(),
+                    &syms,
+                    QueryMode::Explain,
+                    &input,
+                )?);
+                Ok(Statement::new(
+                    program,
+                    self._db.mv_store.clone(),
+                    self.pager.clone(),
+                ))
+            }
+            // `EXPLAIN QUERY PLAN` never compiles to a `vdbe::Program`: it
+            // computes and formats the planner's chosen access method
+            // directly (see `Connection::explain_query_plan`), so there is
+            // no `Statement` for `prepare()` to hand back. `query()` and
+            // `execute()` handle it directly and print the plan text.
+            Cmd::ExplainQueryPlan(_stmt) => crate::bail_parse_error!(
+                "EXPLAIN QUERY PLAN is not supported via Connection::prepare(); use Connection::query() or Connection::execute() instead"
+            ),
         }
     }
 
@@ -573,34 +666,78 @@ impl Connection {
                 Ok(Some(stmt))
             }
             Cmd::ExplainQueryPlan(stmt) => {
-                let mut table_ref_counter = TableRefIdCounter::new();
-                match stmt {
-                    ast::Stmt::Select(select) => {
-                        let mut plan = prepare_select_plan(
-                            self.schema
-                                .try_read()
-                                .ok_or(LimboError::SchemaLocked)?
-                                .deref(),
-                            *select,
-                            &syms,
-                            &[],
-                            &mut table_ref_counter,
-                            translate::plan::QueryDestination::ResultRows,
-                        )?;
-                        optimize_plan(
-                            &mut plan,
-                            self.schema
-                                .try_read()
-                                .ok_or(LimboError::SchemaLocked)?
-                                .deref(),
-                        )?;
-                        let _ = std::io::stdout().write_all(plan.to_string().as_bytes());
-                    }
-                    _ => todo!(),
-                }
+                let plan_text = self.explain_query_plan(stmt)?;
+                let _ = std::io::stdout().write_all(plan_text.as_bytes());
                 Ok(None)
             }
         }
+    }
+
+    /// Build the `EXPLAIN QUERY PLAN` textual output for `stmt`.
+    ///
+    /// Shared by [`Connection::run_cmd`] and [`Connection::execute`] so the
+    /// plan-preparation logic -- `prepare_select_plan` / `prepare_update_plan`
+    /// / `prepare_delete_plan`, followed by `optimize_plan` and the
+    /// `Display` impls in `translate::display` -- lives in exactly one
+    /// place instead of being duplicated between the two call sites.
+    ///
+    /// Unlike `EXPLAIN`, `EXPLAIN QUERY PLAN` never touches the VDBE: it
+    /// computes the planner's chosen access method (table scan vs. rowid /
+    /// index search) and formats it directly, without compiling or running
+    /// any bytecode, so it is always side-effect free.
+    fn explain_query_plan(&self, stmt: ast::Stmt) -> Result<String> {
+        let mut table_ref_counter = TableRefIdCounter::new();
+        let schema = self.schema.try_read().ok_or(LimboError::SchemaLocked)?;
+        let plan = match stmt {
+            ast::Stmt::Select(select) => {
+                let syms = self.syms.borrow();
+                let mut plan = prepare_select_plan(
+                    schema.deref(),
+                    *select,
+                    &syms,
+                    &[],
+                    &mut table_ref_counter,
+                    translate::plan::QueryDestination::ResultRows,
+                )?;
+                optimize_plan(&mut plan, schema.deref())?;
+                plan
+            }
+            ast::Stmt::Update(mut update) => {
+                let mut plan =
+                    prepare_update_plan(schema.deref(), &mut update, &mut table_ref_counter)?;
+                optimize_plan(&mut plan, schema.deref())?;
+                plan
+            }
+            ast::Stmt::Delete(delete) => {
+                let ast::Delete {
+                    tbl_name,
+                    where_clause,
+                    limit,
+                    ..
+                } = *delete;
+                let mut plan = prepare_delete_plan(
+                    schema.deref(),
+                    &tbl_name,
+                    where_clause,
+                    limit,
+                    &mut table_ref_counter,
+                )?;
+                optimize_plan(&mut plan, schema.deref())?;
+                plan
+            }
+            // `Insert` has no `Plan`/`Display` type yet (see `translate::plan`
+            // and `translate::display`) -- report cleanly instead of
+            // reaching an unreachable/panicking arm.
+            ast::Stmt::Insert(_) => {
+                crate::bail_parse_error!(
+                    "EXPLAIN QUERY PLAN is not supported for INSERT statements"
+                )
+            }
+            _ => crate::bail_parse_error!(
+                "EXPLAIN QUERY PLAN is only supported for SELECT, UPDATE, and DELETE statements"
+            ),
+        };
+        Ok(plan.to_string())
     }
 
     pub fn query_runner<'a>(self: &'a Arc<Connection>, sql: &'a [u8]) -> QueryRunner<'a> {
@@ -614,7 +751,6 @@ impl Connection {
         let sql = sql.as_ref();
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next()?;
-        let syms = self.syms.borrow();
         let byte_offset_end = parser.offset();
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
             .expect("invariant: sql is valid UTF-8 bytes slice") // UPSTREAM (Limbo): unwrap — needs proper error propagation
@@ -622,6 +758,11 @@ impl Connection {
         if let Some(cmd) = cmd {
             match cmd {
                 Cmd::Explain(stmt) => {
+                    // `syms` only needs to live through translation, not past it -- scoped to
+                    // this block (rather than borrowed once for the whole function) so it is
+                    // dropped before any subsequent statement executes. See the `Cmd::Stmt` arm
+                    // below for why that distinction matters.
+                    let syms = self.syms.borrow();
                     let program = translate::translate(
                         self.schema
                             .try_read()
@@ -637,21 +778,35 @@ impl Connection {
                     )?;
                     let _ = std::io::stdout().write_all(program.explain().as_bytes());
                 }
-                Cmd::ExplainQueryPlan(_stmt) => todo!(),
+                Cmd::ExplainQueryPlan(stmt) => {
+                    let plan_text = self.explain_query_plan(stmt)?;
+                    let _ = std::io::stdout().write_all(plan_text.as_bytes());
+                }
                 Cmd::Stmt(stmt) => {
-                    let program = translate::translate(
-                        self.schema
-                            .try_read()
-                            .ok_or(LimboError::SchemaLocked)?
-                            .deref(),
-                        stmt,
-                        self.header.clone(),
-                        self.pager.clone(),
-                        self.clone(),
-                        &syms,
-                        QueryMode::Normal,
-                        &input,
-                    )?;
+                    // `syms` (a `RefCell` borrow) must be dropped before `program.step()` runs
+                    // below: bytecode execution can itself need a *mutable* borrow of the same
+                    // `RefCell` -- e.g. `Insn::VCreate` (`CREATE VIRTUAL TABLE`) registers the
+                    // newly-created table into `syms.vtabs`. Scoping `syms` to just this
+                    // translation call (instead of borrowing it once for the whole function, as
+                    // this used to do) ensures it is released before the execution loop starts,
+                    // instead of staying alive for the rest of `execute()` and making any such
+                    // instruction panic with "already borrowed".
+                    let program = {
+                        let syms = self.syms.borrow();
+                        translate::translate(
+                            self.schema
+                                .try_read()
+                                .ok_or(LimboError::SchemaLocked)?
+                                .deref(),
+                            stmt,
+                            self.header.clone(),
+                            self.pager.clone(),
+                            self.clone(),
+                            &syms,
+                            QueryMode::Normal,
+                            &input,
+                        )?
+                    };
 
                     let mut state =
                         vdbe::ProgramState::new(program.max_registers, program.cursor_ref.len());
@@ -1133,5 +1288,602 @@ impl Iterator for QueryRunner<'_> {
                 Some(Result::Err(LimboError::from(err)))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod explain_tests {
+    use super::*;
+
+    fn new_mem_conn() -> Arc<Connection> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", false).expect("open :memory: database");
+        db.connect().expect("connect to :memory: database")
+    }
+
+    fn exec(conn: &Arc<Connection>, sql: &str) {
+        conn.execute(sql)
+            .unwrap_or_else(|e| panic!("execute {sql:?} failed: {e:?}"));
+    }
+
+    /// Run `sql` to completion via `prepare()` + `step()` and return the sole
+    /// integer column of its sole result row.
+    fn scalar_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
+        let mut stmt = conn
+            .prepare(sql)
+            .unwrap_or_else(|e| panic!("prepare {sql:?} failed: {e:?}"));
+        loop {
+            match stmt
+                .step()
+                .unwrap_or_else(|e| panic!("step {sql:?} failed: {e:?}"))
+            {
+                StepResult::Row => {
+                    let row = stmt.row().expect("row available after StepResult::Row");
+                    return match row
+                        .get_values()
+                        .next()
+                        .expect("query should return exactly one column")
+                    {
+                        Value::Integer(i) => *i,
+                        other => panic!("expected an integer column, got {other:?}"),
+                    };
+                }
+                StepResult::IO => stmt.run_once().expect("run_once"),
+                other => panic!("expected a result row for {sql:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Parse `sql` (expected to be `EXPLAIN QUERY PLAN ...`) and run it
+    /// through the private `Connection::explain_query_plan` helper directly,
+    /// bypassing the stdout-printing public entry points so the plan text
+    /// itself can be asserted on.
+    fn query_plan_text(conn: &Arc<Connection>, sql: &str) -> Result<String> {
+        let mut parser = Parser::new(sql.as_bytes());
+        let cmd = parser
+            .next()
+            .unwrap_or_else(|e| panic!("parse {sql:?} failed: {e:?}"))
+            .unwrap_or_else(|| panic!("{sql:?} did not parse to a command"));
+        match cmd {
+            Cmd::ExplainQueryPlan(stmt) => conn.explain_query_plan(stmt),
+            other => panic!("expected Cmd::ExplainQueryPlan for {sql:?}, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // EXPLAIN: bytecode listing, never a panic, never real side effects.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn explain_select_via_prepare_lists_bytecode() {
+        let conn = new_mem_conn();
+        exec(&conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+        exec(&conn, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)");
+
+        let stmt = conn
+            .prepare("EXPLAIN SELECT * FROM t")
+            .expect("prepare EXPLAIN SELECT should succeed");
+        let text = stmt.explain();
+        assert!(
+            text.contains("addr") && text.contains("opcode"),
+            "explain output should have the addr/opcode header, got: {text}"
+        );
+        assert!(
+            text.contains("Halt"),
+            "explain output should list the terminating Halt opcode, got: {text}"
+        );
+    }
+
+    #[test]
+    fn explain_update_via_prepare_does_not_run_the_update() {
+        let conn = new_mem_conn();
+        exec(&conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+        exec(&conn, "INSERT INTO t (id, v) VALUES (1, 10)");
+
+        let stmt = conn
+            .prepare("EXPLAIN UPDATE t SET v = 999 WHERE id = 1")
+            .expect("prepare EXPLAIN UPDATE should succeed");
+        let text = stmt.explain();
+        assert!(
+            text.contains("addr") && text.contains("opcode"),
+            "explain output should have the addr/opcode header, got: {text}"
+        );
+
+        // Only `Statement::explain()` was called -- `step()` never ran --
+        // so the real UPDATE must not have executed.
+        assert_eq!(scalar_i64(&conn, "SELECT v FROM t WHERE id = 1"), 10);
+    }
+
+    #[test]
+    fn explain_delete_via_prepare_does_not_run_the_delete() {
+        let conn = new_mem_conn();
+        exec(&conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+        exec(&conn, "INSERT INTO t (id, v) VALUES (1, 10)");
+
+        let stmt = conn
+            .prepare("EXPLAIN DELETE FROM t WHERE id = 1")
+            .expect("prepare EXPLAIN DELETE should succeed");
+        let text = stmt.explain();
+        assert!(
+            text.contains("addr") && text.contains("opcode"),
+            "explain output should have the addr/opcode header, got: {text}"
+        );
+
+        assert_eq!(scalar_i64(&conn, "SELECT count(*) FROM t"), 1);
+    }
+
+    #[test]
+    fn explain_via_execute_prints_bytecode_and_does_not_run_the_statement() {
+        let conn = new_mem_conn();
+        exec(&conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+        exec(&conn, "INSERT INTO t (id, v) VALUES (1, 10)");
+
+        conn.execute("EXPLAIN UPDATE t SET v = 999 WHERE id = 1")
+            .expect("execute EXPLAIN UPDATE should succeed");
+
+        assert_eq!(scalar_i64(&conn, "SELECT v FROM t WHERE id = 1"), 10);
+    }
+
+    // -----------------------------------------------------------------
+    // EXPLAIN QUERY PLAN: plan description reflects the access method.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn explain_query_plan_select_reflects_scan_vs_rowid_search() {
+        let conn = new_mem_conn();
+        exec(&conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+        exec(&conn, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)");
+
+        let scan = query_plan_text(&conn, "EXPLAIN QUERY PLAN SELECT * FROM t")
+            .expect("explain query plan (scan) should succeed");
+        assert!(
+            scan.contains("SCAN t"),
+            "unfiltered SELECT should be a full scan, got: {scan}"
+        );
+        assert!(!scan.contains("SEARCH"), "got: {scan}");
+
+        let search = query_plan_text(&conn, "EXPLAIN QUERY PLAN SELECT * FROM t WHERE id = 1")
+            .expect("explain query plan (search) should succeed");
+        assert!(
+            search.contains("SEARCH t USING INTEGER PRIMARY KEY"),
+            "rowid equality SELECT should be a rowid search, got: {search}"
+        );
+        assert!(!search.contains("SCAN"), "got: {search}");
+    }
+
+    #[test]
+    fn explain_query_plan_update_reflects_scan_vs_rowid_search() {
+        let conn = new_mem_conn();
+        exec(&conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+        exec(&conn, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)");
+
+        let scan = query_plan_text(&conn, "EXPLAIN QUERY PLAN UPDATE t SET v = 0")
+            .expect("explain query plan (scan) should succeed");
+        assert!(
+            scan.contains("UPDATE t"),
+            "unfiltered UPDATE should be a full scan, got: {scan}"
+        );
+        assert!(!scan.contains("SEARCH"), "got: {scan}");
+
+        let search = query_plan_text(&conn, "EXPLAIN QUERY PLAN UPDATE t SET v = 0 WHERE id = 1")
+            .expect("explain query plan (search) should succeed");
+        assert!(
+            search.contains("SEARCH t USING INTEGER PRIMARY KEY"),
+            "rowid equality UPDATE should be a rowid search, got: {search}"
+        );
+
+        // EXPLAIN QUERY PLAN must never actually run the UPDATE.
+        assert_eq!(scalar_i64(&conn, "SELECT v FROM t WHERE id = 1"), 10);
+        assert_eq!(scalar_i64(&conn, "SELECT v FROM t WHERE id = 2"), 20);
+    }
+
+    #[test]
+    fn explain_query_plan_delete_reflects_scan_vs_rowid_search() {
+        let conn = new_mem_conn();
+        exec(&conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+        exec(&conn, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)");
+
+        let scan = query_plan_text(&conn, "EXPLAIN QUERY PLAN DELETE FROM t")
+            .expect("explain query plan (scan) should succeed");
+        assert!(
+            scan.contains("DELETE FROM t") && !scan.contains("USING"),
+            "unfiltered DELETE should be a full scan (no access-method suffix), got: {scan}"
+        );
+
+        let search = query_plan_text(&conn, "EXPLAIN QUERY PLAN DELETE FROM t WHERE id = 1")
+            .expect("explain query plan (search) should succeed");
+        // `DeletePlan`'s `Display` impl (translate::display) folds the access
+        // method into the same "DELETE FROM ..." line rather than using a
+        // separate "SEARCH" line like Select/Update plans do.
+        assert!(
+            search.contains("DELETE FROM t USING INTEGER PRIMARY KEY"),
+            "rowid equality DELETE should be a rowid search, got: {search}"
+        );
+
+        // EXPLAIN QUERY PLAN must never actually run the DELETE.
+        assert_eq!(scalar_i64(&conn, "SELECT count(*) FROM t"), 2);
+    }
+
+    // -----------------------------------------------------------------
+    // EXPLAIN QUERY PLAN: public entry points (query()/execute()), no panic.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn explain_query_plan_select_update_delete_via_query_do_not_panic() {
+        let conn = new_mem_conn();
+        exec(&conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+        exec(&conn, "INSERT INTO t (id, v) VALUES (1, 10)");
+
+        for sql in [
+            "EXPLAIN QUERY PLAN SELECT * FROM t WHERE id = 1",
+            "EXPLAIN QUERY PLAN UPDATE t SET v = 0 WHERE id = 1",
+            "EXPLAIN QUERY PLAN DELETE FROM t WHERE id = 1",
+        ] {
+            let result = conn
+                .query(sql)
+                .unwrap_or_else(|e| panic!("query {sql:?} failed: {e:?}"));
+            assert!(
+                result.is_none(),
+                "EXPLAIN QUERY PLAN via query() should not yield a Statement: {sql:?}"
+            );
+        }
+
+        // None of the above actually ran.
+        assert_eq!(scalar_i64(&conn, "SELECT v FROM t WHERE id = 1"), 10);
+        assert_eq!(scalar_i64(&conn, "SELECT count(*) FROM t"), 1);
+    }
+
+    #[test]
+    fn explain_query_plan_select_update_delete_via_execute_do_not_panic() {
+        let conn = new_mem_conn();
+        exec(&conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+        exec(&conn, "INSERT INTO t (id, v) VALUES (1, 10)");
+
+        for sql in [
+            "EXPLAIN QUERY PLAN SELECT * FROM t WHERE id = 1",
+            "EXPLAIN QUERY PLAN UPDATE t SET v = 0 WHERE id = 1",
+            "EXPLAIN QUERY PLAN DELETE FROM t WHERE id = 1",
+        ] {
+            conn.execute(sql)
+                .unwrap_or_else(|e| panic!("execute {sql:?} failed: {e:?}"));
+        }
+
+        assert_eq!(scalar_i64(&conn, "SELECT v FROM t WHERE id = 1"), 10);
+        assert_eq!(scalar_i64(&conn, "SELECT count(*) FROM t"), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // EXPLAIN QUERY PLAN INSERT / prepare(): clean errors, never a panic.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn explain_query_plan_insert_is_a_clean_error_not_a_panic() {
+        let conn = new_mem_conn();
+        exec(&conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+
+        match conn.query("EXPLAIN QUERY PLAN INSERT INTO t (id, v) VALUES (1, 10)") {
+            Err(LimboError::ParseError(_)) => {}
+            Err(other) => panic!("expected LimboError::ParseError via query(), got: {other:?}"),
+            Ok(_) => panic!("expected an error via query() for EXPLAIN QUERY PLAN INSERT"),
+        }
+
+        match conn.execute("EXPLAIN QUERY PLAN INSERT INTO t (id, v) VALUES (1, 10)") {
+            Err(LimboError::ParseError(_)) => {}
+            Err(other) => panic!("expected LimboError::ParseError via execute(), got: {other:?}"),
+            Ok(()) => panic!("expected an error via execute() for EXPLAIN QUERY PLAN INSERT"),
+        }
+
+        // Neither failed attempt inserted a row.
+        assert_eq!(scalar_i64(&conn, "SELECT count(*) FROM t"), 0);
+    }
+
+    #[test]
+    fn explain_query_plan_via_prepare_is_a_clean_error_not_a_panic() {
+        let conn = new_mem_conn();
+        exec(&conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+
+        // `prepare()` has no `Statement` representation for `EXPLAIN QUERY
+        // PLAN` (see `Connection::prepare`); it must report a clean parse
+        // error rather than panicking via the `todo!()` that used to sit
+        // here.
+        match conn.prepare("EXPLAIN QUERY PLAN SELECT * FROM t") {
+            Err(LimboError::ParseError(_)) => {}
+            Err(other) => panic!("expected LimboError::ParseError, got: {other:?}"),
+            Ok(_) => panic!("prepare() should not return a Statement for EXPLAIN QUERY PLAN"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod open_from_bytes_tests {
+    //! Tests for [`Database::open_from_bytes`]: the in-memory database-image
+    //! open path. Fixtures are synthesized at run time (no checked-in binary
+    //! blobs) — either an empty single-page image at a custom page size (built
+    //! through the same bootstrap primitives as `maybe_init_database_file`) or
+    //! a full image produced by the engine itself and serialized back out.
+    use super::*;
+
+    /// Build a minimal, valid, *empty* SQLite database image at `page_size`.
+    ///
+    /// Mirrors the page-1 bootstrap performed by `maybe_init_database_file`,
+    /// but at an arbitrary (power-of-two, 512..=65536) page size so the
+    /// non-default page-size open path can be exercised without relying on the
+    /// (still unimplemented) `PRAGMA page_size = N` SQL path.
+    fn build_empty_db_image(page_size: u32) -> Vec<u8> {
+        let mut db_header = DatabaseHeader::default();
+        db_header.update_page_size(page_size);
+
+        let page1 = allocate_page(
+            1,
+            &Rc::new(BufferPool::new(db_header.get_page_size() as usize)),
+            DATABASE_HEADER_SIZE,
+        );
+        let page1 = Arc::new(BTreePageInner {
+            page: RefCell::new(page1),
+        });
+        btree_init_page(
+            &page1,
+            storage::sqlite3_ondisk::PageType::TableLeaf,
+            DATABASE_HEADER_SIZE,
+            (db_header.get_page_size() - db_header.reserved_space as u32) as u16,
+        );
+        let page1 = page1.get();
+        let contents = page1
+            .get()
+            .contents
+            .as_mut()
+            .expect("page1 contents initialized");
+        contents.write_database_header(&db_header);
+        let buffer = contents.buffer.clone();
+        let image = buffer.borrow().as_slice().to_vec();
+        assert_eq!(image.len(), page_size as usize, "image is exactly one page");
+        image
+    }
+
+    fn exec(conn: &Arc<Connection>, sql: &str) {
+        conn.execute(sql)
+            .unwrap_or_else(|e| panic!("execute {sql:?} failed: {e:?}"));
+    }
+
+    /// Drain `sql` and return the first integer column of the first row.
+    fn scalar_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
+        let mut stmt = conn
+            .prepare(sql)
+            .unwrap_or_else(|e| panic!("prepare {sql:?} failed: {e:?}"));
+        loop {
+            match stmt
+                .step()
+                .unwrap_or_else(|e| panic!("step {sql:?} failed: {e:?}"))
+            {
+                StepResult::Row => {
+                    let row = stmt.row().expect("row available after StepResult::Row");
+                    return match row
+                        .get_values()
+                        .next()
+                        .expect("query returns at least one column")
+                    {
+                        Value::Integer(i) => *i,
+                        other => panic!("expected an integer column, got {other:?}"),
+                    };
+                }
+                StepResult::IO => stmt.run_once().expect("run_once"),
+                other => panic!("expected a result row for {sql:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Drain `sql` and return the first text column of the first row.
+    fn scalar_text(conn: &Arc<Connection>, sql: &str) -> String {
+        let mut stmt = conn
+            .prepare(sql)
+            .unwrap_or_else(|e| panic!("prepare {sql:?} failed: {e:?}"));
+        loop {
+            match stmt
+                .step()
+                .unwrap_or_else(|e| panic!("step {sql:?} failed: {e:?}"))
+            {
+                StepResult::Row => {
+                    let row = stmt.row().expect("row available after StepResult::Row");
+                    return match row
+                        .get_values()
+                        .next()
+                        .expect("query returns at least one column")
+                    {
+                        Value::Text(t) => t.to_string(),
+                        other => panic!("expected a text column, got {other:?}"),
+                    };
+                }
+                StepResult::IO => stmt.run_once().expect("run_once"),
+                other => panic!("expected a result row for {sql:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// A fresh empty image at each supported page size must open, accept
+    /// writes (including overflow-sized rows), and read back correctly. Small
+    /// page sizes force overflow pages for large payloads.
+    ///
+    /// The 65536 page size is deliberately excluded from the *write* matrix:
+    /// the engine represents a page's usable space in a `u16`, which cannot
+    /// hold 65536, so any write at that page size hits a pre-existing
+    /// subtract-with-overflow in `payload_overflow_threshold_max`. The
+    /// read-only open of a 65536 image is covered separately below.
+    #[test]
+    fn test_open_from_bytes_all_page_sizes_read_write() {
+        for &page_size in &[1024u32, 4096, 8192] {
+            let image = build_empty_db_image(page_size);
+            let db = Database::open_from_bytes(&image, false).unwrap_or_else(|e| {
+                panic!("open_from_bytes at page_size {page_size} failed: {e:?}")
+            });
+            let conn = db.connect().expect("connect");
+
+            exec(&conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)");
+
+            // A payload larger than the page size forces overflow pages.
+            let big = "x".repeat((page_size as usize) * 2 + 321);
+            exec(
+                &conn,
+                &format!("INSERT INTO t (id, body) VALUES (1, '{big}')"),
+            );
+            exec(&conn, "INSERT INTO t (id, body) VALUES (2, 'short')");
+
+            assert_eq!(
+                scalar_i64(&conn, "SELECT count(*) FROM t"),
+                2,
+                "row count at page_size {page_size}"
+            );
+            assert_eq!(
+                scalar_i64(&conn, "SELECT length(body) FROM t WHERE id = 1"),
+                big.len() as i64,
+                "overflow payload length at page_size {page_size}"
+            );
+            assert_eq!(
+                scalar_text(&conn, "SELECT body FROM t WHERE id = 2"),
+                "short",
+                "plain read at page_size {page_size}"
+            );
+
+            // Index coverage requires the engine's index-maintenance feature
+            // (the same one the compat consumer enables); exercise it whenever
+            // it is compiled in.
+            #[cfg(feature = "index_experimental")]
+            {
+                exec(&conn, "CREATE INDEX idx_body ON t (body)");
+                assert_eq!(
+                    scalar_text(&conn, "SELECT body FROM t ORDER BY body LIMIT 1"),
+                    "short",
+                    "index-ordered read at page_size {page_size}"
+                );
+            }
+        }
+    }
+
+    /// Writing into a database opened from bytes must not mutate the source
+    /// slice, and two opens of the same slice must be independent.
+    #[test]
+    fn test_open_from_bytes_source_slice_untouched_and_independent() {
+        let image = build_empty_db_image(4096);
+        let snapshot = image.clone();
+
+        let db_a = Database::open_from_bytes(&image, false).expect("open a");
+        let conn_a = db_a.connect().expect("connect a");
+        exec(&conn_a, "CREATE TABLE t (id INTEGER PRIMARY KEY)");
+        exec(&conn_a, "INSERT INTO t (id) VALUES (1), (2), (3)");
+        assert_eq!(scalar_i64(&conn_a, "SELECT count(*) FROM t"), 3);
+
+        // The source slice is unchanged by writes to db_a.
+        assert_eq!(
+            image, snapshot,
+            "open_from_bytes must not mutate the source"
+        );
+
+        // A second open of the same slice sees none of db_a's writes.
+        let db_b = Database::open_from_bytes(&image, false).expect("open b");
+        let conn_b = db_b.connect().expect("connect b");
+        let has_table = conn_b.prepare("SELECT count(*) FROM t").is_ok();
+        assert!(
+            !has_table,
+            "second independent open must not see table created in the first"
+        );
+    }
+
+    #[test]
+    fn test_open_from_bytes_empty_is_err_not_panic() {
+        assert!(matches!(
+            Database::open_from_bytes(&[], false),
+            Err(LimboError::NotADB)
+        ));
+    }
+
+    #[test]
+    fn test_open_from_bytes_truncated_header_is_err() {
+        let image = build_empty_db_image(4096);
+        // Fewer than DATABASE_HEADER_SIZE bytes.
+        let truncated = &image[..DATABASE_HEADER_SIZE - 1];
+        assert!(matches!(
+            Database::open_from_bytes(truncated, false),
+            Err(LimboError::NotADB)
+        ));
+    }
+
+    #[test]
+    fn test_open_from_bytes_bad_magic_is_err() {
+        let mut image = build_empty_db_image(4096);
+        image[0] = b'X';
+        assert!(matches!(
+            Database::open_from_bytes(&image, false),
+            Err(LimboError::NotADB)
+        ));
+    }
+
+    #[test]
+    fn test_open_from_bytes_bad_page_size_is_err() {
+        let mut image = build_empty_db_image(4096);
+        // Offset 16..18 is the page size; 1000 is not a power of two.
+        image[16] = 0x03;
+        image[17] = 0xE8;
+        assert!(matches!(
+            Database::open_from_bytes(&image, false),
+            Err(LimboError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn test_open_from_bytes_page_size_one_means_65536() {
+        // A header page-size field of 1 encodes the 65536 maximum: it must be
+        // accepted (not rejected as < MIN_PAGE_SIZE) and must open + read.
+        //
+        // Only the read path is exercised here: writing at a 65536 page size
+        // hits a pre-existing engine limitation (usable space is a `u16` and
+        // cannot represent 65536), independent of open_from_bytes.
+        let image = build_empty_db_image(65536);
+        assert_eq!(
+            u16::from_be_bytes([image[16], image[17]]),
+            1,
+            "page size 65536 is encoded as 1 in the header"
+        );
+        let db = Database::open_from_bytes(&image, false).expect("open 65536");
+        let conn = db.connect().expect("connect");
+        // A fresh image has an empty schema: reading it back must work.
+        assert_eq!(
+            scalar_i64(&conn, "SELECT count(*) FROM sqlite_master"),
+            0,
+            "empty 65536 image opens and reads an empty schema"
+        );
+    }
+
+    /// A non-zero `reserved_space` in the header (as real GeoPackage/OxiProj
+    /// databases have, e.g. 12) must round-trip through open_from_bytes.
+    #[test]
+    fn test_open_from_bytes_nonzero_reserved_space() {
+        let mut db_header = DatabaseHeader::default();
+        db_header.update_page_size(4096);
+        db_header.reserved_space = 12;
+
+        let page1 = allocate_page(
+            1,
+            &Rc::new(BufferPool::new(db_header.get_page_size() as usize)),
+            DATABASE_HEADER_SIZE,
+        );
+        let page1 = Arc::new(BTreePageInner {
+            page: RefCell::new(page1),
+        });
+        btree_init_page(
+            &page1,
+            storage::sqlite3_ondisk::PageType::TableLeaf,
+            DATABASE_HEADER_SIZE,
+            (db_header.get_page_size() - db_header.reserved_space as u32) as u16,
+        );
+        let page1 = page1.get();
+        let contents = page1.get().contents.as_mut().expect("page1 contents");
+        contents.write_database_header(&db_header);
+        let image = contents.buffer.clone().borrow().as_slice().to_vec();
+        assert_eq!(image[20], 12, "reserved_space byte at offset 20");
+
+        let db = Database::open_from_bytes(&image, false).expect("open reserved_space=12");
+        let conn = db.connect().expect("connect");
+        exec(&conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+        exec(&conn, "INSERT INTO t (id, v) VALUES (1, 'hello')");
+        assert_eq!(scalar_text(&conn, "SELECT v FROM t WHERE id = 1"), "hello");
     }
 }

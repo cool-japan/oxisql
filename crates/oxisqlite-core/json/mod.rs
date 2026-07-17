@@ -383,17 +383,22 @@ fn jsonb_extract_internal(value: Jsonb, paths: &[Register]) -> crate::Result<(Js
     let mut json = value;
     let mut result = Jsonb::make_empty_array(json.len());
 
-    // TODO: make an op to avoid creating new json for every path element
     let paths = paths
         .iter()
         .map(|p| json_path_from_owned_value(p.get_owned_value(), true));
+
+    // Reuse a single scratch `SearchOperation` (and its backing buffer) across every path
+    // element instead of allocating a fresh `json.len()`-sized one per path: `clear()` resets
+    // its contents while keeping the buffer's capacity, so the whole loop only pays for
+    // allocation once (plus reallocation if some path's extracted fragment ever outgrows the
+    // capacity reserved up front), rather than once per path.
+    let mut op = SearchOperation::new(json.len());
     for path in paths {
         if let Some(path) = path? {
-            let mut op = SearchOperation::new(json.len());
+            op.clear();
             let res = json.operate_on_path(&path, &mut op);
-            let extracted = op.result();
             if res.is_ok() {
-                result.append_to_array_unsafe(&extracted.data());
+                result.append_to_array_unsafe(op.data());
             } else {
                 result.append_to_array_unsafe(JsonbHeader::make_null().into_bytes().as_bytes());
             }
@@ -938,6 +943,36 @@ mod tests {
         match result {
             Ok(Value::Null) => (),
             _ => panic!("Expected null result, got: {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_json_extract_multiple_paths_reuses_scratch_buffer() {
+        // Perf-only change (see `jsonb_extract_internal`): a single `SearchOperation` scratch
+        // buffer is now reused (cleared) across path elements instead of allocating a fresh one
+        // per path. This confirms the observable behavior is unchanged, including a missing
+        // path still rendering as a JSON `null` alongside successfully-extracted values of
+        // different element types (int, string, array, object). Verified against real sqlite3
+        // 3.51.0: `SELECT json_extract('{...}', '$.a', '$.missing', '$.b', '$.c');`.
+        let json_cache = JsonCacheCell::new();
+        let result = json_extract(
+            &Value::build_text(r#"{"a":1,"b":"hello","c":[1,2],"d":{"x":9}}"#),
+            &[
+                Register::Value(Value::build_text("$.a")),
+                Register::Value(Value::build_text("$.missing")),
+                Register::Value(Value::build_text("$.b")),
+                Register::Value(Value::build_text("$.c")),
+                Register::Value(Value::build_text("$.d")),
+            ],
+            &json_cache,
+        )
+        .unwrap();
+
+        match result {
+            Value::Text(t) => {
+                assert_eq!(t.as_str(), r#"[1,null,"hello",[1,2],{"x":9}]"#);
+            }
+            other => panic!("Expected JSON array text, got: {:?}", other),
         }
     }
 

@@ -2,27 +2,29 @@
 
 ## Status
 
-**Stable** · version 0.3.2 · **114 tests**.
+**Stable** · version 0.3.3 · **155 tests** (142 unit + 13 doc).
 
 Core traits and types are fully implemented and shared by every OxiSQL backend.
 `Connection` / `Transaction` / `ConnectionPool` / `PreparedStatement` async
-traits; the 13-variant `Value` enum; `Row` / `RowSet`; `FromValue` /
+traits; the 14-variant `Value` enum; `Row` / `RowSet`; `FromValue` /
 `ToSqlValue`; `OxiSqlError` (11 variants); `Cursor`; `Migrator`; `TypeRegistry`
-+ `SqlType`; the `params` named-parameter module; query builders; and the
-logging / metrics / retry middleware. **No feature flags. Zero `unsafe`.**
++ `SqlType`; the `params` named-parameter module; query builders; `SqlWarning`
+/ `last_warnings()`; and the logging / metrics / retry / tracing middleware.
+Zero `unsafe`; default build has no feature flags enabled (`chrono` / `time` /
+`tracing` are opt-in — see Roadmap below).
 
 ## Done
 
 ### Traits
-- [x] `Connection` async trait — `execute`, `query`, `execute_named`, `query_named`, `transaction`, `execute_batch`, `ping`, `prepare`, `tables`, `columns`, `indexes`, `foreign_keys`, `query_stream`
+- [x] `Connection` async trait — `execute`, `query`, `execute_named`, `query_named`, `transaction`, `execute_batch`, `ping`, `prepare`, `tables`, `columns`, `indexes`, `foreign_keys`, `query_stream`, `last_warnings`
 - [x] `Transaction` async trait — `execute`, `query`, `commit`, `rollback`, `savepoint`, `release_savepoint`, `rollback_to_savepoint`
 - [x] `ConnectionPool` object-safe trait — `get`, `pool_size`, `idle_count`, `active_count`, `health_check`, `close`
 - [x] `PreparedStatement` — compiled statement for repeated execution
-- [x] `Migrator` async trait — `apply`, `rollback`, `status`, `pending`
+- [x] `Migrator` async trait — `apply`, `rollback`, `status`, `pending`; `status`/`pending` return `MigrationInfo` (`version`, `name`, `status: MigrationStatus`, `applied_at`)
 - [x] Trait object-safety verified for `Connection` across embedded / postgres / mysql backends
 
 ### Value model
-- [x] `Value` enum, 13 variants: `Null`, `Bool`, `I64`, `F64`, `Text`, `Blob`, `Decimal`, `Timestamp`, `Date`, `Time`, `Uuid`, `Json`, `Array`
+- [x] `Value` enum, 14 variants: `Null`, `Bool`, `I64`, `F64`, `Text`, `Blob`, `Decimal`, `Timestamp`, `Date`, `Time`, `Uuid`, `Json`, `Array`, `TypedArray { element_type: ArrayElementType, values }`
 - [x] `Display`, `PartialOrd` (cross-type → `None`), and `From<…>` ergonomic constructors for `Value`
 - [x] `Row` with O(1) `HashMap` column index, `try_get::<T: FromValue>`, `get` / `get_by_index`, `is_null`, `column_count`, `into_values`, `columns`
 - [x] `RowSet` wrapper with `len` / `is_empty` / `column_count` / `columns` / `rows` / `into_rows` / `from_rows`
@@ -32,6 +34,7 @@ logging / metrics / retry middleware. **No feature flags. Zero `unsafe`.**
 ### Errors
 - [x] `OxiSqlError`, 11 variants: `Parse`, `Execution`, `NotConnected`, `TypeMismatch { expected, got }`, `ConstraintViolation`, `Timeout`, `ConnectionPool`, `Migration`, `UnsupportedUri`, `Params`, `Other`
 - [x] `Display` for every error variant
+- [x] `SqlWarning` / `SqlWarningLevel` (`Note`/`Warning`/`Error`) + `parse_warning_level` — non-fatal SQL warnings surfaced via `Connection::last_warnings()` (MySQL `SHOW WARNINGS`)
 
 ### Named parameters
 - [x] `execute_named` / `query_named` default methods on `Connection`
@@ -65,7 +68,7 @@ logging / metrics / retry middleware. **No feature flags. Zero `unsafe`.**
   - **Files:** `src/value.rs`, `Cargo.toml` (workspace root + crate)
   - **Tests:** round-trip `Value::Date → chrono::NaiveDate → Value::Date`; same for `time::Date`; error on type mismatch.
   - **Risk:** Low — purely additive, feature-gated. Verify no C dep enters (chrono/time are Pure Rust).
-- [x] `Value::Array` element-type metadata for richer Postgres array round-trips
+- [x] `Value::Array` element-type metadata for richer Postgres array round-trips — shipped as `Value::TypedArray { element_type: ArrayElementType, values }` (16-variant `#[non_exhaustive]` `ArrayElementType`)
 - [x] Streaming `Transaction::query_stream` to mirror `Connection::query_stream` (done 2026-06-10)
   - **Goal:** Callers can iterate a `Transaction`'s results as a `Stream` with the same API as `Connection::query_stream`.
   - **Design:** Add `fn query_stream<'a>(&'a mut self, sql: &'a str, params: &'a [&'a dyn ToSqlValue]) -> Pin<Box<dyn Stream<Item=Result<Row, OxiSqlError>> + Send + 'a>>` to the `Transaction` trait with a default body identical to `Connection::query_stream` (traits.rs:248-259) but using `self.query(...)`. Object-safe: lifetime-only generic, `&mut self`, no `Self` in sig. All 9 `impl Transaction` sites inherit the default — zero backend edits.
@@ -84,6 +87,7 @@ logging / metrics / retry middleware. **No feature flags. Zero `unsafe`.**
   - **Risk:** Low — additive feature gate. `tracing` is Pure Rust.
 
 ## Known limitations
-None. `oxisql-core` is the stable foundation crate: no feature flags, zero
-`unsafe`, and a complete trait/type surface. Backend-specific caveats live in
-the respective backend crates, not here.
+None. `oxisql-core` is the stable foundation crate: no feature flags enabled
+by default (`chrono` / `time` / `tracing` are opt-in), zero `unsafe`, and a
+complete trait/type surface. Backend-specific caveats live in the respective
+backend crates, not here.

@@ -24,6 +24,7 @@ pub use value::Value;
 pub use params::params_from_iter;
 
 use crate::params::*;
+use std::borrow::Cow;
 use std::fmt::Debug;
 use std::num::NonZero;
 use std::sync::{Arc, Mutex};
@@ -113,6 +114,29 @@ impl Database {
             inner: Arc::new(Mutex::new(conn)),
         };
         Ok(connection)
+    }
+
+    /// Open an in-memory database preloaded from an existing SQLite database
+    /// image `bytes` (e.g. the output of `include_bytes!`, `VACUUM INTO`, or
+    /// `sqlite3_serialize()`).
+    ///
+    /// Mirrors rusqlite's `Connection::deserialize` / SQLite's
+    /// `sqlite3_deserialize()`. Unlike [`Builder::build`], this is synchronous
+    /// because no real I/O occurs — the bytes are copied into an in-memory
+    /// page store. The returned [`Database`] can be [`connect`]ed multiple
+    /// times, and all connections share the same preloaded image.
+    ///
+    /// [`connect`]: Database::connect
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SqlExecutionFailure`] if `bytes` is not a valid SQLite
+    /// database image (too short, wrong magic, or an invalid page size in the
+    /// header). Never panics on malformed input.
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub fn open_from_bytes(bytes: &[u8]) -> Result<Database> {
+        let inner = limbo_core::Database::open_from_bytes(bytes, false)?;
+        Ok(Database { inner })
     }
 }
 
@@ -224,7 +248,7 @@ impl Statement {
                     }
                 }
             }
-            params::Params::Named(_items) => todo!(),
+            params::Params::Named(items) => self.bind_named_params(items)?,
         }
         #[allow(clippy::arc_with_non_send_sync)]
         let rows = Rows {
@@ -255,7 +279,7 @@ impl Statement {
                     }
                 }
             }
-            params::Params::Named(_items) => todo!(),
+            params::Params::Named(items) => self.bind_named_params(items)?,
         }
         loop {
             let mut stmt = self
@@ -285,6 +309,40 @@ impl Statement {
                 }
             }
         }
+    }
+
+    /// Bind a set of named parameters (`:name`, `@name`, `$name`, or
+    /// `#name` placeholders — prefix character included, exactly as it
+    /// appears in the compiled SQL) against this prepared statement.
+    ///
+    /// Each `name` is resolved to its 1-based bind index through
+    /// `limbo_core::Statement::parameters()` /
+    /// `limbo_core::parameters::Parameters::index`, then bound via the exact
+    /// same `limbo_core::Statement::bind_at` path already used by the
+    /// sibling [`params::Params::Positional`] arm. Shared by
+    /// [`Statement::query`] and [`Statement::execute`], the two call sites
+    /// that accept [`params::Params::Named`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SqlExecutionFailure`] if `name` does not match any
+    /// placeholder recorded in the prepared statement (e.g. a typo, or a
+    /// name for a placeholder absent from the compiled SQL) — the bind is
+    /// rejected outright rather than silently skipped.
+    fn bind_named_params(&self, items: Vec<(Cow<'static, str>, Value)>) -> Result<()> {
+        let mut stmt = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        for (name, value) in items {
+            let idx = stmt.parameters().index(name.as_ref()).ok_or_else(|| {
+                Error::SqlExecutionFailure(format!(
+                    "no bind parameter named `{name}` in this prepared statement"
+                ))
+            })?;
+            stmt.bind_at(idx, value.into());
+        }
+        Ok(())
     }
 
     pub fn columns(&self) -> Vec<Column> {
@@ -1511,5 +1569,320 @@ mod tests {
             0
         );
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Named parameters (`:name` / `@name` / `$name` / `#name`).
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_named_params_colon_prefix_round_trip() -> Result<()> {
+        let db = Builder::new_local(":memory:").build().await?;
+        let conn = db.connect()?;
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+            (),
+        )
+        .await?;
+
+        // Heterogeneous named params via tuple syntax.
+        conn.execute(
+            "INSERT INTO t (id, name) VALUES (:id, :name);",
+            ((":id", 1i64), (":name", "Alice")),
+        )
+        .await?;
+
+        let mut rows = conn
+            .query("SELECT name FROM t WHERE id = :id;", [(":id", 1i64)])
+            .await?;
+        let row = rows.next().await?.expect("expected one row");
+        assert_eq!(row.get_value(0)?, Value::Text("Alice".to_string()));
+        assert!(rows.next().await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_named_params_at_prefix_round_trip() -> Result<()> {
+        let db = Builder::new_local(":memory:").build().await?;
+        let conn = db.connect()?;
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+            (),
+        )
+        .await?;
+
+        conn.execute(
+            "INSERT INTO t (id, name) VALUES (@id, @name);",
+            (("@id", 1i64), ("@name", "Bob")),
+        )
+        .await?;
+
+        let mut rows = conn
+            .query("SELECT name FROM t WHERE id = @id;", [("@id", 1i64)])
+            .await?;
+        let row = rows.next().await?.expect("expected one row");
+        assert_eq!(row.get_value(0)?, Value::Text("Bob".to_string()));
+        assert!(rows.next().await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_named_params_dollar_prefix_round_trip() -> Result<()> {
+        let db = Builder::new_local(":memory:").build().await?;
+        let conn = db.connect()?;
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+            (),
+        )
+        .await?;
+
+        conn.execute(
+            "INSERT INTO t (id, name) VALUES ($id, $name);",
+            (("$id", 1i64), ("$name", "Carol")),
+        )
+        .await?;
+
+        let mut rows = conn
+            .query("SELECT name FROM t WHERE id = $id;", [("$id", 1i64)])
+            .await?;
+        let row = rows.next().await?.expect("expected one row");
+        assert_eq!(row.get_value(0)?, Value::Text("Carol".to_string()));
+        assert!(rows.next().await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_named_params_hash_prefix_round_trip() -> Result<()> {
+        let db = Builder::new_local(":memory:").build().await?;
+        let conn = db.connect()?;
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+            (),
+        )
+        .await?;
+
+        conn.execute(
+            "INSERT INTO t (id, name) VALUES (#id, #name);",
+            (("#id", 1i64), ("#name", "Dave")),
+        )
+        .await?;
+
+        let mut rows = conn
+            .query("SELECT name FROM t WHERE id = #id;", [("#id", 1i64)])
+            .await?;
+        let row = rows.next().await?.expect("expected one row");
+        assert_eq!(row.get_value(0)?, Value::Text("Dave".to_string()));
+        assert!(rows.next().await?.is_none());
+
+        Ok(())
+    }
+
+    /// The same named placeholder used twice in one statement resolves to
+    /// the same bind index (SQLite semantics): binding it once must satisfy
+    /// both occurrences.
+    #[tokio::test]
+    async fn test_named_params_repeated_placeholder_shares_value() -> Result<()> {
+        let db = Builder::new_local(":memory:").build().await?;
+        let conn = db.connect()?;
+
+        let mut rows = conn
+            .query("SELECT :x + :x AS doubled;", [(":x", 21i64)])
+            .await?;
+        let row = rows.next().await?.expect("expected one row");
+        assert_eq!(row.get_value(0)?, Value::Integer(42));
+        assert!(rows.next().await?.is_none());
+
+        Ok(())
+    }
+
+    /// Homogeneous const-array named-parameter syntax (`[(":a", v), ...]`)
+    /// exercises the zero-allocation `&'static str` key path (the
+    /// `[(&'static str, T); N]` `IntoParams` impl) with more than one pair.
+    #[tokio::test]
+    async fn test_named_params_array_literal_multi() -> Result<()> {
+        let db = Builder::new_local(":memory:").build().await?;
+        let conn = db.connect()?;
+        conn.execute("CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);", ())
+            .await?;
+
+        conn.execute(
+            "INSERT INTO t (a, b, c) VALUES (:a, :b, :c);",
+            [(":a", 1i64), (":b", 2i64), (":c", 3i64)],
+        )
+        .await?;
+
+        let mut rows = conn.query("SELECT a, b, c FROM t;", ()).await?;
+        let row = rows.next().await?.expect("expected one row");
+        assert_eq!(row.get_value(0)?, Value::Integer(1));
+        assert_eq!(row.get_value(1)?, Value::Integer(2));
+        assert_eq!(row.get_value(2)?, Value::Integer(3));
+        assert!(rows.next().await?.is_none());
+
+        Ok(())
+    }
+
+    /// Owned `String` keys (the non-`'static` path, e.g. built at runtime)
+    /// still bind correctly through the `Vec<(String, T)>` `IntoParams` impl
+    /// — the `Cow::Owned` branch of `Params::Named`.
+    #[tokio::test]
+    async fn test_named_params_owned_string_keys() -> Result<()> {
+        let db = Builder::new_local(":memory:").build().await?;
+        let conn = db.connect()?;
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);", ())
+            .await?;
+
+        let key = String::from(":id");
+        conn.execute("INSERT INTO t (id) VALUES (:id);", vec![(key, 7i64)])
+            .await?;
+
+        assert_eq!(query_scalar_i64(&conn, "SELECT id FROM t;").await?, 7);
+
+        Ok(())
+    }
+
+    /// Binding a name that doesn't match any placeholder in the prepared
+    /// statement must be a clear, catchable error — never a panic, and never
+    /// a silent no-op that leaves the placeholder unbound.
+    #[tokio::test]
+    async fn test_named_param_unknown_name_errors() -> Result<()> {
+        let db = Builder::new_local(":memory:").build().await?;
+        let conn = db.connect()?;
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);", ())
+            .await?;
+
+        let result = conn
+            .execute("INSERT INTO t (id) VALUES (:id);", [(":nope", 1i64)])
+            .await;
+        assert!(
+            result.is_err(),
+            "binding an unknown named parameter must error, not silently no-op"
+        );
+        if let Err(e) = result {
+            let msg = e.to_string();
+            assert!(
+                msg.contains(":nope"),
+                "error should name the offending parameter, got: {msg}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A named parameter that IS declared in the SQL but never bound must
+    /// still error at the unknown-name check for any name the caller tries
+    /// to bind that the statement doesn't recognize (typo protection), while
+    /// a `query`-side (as opposed to `execute`-side) unknown name must also
+    /// error rather than silently succeed with a bogus/absent binding.
+    #[tokio::test]
+    async fn test_named_param_unknown_name_errors_on_query() -> Result<()> {
+        let db = Builder::new_local(":memory:").build().await?;
+        let conn = db.connect()?;
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);", ())
+            .await?;
+        conn.execute("INSERT INTO t (id) VALUES (1);", ()).await?;
+
+        let result = conn
+            .query("SELECT id FROM t WHERE id = :id;", [(":typo", 1i64)])
+            .await;
+        assert!(
+            result.is_err(),
+            "query()-side unknown named parameter must error, not silently no-op"
+        );
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod open_from_bytes_tests {
+    //! Tests for [`Database::open_from_bytes`] at the engine-wrapper layer,
+    //! including multi-connection shared visibility over a single preloaded
+    //! in-memory image.
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    /// Produce a populated database image by writing through the engine into a
+    /// temp file, checkpointing, and reading the bytes back.
+    async fn build_bytes() -> Result<Vec<u8>> {
+        let temp = NamedTempFile::new().expect("temp file");
+        let path = temp.path().to_str().expect("utf-8 path").to_string();
+        {
+            let db = Builder::new_local(&path).build().await?;
+            let conn = db.connect()?;
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);", ())
+                .await?;
+            conn.execute("INSERT INTO t (id, v) VALUES (1, 'one'), (2, 'two');", ())
+                .await?;
+            conn.execute("PRAGMA wal_checkpoint;", ()).await?;
+        }
+        Ok(std::fs::read(&path).expect("read db bytes"))
+    }
+
+    async fn count(conn: &Connection) -> Result<i64> {
+        let mut rows = conn.query("SELECT count(*) FROM t;", ()).await?;
+        let row = rows.next().await?.expect("count row");
+        match row.get_value(0)? {
+            Value::Integer(i) => Ok(i),
+            other => panic!("expected integer, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_open_from_bytes_round_trip() -> Result<()> {
+        let bytes = build_bytes().await?;
+        let db = Database::open_from_bytes(&bytes)?;
+        let conn = db.connect()?;
+        assert_eq!(count(&conn).await?, 2);
+        Ok(())
+    }
+
+    /// Multiple connections opened from the same preloaded [`Database`] share
+    /// the underlying in-memory image. A write committed on one connection is
+    /// visible to a *newly opened* connection, mirroring the shared-storage
+    /// behavior of the `":memory:"` path. A connection that already
+    /// established a read snapshot keeps that snapshot (SQLite-style read
+    /// isolation) — this behavior is pinned explicitly below.
+    #[tokio::test]
+    async fn test_open_from_bytes_shared_across_connections() -> Result<()> {
+        let bytes = build_bytes().await?;
+        let db = Database::open_from_bytes(&bytes)?;
+        let writer = db.connect()?;
+        let reader = db.connect()?;
+
+        // Both connections start from the same 2-row image.
+        assert_eq!(count(&reader).await?, 2);
+
+        writer
+            .execute("INSERT INTO t (id, v) VALUES (3, 'three');", ())
+            .await?;
+
+        // The writer observes its own committed write.
+        assert_eq!(count(&writer).await?, 3);
+
+        // The reader that already took a read snapshot retains it.
+        assert_eq!(
+            count(&reader).await?,
+            2,
+            "an existing read snapshot is isolated from a later commit"
+        );
+
+        // A freshly opened connection sees the committed write, proving the
+        // image is genuinely shared (not a private per-connection copy).
+        let fresh = db.connect()?;
+        assert_eq!(
+            count(&fresh).await?,
+            3,
+            "a new connection must observe the committed write"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_open_from_bytes_invalid_is_err() {
+        assert!(Database::open_from_bytes(&[]).is_err());
+        assert!(Database::open_from_bytes(&[0xFFu8; 4096]).is_err());
     }
 }

@@ -8,6 +8,15 @@ use crate::{
 
 use super::*;
 
+// Slice wave-ac-5-btree-cursor-pageops regression tests: page-corruption
+// detection in `page_ops.rs` and the MVCC `count()` implementation in
+// `cursor_nav.rs`. Kept as separate files (rather than appended into
+// `tests_2` below) to keep this module's line count away from the 2000-line
+// policy ceiling; `get_page`/`empty_btree` are exposed as `pub(super)` from
+// `tests_2` so these siblings can reuse them instead of duplicating setup.
+mod mvcc_count;
+mod page_corruption;
+
 #[cfg(test)]
 mod tests_2 {
     use super::*;
@@ -48,7 +57,7 @@ mod tests_2 {
     use tempfile::TempDir;
     use test_log::test;
     #[allow(clippy::arc_with_non_send_sync)]
-    fn get_page(id: usize) -> BTreePage {
+    pub(super) fn get_page(id: usize) -> BTreePage {
         let page = Arc::new(Page::new(id));
         let drop_fn = Rc::new(|_| {});
         let inner = PageContent::new(
@@ -78,12 +87,14 @@ mod tests_2 {
         db
     }
     fn ensure_cell(page: &mut PageContent, cell_idx: usize, payload: &Vec<u8>) {
-        let cell = page.cell_get_raw_region(
-            cell_idx,
-            payload_overflow_threshold_max(page.page_type(), 4096),
-            payload_overflow_threshold_min(page.page_type(), 4096),
-            4096,
-        );
+        let cell = page
+            .cell_get_raw_region(
+                cell_idx,
+                payload_overflow_threshold_max(page.page_type(), 4096),
+                payload_overflow_threshold_min(page.page_type(), 4096),
+                4096,
+            )
+            .unwrap();
         tracing::trace!("cell idx={} start={} len={}", cell_idx, cell.0, cell.1);
         let buf = &page.as_ptr()[cell.0..cell.0 + cell.1];
         assert_eq!(buf.len(), payload.len());
@@ -104,7 +115,8 @@ mod tests_2 {
             &record,
             4096,
             conn.pager.clone(),
-        );
+        )
+        .unwrap();
         insert_into_cell(page, &payload, pos, 4096).unwrap();
         payload
     }
@@ -114,12 +126,12 @@ mod tests_2 {
         let conn = db.connect().unwrap();
         let page = get_page(2);
         let page = page.get();
-        let page = page.get_contents();
+        let page = page.get_contents_mut();
         let header_size = 8;
         let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(1))]);
         let payload = add_record(1, 0, page, record, &conn);
         assert_eq!(page.cell_count(), 1);
-        let free = compute_free_space(page, 4096);
+        let free = compute_free_space(page, 4096).unwrap();
         assert_eq!(free, 4096 - payload.len() as u16 - 2 - header_size);
         let cell_idx = 0;
         ensure_cell(page, cell_idx, &payload);
@@ -134,7 +146,7 @@ mod tests_2 {
         let conn = db.connect().unwrap();
         let page = get_page(2);
         let page = page.get();
-        let page = page.get_contents();
+        let page = page.get_contents_mut();
         let header_size = 8;
         let mut total_size = 0;
         let mut cells = Vec::new();
@@ -144,7 +156,7 @@ mod tests_2 {
                 ImmutableRecord::from_registers(&[Register::Value(Value::Integer(i as i64))]);
             let payload = add_record(i, i, page, record, &conn);
             assert_eq!(page.cell_count(), i + 1);
-            let free = compute_free_space(page, usable_space);
+            let free = compute_free_space(page, usable_space).unwrap();
             total_size += payload.len() as u16 + 2;
             assert_eq!(free, 4096 - total_size - header_size);
             cells.push(Cell { pos: i, payload });
@@ -250,7 +262,7 @@ mod tests_2 {
             while p.get().is_locked() {
                 pager.io.run_once().unwrap();
             }
-            p.get().get_contents().page_type()
+            p.get().get_contents_mut().page_type()
         });
         if let Some(child_type) = first_page_type {
             for page in child_pages.iter().skip(1) {
@@ -261,7 +273,7 @@ mod tests_2 {
                 while page.get().is_locked() {
                     pager.io.run_once().unwrap();
                 }
-                if page.get().get_contents().page_type() != child_type {
+                if page.get().get_contents_mut().page_type() != child_type {
                     tracing::error!("child pages have different types");
                     valid = false;
                 }
@@ -335,7 +347,7 @@ mod tests_2 {
             current + "\n" + &child.join("\n")
         }
     }
-    fn empty_btree() -> (Rc<Pager>, usize) {
+    pub(super) fn empty_btree() -> (Rc<Pager>, usize) {
         let db_header = DatabaseHeader::default();
         let page_size = db_header.get_page_size();
         #[allow(clippy::arc_with_non_send_sync)]
@@ -714,7 +726,7 @@ mod tests_2 {
         let conn = db.connect().unwrap();
         let page = get_page(2);
         let page = page.get();
-        let page = page.get_contents();
+        let page = page.get_contents_mut();
         let header_size = 8;
         let mut total_size = 0;
         let mut cells = Vec::new();
@@ -725,7 +737,7 @@ mod tests_2 {
                 ImmutableRecord::from_registers(&[Register::Value(Value::Integer(i as i64))]);
             let payload = add_record(i, i, page, record, &conn);
             assert_eq!(page.cell_count(), i + 1);
-            let free = compute_free_space(page, usable_space);
+            let free = compute_free_space(page, usable_space).unwrap();
             total_size += payload.len() as u16 + 2;
             assert_eq!(free, 4096 - total_size - header_size);
             cells.push(Cell { pos: i, payload });
@@ -886,7 +898,7 @@ mod tests_2 {
             }
             {
                 let page = page.get();
-                let contents = page.get_contents();
+                let contents = page.get_contents_mut();
                 let next_page = if current_page < 4 {
                     current_page + 1
                 } else {
@@ -983,8 +995,8 @@ mod tests_2 {
         {
             btree_init_page(&root_page, PageType::TableInterior, 0, 512);
         }
-        let page3 = cursor.allocate_page(PageType::TableLeaf, 0);
-        let page4 = cursor.allocate_page(PageType::TableLeaf, 0);
+        let page3 = cursor.allocate_page(PageType::TableLeaf, 0)?;
+        let page4 = cursor.allocate_page(PageType::TableLeaf, 0)?;
         {
             let root_page = root_page.get();
             let contents = root_page.get().contents.as_mut().unwrap();
@@ -1022,7 +1034,7 @@ mod tests_2 {
         let conn = db.connect().unwrap();
         let page = get_page(2);
         let page = page.get();
-        let page = page.get_contents();
+        let page = page.get_contents_mut();
         let header_size = 8;
         let mut total_size = 0;
         let mut cells = Vec::new();
@@ -1032,7 +1044,7 @@ mod tests_2 {
                 ImmutableRecord::from_registers(&[Register::Value(Value::Integer(i as i64))]);
             let payload = add_record(i, i, page, record, &conn);
             assert_eq!(page.cell_count(), i + 1);
-            let free = compute_free_space(page, usable_space);
+            let free = compute_free_space(page, usable_space).unwrap();
             total_size += payload.len() as u16 + 2;
             assert_eq!(free, 4096 - total_size - header_size);
             cells.push(Cell { pos: i, payload });
@@ -1045,7 +1057,7 @@ mod tests_2 {
         for (i, cell) in cells.iter().enumerate() {
             ensure_cell(page, i, &cell.payload);
         }
-        defragment_page(page, usable_space);
+        defragment_page(page, usable_space).unwrap();
         for (i, cell) in cells.iter().enumerate() {
             ensure_cell(page, i, &cell.payload);
         }
@@ -1056,7 +1068,7 @@ mod tests_2 {
         let conn = db.connect().unwrap();
         let page = get_page(2);
         let page = page.get();
-        let page = page.get_contents();
+        let page = page.get_contents_mut();
         let header_size = 8;
         let mut total_size = 0;
         let mut cells = Vec::new();
@@ -1067,7 +1079,7 @@ mod tests_2 {
                 ImmutableRecord::from_registers(&[Register::Value(Value::Integer(i as i64))]);
             let payload = add_record(i, i, page, record, &conn);
             assert_eq!(page.cell_count(), i + 1);
-            let free = compute_free_space(page, usable_space);
+            let free = compute_free_space(page, usable_space).unwrap();
             total_size += payload.len() as u16 + 2;
             assert_eq!(free, 4096 - total_size - header_size);
             cells.push(Cell { pos: i, payload });
@@ -1086,7 +1098,7 @@ mod tests_2 {
         for (i, cell) in cells.iter().enumerate() {
             ensure_cell(page, i, &cell.payload);
         }
-        defragment_page(page, usable_space);
+        defragment_page(page, usable_space).unwrap();
         for (i, cell) in cells.iter().enumerate() {
             ensure_cell(page, i, &cell.payload);
         }
@@ -1097,7 +1109,7 @@ mod tests_2 {
         let conn = db.connect().unwrap();
         let page = get_page(2);
         let page = page.get();
-        let page = page.get_contents();
+        let page = page.get_contents_mut();
         let header_size = 8;
         let mut total_size = 0;
         let mut cells = Vec::new();
@@ -1111,7 +1123,7 @@ mod tests_2 {
             match rng.next_u64() % 4 {
                 0 => {
                     let cell_idx = rng.next_u64() as usize % (page.cell_count() + 1);
-                    let free = compute_free_space(page, usable_space);
+                    let free = compute_free_space(page, usable_space).unwrap();
                     let record = ImmutableRecord::from_registers(&[Register::Value(
                         Value::Integer(i as i64),
                     )]);
@@ -1123,7 +1135,8 @@ mod tests_2 {
                         &record,
                         4096,
                         conn.pager.clone(),
-                    );
+                    )
+                    .unwrap();
                     if (free as usize) < payload.len() + 2 {
                         continue;
                     }
@@ -1137,18 +1150,20 @@ mod tests_2 {
                         continue;
                     }
                     let cell_idx = rng.next_u64() as usize % page.cell_count();
-                    let (_, len) = page.cell_get_raw_region(
-                        cell_idx,
-                        payload_overflow_threshold_max(page.page_type(), 4096),
-                        payload_overflow_threshold_min(page.page_type(), 4096),
-                        usable_space as usize,
-                    );
+                    let (_, len) = page
+                        .cell_get_raw_region(
+                            cell_idx,
+                            payload_overflow_threshold_max(page.page_type(), 4096),
+                            payload_overflow_threshold_min(page.page_type(), 4096),
+                            usable_space as usize,
+                        )
+                        .unwrap();
                     drop_cell(page, cell_idx, usable_space).unwrap();
                     total_size -= len as u16 + 2;
                     cells.remove(cell_idx);
                 }
                 2 => {
-                    defragment_page(page, usable_space);
+                    defragment_page(page, usable_space).unwrap();
                 }
                 3 => {
                     for (i, cell) in cells.iter().enumerate() {
@@ -1158,7 +1173,7 @@ mod tests_2 {
                 }
                 _ => unreachable!(),
             }
-            let free = compute_free_space(page, usable_space);
+            let free = compute_free_space(page, usable_space).unwrap();
             assert_eq!(free, 4096 - total_size - header_size);
         }
     }
@@ -1168,7 +1183,7 @@ mod tests_2 {
         let conn = db.connect().unwrap();
         let page = get_page(2);
         let page = page.get();
-        let page = page.get_contents();
+        let page = page.get_contents_mut();
         let header_size = 8;
         let mut total_size = 0;
         let mut cells = Vec::new();
@@ -1182,7 +1197,7 @@ mod tests_2 {
                 match rng.next_u64() % 3 {
                     0 => {
                         let cell_idx = rng.next_u64() as usize % (page.cell_count() + 1);
-                        let free = compute_free_space(page, usable_space);
+                        let free = compute_free_space(page, usable_space).unwrap();
                         let record = ImmutableRecord::from_registers(&[Register::Value(
                             Value::Integer(i as i64),
                         )]);
@@ -1194,7 +1209,8 @@ mod tests_2 {
                             &record,
                             4096,
                             conn.pager.clone(),
-                        );
+                        )
+                        .unwrap();
                         if (free as usize) < payload.len() - 2 {
                             continue;
                         }
@@ -1211,22 +1227,24 @@ mod tests_2 {
                             continue;
                         }
                         let cell_idx = rng.next_u64() as usize % page.cell_count();
-                        let (_, len) = page.cell_get_raw_region(
-                            cell_idx,
-                            payload_overflow_threshold_max(page.page_type(), 4096),
-                            payload_overflow_threshold_min(page.page_type(), 4096),
-                            usable_space as usize,
-                        );
+                        let (_, len) = page
+                            .cell_get_raw_region(
+                                cell_idx,
+                                payload_overflow_threshold_max(page.page_type(), 4096),
+                                payload_overflow_threshold_min(page.page_type(), 4096),
+                                usable_space as usize,
+                            )
+                            .unwrap();
                         drop_cell(page, cell_idx, usable_space).unwrap();
                         total_size -= len as u16 + 2;
                         cells.remove(cell_idx);
                     }
                     2 => {
-                        defragment_page(page, usable_space);
+                        defragment_page(page, usable_space).unwrap();
                     }
                     _ => unreachable!(),
                 }
-                let free = compute_free_space(page, usable_space);
+                let free = compute_free_space(page, usable_space).unwrap();
                 assert_eq!(free, 4096 - total_size - header_size);
             }
         }
@@ -1319,12 +1337,12 @@ mod tests_2 {
         let conn = db.connect().unwrap();
         let page = get_page(2);
         let page = page.get();
-        let page = page.get_contents();
+        let page = page.get_contents_mut();
         let header_size = 8;
         let usable_space = 4096;
         let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
         let payload = add_record(0, 0, page, record, &conn);
-        let free = compute_free_space(page, usable_space);
+        let free = compute_free_space(page, usable_space).unwrap();
         assert_eq!(free, 4096 - payload.len() as u16 - 2 - header_size);
     }
     #[test]
@@ -1333,19 +1351,21 @@ mod tests_2 {
         let conn = db.connect().unwrap();
         let page = get_page(2);
         let page = page.get();
-        let page = page.get_contents();
+        let page = page.get_contents_mut();
         let usable_space = 4096;
         let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
         let payload = add_record(0, 0, page, record, &conn);
         assert_eq!(page.cell_count(), 1);
-        defragment_page(page, usable_space);
+        defragment_page(page, usable_space).unwrap();
         assert_eq!(page.cell_count(), 1);
-        let (start, len) = page.cell_get_raw_region(
-            0,
-            payload_overflow_threshold_max(page.page_type(), 4096),
-            payload_overflow_threshold_min(page.page_type(), 4096),
-            usable_space as usize,
-        );
+        let (start, len) = page
+            .cell_get_raw_region(
+                0,
+                payload_overflow_threshold_max(page.page_type(), 4096),
+                payload_overflow_threshold_min(page.page_type(), 4096),
+                usable_space as usize,
+            )
+            .unwrap();
         let buf = page.as_ptr();
         assert_eq!(&payload, &buf[start..start + len]);
     }
@@ -1355,7 +1375,7 @@ mod tests_2 {
         let conn = db.connect().unwrap();
         let page = get_page(2);
         let page = page.get();
-        let page = page.get_contents();
+        let page = page.get_contents_mut();
         let usable_space = 4096;
         let record = ImmutableRecord::from_registers(&[
             Register::Value(Value::Integer(0)),
@@ -1368,12 +1388,14 @@ mod tests_2 {
         let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
         let payload = add_record(0, 0, page, record, &conn);
         assert_eq!(page.cell_count(), 1);
-        let (start, len) = page.cell_get_raw_region(
-            0,
-            payload_overflow_threshold_max(page.page_type(), 4096),
-            payload_overflow_threshold_min(page.page_type(), 4096),
-            usable_space as usize,
-        );
+        let (start, len) = page
+            .cell_get_raw_region(
+                0,
+                payload_overflow_threshold_max(page.page_type(), 4096),
+                payload_overflow_threshold_min(page.page_type(), 4096),
+                usable_space as usize,
+            )
+            .unwrap();
         let buf = page.as_ptr();
         assert_eq!(&payload, &buf[start..start + len]);
     }
@@ -1383,7 +1405,7 @@ mod tests_2 {
         let conn = db.connect().unwrap();
         let page = get_page(2);
         let page = page.get();
-        let page = page.get_contents();
+        let page = page.get_contents_mut();
         let usable_space = 4096;
         let record = ImmutableRecord::from_registers(&[
             Register::Value(Value::Integer(0)),
@@ -1397,12 +1419,14 @@ mod tests_2 {
             let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
             let payload = add_record(0, 0, page, record, &conn);
             assert_eq!(page.cell_count(), 1);
-            let (start, len) = page.cell_get_raw_region(
-                0,
-                payload_overflow_threshold_max(page.page_type(), 4096),
-                payload_overflow_threshold_min(page.page_type(), 4096),
-                usable_space as usize,
-            );
+            let (start, len) = page
+                .cell_get_raw_region(
+                    0,
+                    payload_overflow_threshold_max(page.page_type(), 4096),
+                    payload_overflow_threshold_min(page.page_type(), 4096),
+                    usable_space as usize,
+                )
+                .unwrap();
             let buf = page.as_ptr();
             assert_eq!(&payload, &buf[start..start + len]);
         }
@@ -1413,7 +1437,7 @@ mod tests_2 {
         let conn = db.connect().unwrap();
         let page = get_page(2);
         let page = page.get();
-        let page = page.get_contents();
+        let page = page.get_contents_mut();
         let usable_space = 4096;
         let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
         let payload = add_record(0, 0, page, record, &conn);
@@ -1431,14 +1455,14 @@ mod tests_2 {
         let conn = db.connect().unwrap();
         let page = get_page(2);
         let page = page.get();
-        let page = page.get_contents();
+        let page = page.get_contents_mut();
         let usable_space = 4096;
         let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
         let _ = add_record(0, 0, page, record, &conn);
         let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
         let _ = add_record(0, 0, page, record, &conn);
         drop_cell(page, 0, usable_space).unwrap();
-        defragment_page(page, usable_space);
+        defragment_page(page, usable_space).unwrap();
         let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
         let _ = add_record(0, 1, page, record, &conn);
         drop_cell(page, 0, usable_space).unwrap();
@@ -1459,29 +1483,29 @@ mod tests_2 {
             drop_cell(page, pos, usable_space).unwrap();
         };
         let defragment = |page| {
-            defragment_page(page, usable_space);
+            defragment_page(page, usable_space).unwrap();
         };
         let page = page.get();
-        defragment(page.get_contents());
-        defragment(page.get_contents());
-        insert(0, page.get_contents());
-        drop(0, page.get_contents());
-        insert(0, page.get_contents());
-        drop(0, page.get_contents());
-        insert(0, page.get_contents());
-        defragment(page.get_contents());
-        defragment(page.get_contents());
-        drop(0, page.get_contents());
-        defragment(page.get_contents());
-        insert(0, page.get_contents());
-        drop(0, page.get_contents());
-        insert(0, page.get_contents());
-        insert(1, page.get_contents());
-        insert(1, page.get_contents());
-        insert(0, page.get_contents());
-        drop(3, page.get_contents());
-        drop(2, page.get_contents());
-        compute_free_space(page.get_contents(), usable_space);
+        defragment(page.get_contents_mut());
+        defragment(page.get_contents_mut());
+        insert(0, page.get_contents_mut());
+        drop(0, page.get_contents_mut());
+        insert(0, page.get_contents_mut());
+        drop(0, page.get_contents_mut());
+        insert(0, page.get_contents_mut());
+        defragment(page.get_contents_mut());
+        defragment(page.get_contents_mut());
+        drop(0, page.get_contents_mut());
+        defragment(page.get_contents_mut());
+        insert(0, page.get_contents_mut());
+        drop(0, page.get_contents_mut());
+        insert(0, page.get_contents_mut());
+        insert(1, page.get_contents_mut());
+        insert(1, page.get_contents_mut());
+        insert(0, page.get_contents_mut());
+        drop(3, page.get_contents_mut());
+        drop(2, page.get_contents_mut());
+        compute_free_space(page.get_contents_mut(), usable_space).unwrap();
     }
     #[test]
     pub fn test_fuzz_victim_3() {
@@ -1497,31 +1521,32 @@ mod tests_2 {
             drop_cell(page, pos, usable_space).unwrap();
         };
         let defragment = |page| {
-            defragment_page(page, usable_space);
+            defragment_page(page, usable_space).unwrap();
         };
         let record = ImmutableRecord::from_registers(&[Register::Value(Value::Integer(0))]);
         let mut payload: Vec<u8> = Vec::new();
         fill_cell_payload(
-            page.get().get_contents().page_type(),
+            page.get().get_contents_mut().page_type(),
             Some(0),
             &mut payload,
             &record,
             4096,
             conn.pager.clone(),
-        );
+        )
+        .unwrap();
         let page = page.get();
-        insert(0, page.get_contents());
-        defragment(page.get_contents());
-        insert(0, page.get_contents());
-        defragment(page.get_contents());
-        insert(0, page.get_contents());
-        drop(2, page.get_contents());
-        drop(0, page.get_contents());
-        let free = compute_free_space(page.get_contents(), usable_space);
+        insert(0, page.get_contents_mut());
+        defragment(page.get_contents_mut());
+        insert(0, page.get_contents_mut());
+        defragment(page.get_contents_mut());
+        insert(0, page.get_contents_mut());
+        drop(2, page.get_contents_mut());
+        drop(0, page.get_contents_mut());
+        let free = compute_free_space(page.get_contents_mut(), usable_space).unwrap();
         let total_size = payload.len() + 2;
         assert_eq!(
             free,
-            usable_space - page.get_contents().header_size() as u16 - total_size as u16
+            usable_space - page.get_contents_mut().header_size() as u16 - total_size as u16
         );
         dbg!(free);
     }
@@ -1573,19 +1598,20 @@ mod tests_2 {
             ImmutableRecord::from_registers(&[Register::Value(Value::Blob(vec![0; 3600]))]);
         let mut payload: Vec<u8> = Vec::new();
         fill_cell_payload(
-            page.get().get_contents().page_type(),
+            page.get().get_contents_mut().page_type(),
             Some(0),
             &mut payload,
             &record,
             4096,
             conn.pager.clone(),
-        );
-        insert_into_cell(page.get().get_contents(), &payload, 0, 4096).unwrap();
-        let free = compute_free_space(page.get().get_contents(), usable_space);
+        )
+        .unwrap();
+        insert_into_cell(page.get().get_contents_mut(), &payload, 0, 4096).unwrap();
+        let free = compute_free_space(page.get().get_contents_mut(), usable_space).unwrap();
         let total_size = payload.len() + 2;
         assert_eq!(
             free,
-            usable_space - page.get().get_contents().header_size() as u16 - total_size as u16
+            usable_space - page.get().get_contents_mut().header_size() as u16 - total_size as u16
         );
         dbg!(free);
     }
@@ -1862,6 +1888,7 @@ mod tests_2 {
         const ITERATIONS: usize = 10000;
         for _ in 0..ITERATIONS {
             let mut cell_array = CellArray {
+                bufs: Vec::new(),
                 cells: Vec::new(),
                 number_of_cells_per_page: [0; 5],
             };
@@ -1876,25 +1903,39 @@ mod tests_2 {
             let page = page.get();
             let mut size = (rng.next_u64() % 100) as u16;
             let mut i = 0;
-            while compute_free_space(page.get_contents(), pager.usable_space() as u16) >= size + 10
+            while compute_free_space(page.get_contents_mut(), pager.usable_space() as u16).unwrap()
+                >= size + 10
             {
-                insert_cell(i, size, page.get_contents(), pager.clone(), page_type);
+                insert_cell(i, size, page.get_contents_mut(), pager.clone(), page_type);
                 i += 1;
                 size = (rng.next_u64() % 1024) as u16;
             }
-            let contents = page.get_contents();
+            let contents = page.get_contents_mut();
+            // Owned snapshot of the page, mirroring balance_non_root: each cell
+            // is a `CellRef` into this snapshot, tagged with its origin slot so
+            // page_free_array can reclaim the correct byte range.
+            let page_offset = contents.offset;
+            let snapshot_idx = cell_array.bufs.len() as u32;
+            cell_array.bufs.push(Box::from(contents.as_slice()));
             for cell_idx in 0..contents.cell_count() {
-                let buf = contents.as_ptr();
-                let (start, len) = contents.cell_get_raw_region(
-                    cell_idx,
-                    payload_overflow_threshold_max(contents.page_type(), 4096),
-                    payload_overflow_threshold_min(contents.page_type(), 4096),
-                    pager.usable_space(),
-                );
-                cell_array
-                    .cells
-                    .push(to_static_buf(&mut buf[start..start + len]));
-                cells_cloned.push(buf[start..start + len].to_vec());
+                let (start, len) = contents
+                    .cell_get_raw_region(
+                        cell_idx,
+                        payload_overflow_threshold_max(contents.page_type(), 4096),
+                        payload_overflow_threshold_min(contents.page_type(), 4096),
+                        pager.usable_space(),
+                    )
+                    .unwrap();
+                cell_array.cells.push(CellRef {
+                    buf: snapshot_idx,
+                    start: start as u32,
+                    len: len as u32,
+                    origin: Some(CellOrigin {
+                        page_slot: 0,
+                        page_offset: (start - page_offset) as u16,
+                    }),
+                });
+                cells_cloned.push(contents.as_slice()[start..start + len].to_vec());
             }
             debug_validate_cells!(contents, pager.usable_space() as u16);
             let cells_before_free = contents.cell_count();
@@ -1907,6 +1948,7 @@ mod tests_2 {
             };
             let removed = page_free_array(
                 contents,
+                0,
                 start,
                 size as usize,
                 &cell_array,
@@ -1923,12 +1965,14 @@ mod tests_2 {
             let mut cell_idx_cloned = if prefix { size } else { 0 };
             for cell_idx in 0..contents.cell_count() {
                 let buf = contents.as_ptr();
-                let (start, len) = contents.cell_get_raw_region(
-                    cell_idx,
-                    payload_overflow_threshold_max(contents.page_type(), 4096),
-                    payload_overflow_threshold_min(contents.page_type(), 4096),
-                    pager.usable_space(),
-                );
+                let (start, len) = contents
+                    .cell_get_raw_region(
+                        cell_idx,
+                        payload_overflow_threshold_max(contents.page_type(), 4096),
+                        payload_overflow_threshold_min(contents.page_type(), 4096),
+                        pager.usable_space(),
+                    )
+                    .unwrap();
                 let cell_in_page = &buf[start..start + len];
                 let cell_in_array = &cells_cloned[cell_idx_cloned];
                 assert_eq!(cell_in_page, cell_in_array);
@@ -1955,7 +1999,8 @@ mod tests_2 {
             &record,
             pager.usable_space() as u16,
             pager.clone(),
-        );
+        )
+        .unwrap();
         insert_into_cell(contents, &payload, i as usize, pager.usable_space() as u16).unwrap();
     }
 }

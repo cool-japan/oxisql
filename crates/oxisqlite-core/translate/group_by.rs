@@ -91,7 +91,7 @@ pub fn init_group_by(
     let non_aggregate_count = plan
         .result_columns
         .iter()
-        .filter(|rc| !rc.contains_aggregates)
+        .filter(|rc| rc.contains_aggregates.is_empty())
         .count();
 
     let label_subrtn_acc_output = program.allocate_label();
@@ -261,7 +261,9 @@ pub fn group_by_create_pseudo_table(
             notnull: false,
             default: None,
             unique: false,
+            unique_conflict: ast::ResolveType::Abort,
             collation: None,
+            is_generated: false,
         })
         .collect::<Vec<_>>();
 
@@ -624,7 +626,7 @@ pub fn group_by_process_single_group(
             for (i, rc) in plan
                 .result_columns
                 .iter()
-                .filter(|rc| !rc.contains_aggregates)
+                .filter(|rc| rc.contains_aggregates.is_empty())
                 .enumerate()
             {
                 let dest_reg = start_reg_dest + i;
@@ -846,10 +848,9 @@ pub fn group_by_emit_row_phase<'a>(
     }
 
     // Map non-aggregate, non-GROUP BY columns to their registers
-    let non_agg_cols = plan
-        .result_columns
-        .iter()
-        .filter(|rc| !rc.contains_aggregates && !is_column_in_group_by(&rc.expr, &group_by.exprs));
+    let non_agg_cols = plan.result_columns.iter().filter(|rc| {
+        rc.contains_aggregates.is_empty() && !is_column_in_group_by(&rc.expr, &group_by.exprs)
+    });
 
     for (idx, rc) in non_agg_cols.enumerate() {
         let column_relative_idx = plan.group_by_col_count() + idx;
@@ -1208,8 +1209,50 @@ pub fn translate_aggregation_step_groupby(
             });
             target_register
         }
-        AggFunc::External(_) => {
-            todo!("External aggregate functions are not yet supported in GROUP BY");
+        AggFunc::External(func) => {
+            // Mirrors the AggFunc::External arm of `translate_aggregation_step` in
+            // aggregation.rs (the non-GROUP-BY ungrouped/aggregate path), adapted to
+            // this file's `agg_arg_source.translate(program, i)` abstraction so argument
+            // values are pulled from the GROUP BY sorter's pseudo cursor (or, when no
+            // sorter is needed, directly from the main loop's registers) instead of
+            // calling `translate_expr` on `agg.args` directly.
+            let expected_argc = func.agg_args().map_err(|_| {
+                LimboError::ExtensionError(
+                    "External aggregate function called with wrong number of arguments".to_string(),
+                )
+            })?;
+            if expected_argc != num_args {
+                crate::bail_parse_error!(
+                    "External aggregate function called with wrong number of arguments"
+                );
+            }
+            let col = if num_args == 0 {
+                // No arguments: AggStep's runtime handling for a 0-arg external
+                // aggregate (see vdbe/execute/aggregate.rs's op_agg_step) ignores
+                // `col` entirely and passes an empty argv, so this register is
+                // never read; it just needs to be a valid allocation.
+                program.alloc_register()
+            } else {
+                let mut first_reg = 0;
+                for i in 0..num_args {
+                    let arg_reg = agg_arg_source.translate(program, i)?;
+                    if i == 0 {
+                        first_reg = arg_reg;
+                    }
+                    // invariant: distinct aggregates are only supported for single-argument functions
+                    if num_args == 1 {
+                        handle_distinct(program, agg_arg_source.aggregate(), arg_reg);
+                    }
+                }
+                first_reg
+            };
+            program.emit_insn(Insn::AggStep {
+                acc_reg: target_register,
+                col,
+                delimiter: 0,
+                func: AggFunc::External(func.clone()),
+            });
+            target_register
         }
     };
     Ok(dest)
@@ -1219,4 +1262,115 @@ pub fn is_column_in_group_by(expr: &ast::Expr, group_by_exprs: &[ast::Expr]) -> 
     group_by_exprs
         .iter()
         .any(|expr2| exprs_are_equivalent(expr, expr2))
+}
+
+#[cfg(test)]
+mod external_aggregate_group_by_tests {
+    //! Regression test for the `AggFunc::External` arm of
+    //! `translate_aggregation_step_groupby` above: external (user-defined)
+    //! aggregate functions must work inside `GROUP BY`, not just as an
+    //! ungrouped aggregate (the latter already worked via `aggregation.rs`'s
+    //! `translate_aggregation_step`). Previously this arm was
+    //! `todo!("External aggregate functions are not yet supported in GROUP
+    //! BY")`, which panicked as soon as a query reached it.
+    //!
+    //! There is no built-in mechanism in this crate to register an external
+    //! aggregate purely in Rust: the only registration path is the C-ABI
+    //! extension surface (`Connection::build_limbo_ext` /
+    //! `ext::register_aggregate_function`, ultimately backed by
+    //! `ExternalFunc::new_aggregate`). So this test registers a minimal
+    //! "sum" aggregate directly through the connection's (crate-private, but
+    //! reachable from this in-crate test) symbol table, using the same
+    //! `init`/`step`/`finalize` C-ABI function pointers a real extension
+    //! would supply.
+
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    use limbo_ext::{AggCtx, Value as ExtValue};
+
+    use crate::function::ExternalFunc;
+    use crate::{Database, StepResult, Value};
+
+    /// `init`: allocate a fresh `i64` accumulator seeded at 0, boxed twice
+    /// (once for the accumulator itself, once for the `AggCtx` wrapper SQLite's
+    /// C ABI expects), matching the ownership contract `op_agg_step` /
+    /// `op_agg_final` rely on: `init` is called once per group, `step` zero or
+    /// more times per group (never taking ownership), and `finalize` exactly
+    /// once per group (taking ownership and freeing both allocations).
+    unsafe extern "C" fn ext_sum_init() -> *mut AggCtx {
+        let state = Box::into_raw(Box::new(0i64)) as *mut std::ffi::c_void;
+        Box::into_raw(Box::new(AggCtx { state }))
+    }
+
+    unsafe extern "C" fn ext_sum_step(ctx: *mut AggCtx, argc: i32, argv: *const ExtValue) {
+        if ctx.is_null() || argc != 1 {
+            return;
+        }
+        let state = unsafe { &mut *((*ctx).state as *mut i64) };
+        let arg = unsafe { &*argv };
+        if let Some(v) = arg.to_integer() {
+            *state += v;
+        }
+    }
+
+    unsafe extern "C" fn ext_sum_finalize(ctx: *mut AggCtx) -> ExtValue {
+        if ctx.is_null() {
+            return ExtValue::null();
+        }
+        let boxed_ctx = unsafe { Box::from_raw(ctx) };
+        let state = unsafe { Box::from_raw(boxed_ctx.state as *mut i64) };
+        ExtValue::from_integer(*state)
+    }
+
+    #[test]
+    fn external_aggregate_works_in_group_by() {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let db =
+            Database::open_file(io.clone(), ":memory:", false).expect("open in-memory database");
+        let conn = db.connect().expect("connect");
+
+        conn.syms.borrow_mut().functions.insert(
+            "test_ext_sum".to_string(),
+            Rc::new(ExternalFunc::new_aggregate(
+                "test_ext_sum".to_string(),
+                1,
+                (ext_sum_init, ext_sum_step, ext_sum_finalize),
+            )),
+        );
+
+        conn.execute("CREATE TABLE t(grp INTEGER, val INTEGER)")
+            .expect("create table");
+        conn.execute("INSERT INTO t VALUES (1, 10), (1, 20), (2, 5), (2, 7), (2, 9)")
+            .expect("insert rows");
+
+        // Before the fix, translating this statement panicked at the `todo!()`
+        // in the `AggFunc::External` arm above as soon as the GROUP BY codegen
+        // reached it. It must now produce correct per-group sums.
+        let mut stmt = conn
+            .prepare("SELECT grp, test_ext_sum(val) FROM t GROUP BY grp ORDER BY grp")
+            .expect("prepare grouped external aggregate query");
+
+        let mut rows = Vec::new();
+        loop {
+            match stmt.step().expect("step") {
+                StepResult::Row => {
+                    let row = stmt.row().expect("row");
+                    rows.push((row.get_value(0).clone(), row.get_value(1).clone()));
+                }
+                StepResult::IO => io.run_once().expect("io"),
+                StepResult::Done => break,
+                other => panic!("unexpected step result: {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            rows,
+            vec![
+                (Value::Integer(1), Value::Integer(30)),
+                (Value::Integer(2), Value::Integer(21)),
+            ],
+            "external aggregate must produce correct per-group sums, got {rows:?}"
+        );
+    }
 }

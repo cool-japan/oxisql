@@ -107,7 +107,9 @@ pub fn emit_order_by(
             notnull: false,
             default: None,
             unique: false,
+            unique_conflict: ast::ResolveType::Abort,
             collation: None,
+            is_generated: false,
         });
     }
     for i in 0..result_columns.len() {
@@ -127,7 +129,9 @@ pub fn emit_order_by(
             notnull: false,
             default: None,
             unique: false,
+            unique_conflict: ast::ResolveType::Abort,
             collation: None,
+            is_generated: false,
         });
     }
 

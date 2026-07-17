@@ -108,9 +108,14 @@ mod tests {
         th2.join().unwrap();
     }
 
-    // FIXME: This test fails sporadically.
+    // This test used to fail sporadically due to a race between `commit_tx`/
+    // `rollback_tx` removing a transaction from `self.txs` and concurrent
+    // `is_begin_visible`/`is_end_visible`/`is_write_write_conflict` checks still
+    // holding a `TxID` reference to it (root-caused to `drop_unused_row_versions`
+    // dropping row versions that were still owned by an active transaction — see
+    // `MvStore::drop_unused_row_versions`'s doc comment). Kept un-ignored so CI
+    // catches any regression.
     #[test]
-    #[ignore]
     fn test_overlapping_concurrent_inserts_read_your_writes() {
         let clock = LocalClock::default();
         let storage = crate::mvcc::persistent_storage::Storage::new_noop();

@@ -28,9 +28,154 @@ CC=/usr/bin/false cargo build --workspace   # → exit 0
 cargo build --workspace                      # → 0 warnings
 ```
 
-**Version 0.3.2 — 2026-07-11.**
-20 workspace crates · 2,030 tests passing · 0 failing · 0 clippy warnings.
-~136,360 lines of Rust across 397 source files.
+**Version 0.3.3 — 2026-07-17.**
+17 workspace crates (plus 3 non-published, internal patch-shim crates) · 2,157 tests passing (2,651 with `--all-features`) · 0 failing · 0 clippy warnings.
+~178,591 lines of Rust across 484 source files.
+
+---
+
+## What's new in 0.3.3
+
+- **Open a database from an in-memory byte buffer.** New `open_from_bytes`
+  entry points open a SQLite database directly from a byte slice (e.g.
+  `include_bytes!`, `VACUUM INTO`, or `sqlite3_serialize()` output) with no
+  temporary file — enabling WASI/browser/read-only-filesystem use.
+  `oxisqlite_core::Database::open_from_bytes(bytes, enable_mvcc)` copies the
+  image into a fresh in-memory page store and is not gated by the `fs`
+  feature; `oxisqlite::Database::open_from_bytes(bytes)` mirrors SQLite's
+  `sqlite3_deserialize()`; `SqliteConnection::open_from_bytes(bytes)`
+  (async) and `SqliteConnectionBlocking::open_from_bytes(bytes)` (sync,
+  `blocking` feature) expose it through the `oxisql-sqlite-compat` layer.
+  Malformed input (too short, wrong magic, invalid page size) returns a
+  typed error and never panics; any standard on-disk page size is accepted
+  for reading.
+- **PostgreSQL logical replication.** `oxisql-postgres` gains an opt-in
+  `replication` feature (surfaced on the facade as `postgres-replication`)
+  with CDC-style streaming via `PgReplicationConnection::connect`,
+  `identify_system`, `create_replication_slot`, `drop_replication_slot`, and
+  `start_logical_replication`, which hands back a `ReplicationStream` you
+  `ack()` against as you consume it. Includes full `pgoutput` wire-protocol
+  decoding (Begin/Commit/Origin/Relation/Type/Insert/Update/Delete/Truncate/
+  Message), LSN parsing/formatting, `COPY BOTH` streaming (background reader
+  task plus a periodic Standby Status Update keepalive task), and a
+  brace/quote/escape-aware decoder for PostgreSQL's `{...}` array-literal
+  text format. Not routed through `tokio-postgres` — it cannot negotiate
+  replication mode — so this drives the wire protocol directly via a new
+  `postgres-protocol` dependency.
+- **SQL surface growth (`oxisqlite-core`).** `CREATE TABLE ... AS SELECT`;
+  `EXCEPT`/`INTERSECT` compound-`SELECT` operators alongside the existing
+  `UNION`/`UNION ALL`, with `NULL`-aware set semantics and strict
+  left-to-right grouping of mixed chains (`A UNION B EXCEPT C` =
+  `(A UNION B) EXCEPT C`); `ON CONFLICT` conflict-resolution clauses on
+  `CREATE TABLE` column/table `UNIQUE`/`PRIMARY KEY` constraints; `OFFSET`,
+  `ORDER BY`, and `WITH` on the outer compound `SELECT`; parenthesized join
+  sources (`FROM (t1 JOIN t2 ON ...)`); the `REGEXP` operator / `regexp()`
+  function (unanchored regex search over the `regex` crate's dialect,
+  three-valued `NULL` handling, a clean constraint error — never a panic —
+  on a malformed pattern); more `printf()` format specifiers (`%i`, `%x`/
+  `%X`, `%o`, `%c`, `%e`/`%E`; flag/width/precision modifiers such as `%05d`
+  remain a documented TODO); and real `ORDER BY` pushdown into a virtual
+  table's `xBestIndex`, so the engine skips its own sort step when the vtab
+  reports the ordering is already satisfied.
+- **Index-based access restored for `DELETE`/`UPDATE` (`oxisqlite-core`,
+  `index_experimental` feature).** Both plans had unconditionally fallen
+  back to a full table scan ever since a real, upstream-reported corruption
+  hazard was found in driving `DELETE`'s row loop from a secondary index
+  while also maintaining that same index as per-row cursor work (see
+  [tursodatabase/limbo#1714](https://github.com/tursodatabase/limbo/issues/1714));
+  `UPDATE` had an analogous hazard whenever `SET` changed the driving
+  index's own key columns. The optimizer now runs its normal access-method
+  selection and keeps the result only when proven safe (a non-looping rowid
+  lookup, or a range scan/seek over a cursor whose own key the statement
+  provably cannot shift under it) — anything else still falls back to the
+  previous full-table-scan behavior, so indexes are usable again for the
+  common safe cases without reintroducing the corruption.
+- **B-tree index-page balance panic/corruption fix (`oxisqlite-core`).**
+  Inserting into a b-tree could panic (or silently corrupt the page in
+  release builds) whenever parent balancing of an interior **index** page
+  placed a cell at a logical position beyond the page's physical cell count
+  while the page already held deferred overflow cells — reachable on real,
+  index-heavy databases (e.g. a `JOIN` whose planner-built transient
+  automatic index grew deep enough to rebalance an interior index page).
+  `insert_into_cell` now only takes the in-place path when the target
+  position lies within the physical cell array, otherwise appending to
+  `overflow_cells` in logical order.
+- **Named parameter binding in the raw engine (`oxisqlite`).** `:name`,
+  `@name`, `$name`, and `#name` placeholders now bind correctly in
+  `Statement::query`/`execute` — previously an unconditional panic whenever
+  named parameters reached the engine directly.
+- **Windows file locking (`oxisqlite-core`).** Real `LockFileEx`/
+  `UnlockFileEx`-backed locking (`io/windows.rs`) via a new `windows-sys`
+  dependency that is Windows-only and never enters the dependency graph on
+  other targets — previously an unconditional panic on that path.
+- **Server version accessors.** `PgConnection::server_version()`
+  (`oxisql-postgres`) and `MyConnection::server_version()` (`oxisql-mysql`),
+  plus `BackendInfo::from_postgres_connection`/`from_mysql_connection`
+  (`oxisql`) to populate `BackendInfo.version` from a live connection instead
+  of only the static, connectionless dispatcher.
+- **Cleaner REPL error output.** A new `display_error()` helper (`oxisql`),
+  now used by the `oxisql-repl` binary, renders a readable, user-facing
+  error message instead of a raw GlueSQL parser-error debug-dump.
+- **MVCC correctness and durability fixes (`oxisqlite-core`).** A
+  transaction-removal race that could panic on concurrent commit/rollback is
+  fixed — the affected call sites now return typed errors instead of
+  panicking. Separately, `commit_tx()` now persists to the write-ahead log
+  *before* marking a transaction visible in memory (it previously did the
+  reverse), closing a crash-window data-loss gap; a failed persist reverts
+  the transaction to `Active` and returns an error rather than silently
+  losing it. WAL checkpoint bookkeeping was also tightened: `checkpoint_seq`/
+  `salt_1` now evolve consistently on every fully-backfilled checkpoint
+  (not just `Restart`/`Truncate`), and a new frame-trimming step prevents
+  frame-cache bookkeeping from growing unboundedly across repeated partial
+  checkpoints on a long-running connection.
+- **Correctness fixes across the engine (`oxisqlite-core`).**
+  `UPDATE ... RETURNING` (previously returned zero rows silently),
+  `ALTER TABLE ... RENAME` (previously crashed on any schema containing a
+  view, trigger, or virtual table anywhere — not just the table being
+  renamed), multi-row `INSERT` into virtual tables (previously kept only the
+  last row), `IN (...)` used as a plain value expression outside
+  `WHERE`/`HAVING`/`JOIN ... ON` (previously crashed), a `WITH` CTE
+  referenced more than once in the same query (previously only the first
+  reference resolved correctly), wide-row records with a header over 126
+  bytes — roughly 127+ columns, or fewer with one large `TEXT`/`BLOB`
+  (previously crashed during serialization), `BLOB`/`TEXT` coercion in
+  `QUOTE()`/`||`/`concat()` (previously crashed on `BLOB` operands), and a
+  `PRAGMA auto_vacuum = FULL` high-water-mark bug that stalled after the
+  first table/index are all fixed. Reading a corrupt or maliciously-crafted
+  database file (untrusted cell/freeblock pointers, an untrusted page-type
+  byte, a malformed free-space computation) now returns `LimboError::Corrupt`
+  at several more sites instead of panicking.
+- **PostgreSQL connection-timeout hang (`oxisql`).** Connecting to an
+  unreachable PostgreSQL host via `connect()` (also `connect_with_options`/
+  `connect_with_tls`) previously hung indefinitely; a connection timeout now
+  applies by default (10s, configurable via
+  `ConnectOptions::connect_timeout_ms`) and returns a typed timeout error.
+- **Memory-safety hardening via Miri (`oxisqlite-core`).** Fixed a
+  pointer-provenance bug materializing `BLOB`/`TEXT` values from on-disk
+  pages, an unaligned-reference bug in the `VECTOR` column type's slice
+  conversions, and a page-cache memory leak (evicted entries were destructed
+  but never deallocated). Reworked 40+ page-access call sites across the
+  storage/B-tree layers that could previously manufacture simultaneous
+  mutable aliases into the same page buffer from a shared reference, plus
+  smaller pointer-provenance fixes in result-row construction and
+  virtual-table module/row-ID handling.
+- **Large modules split via `splitrs`.** `json/jsonb.rs`, `storage/pager.rs`,
+  `functions/datetime.rs`, `translate/expr.rs`, and `translate/insert.rs`
+  (`oxisqlite-core`), plus `ast/fmt.rs`/`ast/mod.rs`
+  (`oxisqlite-sqlite3-parser`), were split into smaller per-concern files to
+  stay under the workspace's 2000-line file policy — no functional changes.
+- **Two internal breaking changes — neither touches the `oxisql` facade.**
+  `oxisqlite`'s `Params::Named` now stores `Cow<'static, str>` keys (was
+  `Vec<(String, Value)>`, now `Vec<(Cow<'static, str>, Value)>`), so binding
+  a `'static` placeholder-name literal borrows instead of allocating; and
+  `oxisqlite-sqlite3-parser`'s lexer `Token` type dropped its lifetime
+  parameter (`Token<'i>(usize, &'i [u8], usize)` → `Token(usize,
+  Cow<'static, str>, usize)`). Both are internal to the low-level
+  `oxisqlite`/parser crates beneath `oxisql-sqlite-compat` — the
+  facade-level `Connection::query_named`/`execute_named` API used in the
+  Quick Start examples below is unaffected.
+- **Routine dependency bump.** `oxiarc-zstd` (backing the `zstd-shim` patch
+  crate) bumped to `0.3.6`.
 
 ---
 
@@ -190,44 +335,59 @@ cargo build --workspace                      # → 0 warnings
 
 ## Crate Status
 
-OxiSQL ships as **20 workspace crates**: 10 facade/driver crates, a 7-crate,
-C-free `oxisqlite-*` engine, plus a `perf` benchmark crate, a vendored `rustls-rustcrypto-patched` TLS patch, and a vendored `whoami-patched` crate (Pure-Rust macOS path, `objc2`-free).
+OxiSQL ships as **17 workspace-member crates** — 10 facade/driver crates plus
+a 7-crate, C-free `oxisqlite-*` engine — plus **3 non-published, internal
+patch-shim crates** (`whoami-patched`, `zstd-shim`, `rustls-rustcrypto-patched`)
+applied via `[patch.crates-io]`. The patch shims exist solely to satisfy the
+COOLJAPAN Pure-Rust/OxiARC-only-compression policy and to carry a patched TLS
+crypto provider — they are not COOLJAPAN products with their own feature
+roadmap; see the note below the tables.
 
 ### Facade & drivers (10)
 
-| Crate | Status | Tests | Description |
+| Crate | Status | Tests (default / `--all-features`) | Description |
 |-------|--------|-------|-------------|
-| `oxisql` | Stable | 80 (+2 live-gated) | Unified facade: `connect` / `connect_pooled` / `connect_pool` / `connect_datafusion` |
-| `oxisql-core` | Stable | 114 | `Connection` / `Transaction` / `ConnectionPool` / `Value` traits; named-parameter default methods; middleware |
-| `oxisql-parse` | Stable | 129 | SQL parsing, fluent query builder, logical planner, optimizer |
-| `oxisql-embedded` | Stable | 278 | GlueSQL in-memory + persistent (redb / fjall / sled); schema introspection |
-| `oxisql-postgres` | Stable | 61 (+6 live-gated) | Pure Rust `tokio-postgres`, no libpq; OxiTLS/rustcrypto |
-| `oxisql-mysql` | Stable | 95 | Pure Rust `mysql_async`, no libmysqlclient |
-| `oxisql-datafusion` | Alpha | 57 (+4) | Apache DataFusion `TableProvider` bridge |
-| `oxisql-pool` | Stable | 57 (+4 live-gated) | deadpool-based pooling for all backends |
-| `oxisql-migrate` | Stable | 37 | File-based SQL migrations, 14-digit timestamps |
-| `oxisql-sqlite-compat` | Alpha | 85 | C-free SQLite engine on top of `oxisqlite-*`; ROLLBACK, UPSERT, transparent schema re-prepare |
+| `oxisql` | Stable | 60 / 135 | Unified facade: `connect` / `connect_pooled` / `connect_pool` / `connect_datafusion` |
+| `oxisql-core` | Stable | 126 / 142 | `Connection` / `Transaction` / `ConnectionPool` / `Value` traits; named-parameter default methods; middleware |
+| `oxisql-parse` | Stable | 178 / 178 | SQL parsing, fluent query builder, logical planner, optimizer |
+| `oxisql-embedded` | Stable | 263 / 281 | GlueSQL in-memory + persistent (redb / fjall / sled); schema introspection |
+| `oxisql-postgres` | Stable | 53 / 393¹ | Pure Rust `tokio-postgres`, no libpq; OxiTLS/rustcrypto; opt-in logical replication |
+| `oxisql-mysql` | Stable | 96 / 96 | Pure Rust `mysql_async`, no libmysqlclient |
+| `oxisql-datafusion` | Alpha | 67 / 87 | Apache DataFusion `TableProvider` bridge |
+| `oxisql-pool` | Stable | 35 / 52 | deadpool-based pooling for all backends |
+| `oxisql-migrate` | Stable | 47 / 49 | File-based SQL migrations, 14-digit timestamps |
+| `oxisql-sqlite-compat` | Alpha | 85 / 94 | C-free SQLite engine on top of `oxisqlite-*`; ROLLBACK, UPSERT, transparent schema re-prepare |
+
+¹ The large jump under `--all-features` is the opt-in `replication` feature
+(PostgreSQL logical replication / CDC), which brings in a substantial
+live-server-gated test suite.
 
 ### oxisqlite engine (7)
 
 These crates form the in-tree, C-free fork of limbo. They are **internal** —
 consumed by `oxisql-sqlite-compat` and not part of OxiSQL's public surface.
 
-| Crate | Status | Tests | Description |
+| Crate | Status | Tests (default / `--all-features`) | Description |
 |-------|--------|-------|-------------|
-| `oxisqlite` | Internal | 5 | Top-level engine facade / connection entry point |
-| `oxisqlite-core` | Internal | 656 (+13 skipped) | Storage engine: B-tree (split), pager, WAL, VDBE, transactions, ROLLBACK, ANALYZE, System-R optimizer, WITHOUT ROWID |
-| `oxisqlite-ext` | Internal | — | Built-in extensions / virtual-table glue |
-| `oxisqlite-macros` | Internal | — | Procedural macros for the engine |
-| `oxisqlite-sqlite3-parser` | Internal | 208 (+6) | SQL parser (pre-generated, no `lemon` C generator) |
-| `oxisqlite-time` | Internal | — | Pure-Rust date/time helpers (chrono-based) |
-| `oxisqlite-uuid` | Internal | — | Pure-Rust UUID support |
+| `oxisqlite` | Internal | 38 / 38 | Top-level engine facade / connection entry point |
+| `oxisqlite-core` | Internal | 888 / 885 | Storage engine: B-tree (split), pager, WAL, VDBE, transactions, ROLLBACK, ANALYZE, System-R optimizer, WITHOUT ROWID |
+| `oxisqlite-ext` | Internal | ² | Built-in extensions / virtual-table glue |
+| `oxisqlite-macros` | Internal | ² | Procedural macros for the engine |
+| `oxisqlite-sqlite3-parser` | Internal | 221 / 221 | SQL parser (pre-generated, no `lemon` C generator) |
+| `oxisqlite-time` | Internal | ² | Pure-Rust date/time helpers (chrono-based) |
+| `oxisqlite-uuid` | Internal | ² | Pure-Rust UUID support |
 
-> Two vendored crates are applied via `[patch.crates-io]`: `rustls-rustcrypto-patched`
-> (fixes RUSTSEC-2026-0104) and `whoami-patched` (drops `objc2-system-configuration`
-> from the macOS code path, restoring Pure Rust Policy v2 §3 compliance). Neither is
-> a workspace member nor published to crates.io — see
-> [The C-free oxisqlite engine](#the-c-free-oxisqlite-engine) and
+² No dedicated nextest unit tests of its own — a thin wrapper/extension crate
+over `oxisqlite-core`, validated via `oxisqlite-core`'s integration test suite
+instead (`oxisqlite-macros` additionally carries 3 ignored doctests).
+
+> Three vendored crates are applied via `[patch.crates-io]`: `rustls-rustcrypto-patched`
+> (fixes RUSTSEC-2026-0104), `whoami-patched` (drops `objc2-system-configuration`
+> from the macOS code path, restoring Pure Rust Policy v2 §3 compliance), and
+> `zstd-shim` (a Pure-Rust `bulk::{Compressor, Decompressor}` shim backed by
+> `oxiarc-zstd`, dropping the C-FFI `zstd-sys` crate from the `--all-features`
+> dependency closure). None is a workspace member nor published to crates.io —
+> see [The C-free oxisqlite engine](#the-c-free-oxisqlite-engine) and
 > [Pure Rust — FFI eliminated](#pure-rust--ffi-eliminated).
 
 ---
@@ -239,15 +399,50 @@ Add to your workspace's root `Cargo.toml`:
 ```toml
 # Workspace root Cargo.toml
 [workspace.dependencies]
-oxisql = { version = "0.3.2", features = ["embedded"] }
+oxisql = { version = "0.3.3", features = ["embedded"] }
 ```
 
 Or add to a single crate:
 
 ```toml
 [dependencies]
-oxisql = { version = "0.3.2", features = ["embedded", "postgres", "pool-embedded", "migrate"] }
+oxisql = { version = "0.3.3", features = ["embedded", "postgres", "pool-embedded", "migrate"] }
 ```
+
+### Downstream `[patch.crates-io]` requirement (whoami / zstd)
+
+`[patch.crates-io]` entries only take effect at the **root** `Cargo.toml` of
+the final workspace being built — Cargo does not apply a dependency's own
+patches on your behalf. OxiSQL's own build is Pure Rust because its
+workspace root patches two crates to unpublished, in-tree shim crates
+(`crates/whoami-patched`, `crates/zstd-shim`; see
+[Pure Rust — FFI eliminated](#pure-rust--ffi-eliminated)). If your
+application depends on `oxisql` (directly or transitively, e.g. via
+`oxisql-postgres`, `oxisql-mysql`, or `oxisql-datafusion` with the
+`columnar`/`parquet` feature) **and** you build with `CC=/usr/bin/false` or
+otherwise require a genuinely C-free closure, you must repeat both patches in
+*your own* workspace root — they cannot be inherited from OxiSQL's
+`Cargo.toml`, and neither shim is published to crates.io (removal of the
+underlying C dependency at the source, i.e. getting `whoami` or `arrow-ipc`'s
+`zstd` dependency to drop it upstream, was investigated and found not
+currently possible — see the version history above for
+`objc2-system-configuration`/`zstd-sys` context).
+
+Vendor (copy) `crates/whoami-patched/` and `crates/zstd-shim/` from this
+repository into your own workspace, then add:
+
+```toml
+# Your application's workspace root Cargo.toml
+[patch.crates-io]
+whoami = { path = "path/to/whoami-patched" }
+zstd   = { path = "path/to/zstd-shim" }
+```
+
+Without this, a downstream workspace that merely `[dependencies]`-pulls
+`oxisql` will still resolve the upstream `whoami`/`zstd` crates (and their
+`objc2-system-configuration`/`zstd-sys` C dependencies) for its *own* build,
+even though OxiSQL's own `cargo build --workspace` inside this repository is
+C-free. This is a Cargo `[patch]`-scoping limitation, not an OxiSQL defect.
 
 ---
 
@@ -410,8 +605,10 @@ in-memory SQL. Three persistent variants are available:
 | libpq | Never required |
 
 Supports prepared statements, transactions, COPY bulk ingestion, LISTEN/NOTIFY,
-pipeline batching, and extended type mapping (DATE, TIMESTAMP, UUID, JSONB,
-NUMERIC, ARRAY).
+pipeline batching, extended type mapping (DATE, TIMESTAMP, UUID, JSONB,
+NUMERIC, ARRAY), and — behind the opt-in `replication` feature
+(`postgres-replication` on the facade) — logical replication (CDC) via
+`pgoutput`.
 
 > A C-linked `libpq` path does **not** exist today. If legacy parity is ever
 > required it could be added behind an opt-in feature in a future release, but no
@@ -444,8 +641,11 @@ mapping (DECIMAL, DATETIME(6), JSON, ENUM).
 
 The SQLite-compatible backend sits on top of the in-tree `oxisqlite-*` engine.
 Full transactional rollback and UPSERT work. `SAVEPOINT` is fully implemented
-with WAL-based page-state restoration. See [Known Limitations](#known-limitations)
-for current open items.
+with WAL-based page-state restoration. As of 0.3.3,
+`SqliteConnection::open_from_bytes(bytes)` / `SqliteConnectionBlocking::open_from_bytes(bytes)`
+open a database directly from an in-memory byte buffer — no temporary file —
+mirroring SQLite's `sqlite3_deserialize()`. See
+[Known Limitations](#known-limitations) for current open items.
 
 ### DataFusion OLAP (`datafusion://`)
 
@@ -468,6 +668,7 @@ cross-backend OLAP queries (filter / projection / limit pushdown).
 |---------|------------|---------|-------|
 | `embedded` | `memory://` | GlueSQL in-memory | Base embedded feature |
 | `postgres` | `postgres://` / `postgresql://` | tokio-postgres | Pure Rust, no libpq |
+| `postgres-replication` | — | `PgReplicationConnection` (not `connect()`-dispatched) | Logical replication (CDC) via `pgoutput`; implies `postgres` |
 | `mysql` | `mysql://` | mysql_async | Pure Rust, no libmysqlclient |
 | `sqlite` | `sqlite://` / `sqlite::memory:` | oxisqlite (C-free) | Pure Rust, no libsqlite3; Alpha |
 | `redb` | `redb://` | redb B-tree | Persistent embedded; implies `embedded` |
@@ -485,27 +686,27 @@ cross-backend OLAP queries (filter / projection / limit pushdown).
 
 ```toml
 # In-memory only
-oxisql = { version = "0.3.2", features = ["embedded"] }
+oxisql = { version = "0.3.3", features = ["embedded"] }
 
 # PostgreSQL + pooling
-oxisql = { version = "0.3.2", features = ["postgres", "pool-postgres"] }
+oxisql = { version = "0.3.3", features = ["postgres", "pool-postgres"] }
 
 # MySQL + migrations
-oxisql = { version = "0.3.2", features = ["mysql", "pool-mysql", "migrate"] }
+oxisql = { version = "0.3.3", features = ["mysql", "pool-mysql", "migrate"] }
 
 # C-free SQLite + pooling
-oxisql = { version = "0.3.2", features = ["sqlite", "pool-sqlite-compat"] }
+oxisql = { version = "0.3.3", features = ["sqlite", "pool-sqlite-compat"] }
 
 # All OLTP backends + pooling + migrations
-oxisql = { version = "0.3.2", features = [
+oxisql = { version = "0.3.3", features = [
     "embedded", "postgres", "mysql", "sqlite",
     "pool-embedded", "pool-postgres", "pool-mysql", "pool-sqlite-compat",
     "migrate",
 ] }
 
-# Full stack including DataFusion OLAP and the REPL
-oxisql = { version = "0.3.2", features = [
-    "embedded", "postgres", "mysql", "sqlite", "datafusion",
+# Full stack including DataFusion OLAP, logical replication, and the REPL
+oxisql = { version = "0.3.3", features = [
+    "embedded", "postgres", "postgres-replication", "mysql", "sqlite", "datafusion",
     "pool-embedded", "pool-postgres", "pool-mysql",
     "migrate", "repl",
 ] }
@@ -638,13 +839,13 @@ CC=/usr/bin/false cargo build --workspace   # → exit 0
 
 | Crate | Role | ~LOC |
 |-------|------|-----:|
-| `oxisqlite` | Engine facade / connection entry point | 973 |
-| `oxisqlite-core` | Storage engine: B-tree, pager, WAL, VDBE, transactions, ROLLBACK | 62,000 |
-| `oxisqlite-ext` | Built-in extensions / virtual-table glue | 1,100 |
-| `oxisqlite-macros` | Procedural macros for the engine | 900 |
-| `oxisqlite-sqlite3-parser` | SQL parser (pre-generated, no `lemon`) | 14,800 |
-| `oxisqlite-time` | Pure-Rust date/time helpers | 1,200 |
-| `oxisqlite-uuid` | Pure-Rust UUID support | 126 |
+| `oxisqlite` | Engine facade / connection entry point | 2,400 |
+| `oxisqlite-core` | Storage engine: B-tree, pager, WAL, VDBE, transactions, ROLLBACK | 88,000 |
+| `oxisqlite-ext` | Built-in extensions / virtual-table glue | 1,300 |
+| `oxisqlite-macros` | Procedural macros for the engine | 1,000 |
+| `oxisqlite-sqlite3-parser` | SQL parser (pre-generated, no `lemon`) | 16,400 |
+| `oxisqlite-time` | Pure-Rust date/time helpers | 1,600 |
+| `oxisqlite-uuid` | Pure-Rust UUID support | 137 |
 
 ### Fork lineage & licensing
 
@@ -699,6 +900,36 @@ build. The 4 unmaintained-but-not-vulnerable crates are `paste`,
 `rustls-pemfile`, `fxhash`, and `instant` (the latter two via `sled` →
 `oxisql-embedded`).
 
+#### SECURITY: RUSTSEC-2023-0071 (Marvin Attack) is unreachable in OxiSQL
+
+`deny.toml` carries an explicit `[advisories] ignore` entry for
+RUSTSEC-2023-0071 rather than a code workaround, because the vulnerable code
+path cannot be reached from any OxiSQL API:
+
+- The advisory's timing side-channel is only observable during an RSA
+  PKCS#1 v1.5 **private-key** decrypt/sign operation (e.g. a TLS server
+  performing an RSA key-exchange, or a TLS server validating a client
+  certificate signed with RSA).
+- OxiSQL is TLS-**client**-only: `oxisql-postgres` and `oxisql-mysql` both
+  build their `rustls::ClientConfig` with `.with_no_client_auth()`
+  (`crates/oxisql-postgres/src/builder.rs`,
+  `crates/oxisql-mysql/src/lib.rs`) — no client certificate, hence no RSA
+  client-auth private-key operation, is ever performed.
+- OxiSQL never runs as a TLS server, so no RSA key-exchange or
+  certificate-signing private-key operation happens there either.
+- The only RSA operation actually exercised anywhere in the dependency
+  closure is **public-key signature verification** of the server's
+  certificate chain, which is not what Marvin's timing side-channel
+  attacks (verification uses the public exponent, not the private key, and
+  has no secret-dependent timing to leak).
+- `rsa` 0.9.10 reaches the graph solely via `rustls-rustcrypto` (crypto
+  provider for `oxitls`/`rustls`), confirmed with
+  `cargo tree -i rsa` — there is no other path into the workspace.
+
+No safe upgrade exists upstream yet; this entry will be revisited if
+`rustls-rustcrypto`/`rsa` publish a fix, or if OxiSQL ever grows a
+TLS-server or mTLS-client-auth code path.
+
 ---
 
 ## Known Limitations
@@ -709,8 +940,10 @@ These are OxiSQL's own roadmap items, not upstream blockers:
 - **Prepared-statement cache** is active; `Statement::reset()` correctly clears change counts; the compat layer re-prepares transparently on `SchemaChanged`.
 - **PostgreSQL / MySQL live-server tests** are `#[ignore]`-gated and require an
   accessible server. All non-live unit and compile-time tests pass without
-  external services (≈35 ignored tests workspace-wide are almost all
-  live-server-gated, with a handful of fuzz/stress cases).
+  external services (31 skipped tests workspace-wide under default features,
+  90 under `--all-features` — the difference is mostly the newly-gated
+  PostgreSQL logical-replication tests — almost all live-server-gated, with a
+  handful of fuzz/stress cases).
 
 See [`TODO.md`](TODO.md) for the full, tracked roadmap.
 

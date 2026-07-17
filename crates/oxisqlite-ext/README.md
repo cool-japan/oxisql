@@ -10,7 +10,11 @@ but without any C. You define your extension and register it with the
 `register_extension!` macro.
 
 - **Role:** extension API (scalar / aggregate functions, virtual tables, VFS).
-- **Approx LOC:** ~1,136.
+- **Version:** 0.3.3 (2026-07-17).
+- **Tests:** 0 dedicated `nextest` unit tests in this crate; validated
+  indirectly through `oxisqlite-core`'s integration test suite, which depends
+  on both `oxisqlite-ext` and `oxisqlite-macros` (verified 2026-07-17).
+- **Approx LOC:** ~1,134 (tokei `src/`).
 - **Pure Rust / no C:** 100% Rust. **No C allocator**, no C parser generator, no
   `cc` / `build.rs`, no global-allocator injection. `CC=/usr/bin/false cargo
   build` succeeds.
@@ -22,7 +26,10 @@ but without any C. You define your extension and register it with the
 - **Aggregate functions** — via the `AggregateDerive` macro and the `AggFunc`
   trait.
 - **Virtual tables** — via the `VTabModuleDerive` macro and the `VTabModule` /
-  `VTable` / `VTabCursor` traits.
+  `VTable` / `VTabCursor` traits. `CREATE VIRTUAL TABLE` resolves column names
+  from the single, live module instance `xCreate` already returns; fixed in
+  0.3.3 to no longer perform a wasteful (and, for a module with side effects,
+  unsound) extra create-then-destroy round trip just to learn the columns.
 - **VFS modules** — by implementing the `VfsExtension` and `VfsFile` traits
   (requires the `vfs` feature).
 

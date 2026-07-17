@@ -61,6 +61,9 @@ pub fn prepare_delete_plan(
         Some(table) => table,
         None => crate::bail_parse_error!("no such table: {}", tbl_name),
     };
+    if matches!(table.as_ref(), Table::View(_)) {
+        crate::bail_parse_error!("cannot modify {} because it is a view", tbl_name.name.0);
+    }
     let table = if let Some(table) = table.virtual_table() {
         Table::Virtual(table.clone())
     } else if let Some(table) = table.btree() {

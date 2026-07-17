@@ -1,17 +1,19 @@
 use super::emitter::{emit_program, TranslateCtx};
 use super::plan::{
-    select_star, Distinctness, JoinOrderMember, Operation, OuterQueryReference, QueryDestination,
-    Search, TableReferences,
+    select_star, Distinctness, JoinOrderMember, JoinedTable, Operation, OuterQueryReference,
+    QueryDestination, Search, TableReferences,
 };
 use crate::function::{AggFunc, ExtFunc, Func};
 use crate::schema::Table;
 use crate::translate::optimizer::optimize_plan;
-use crate::translate::plan::{Aggregate, GroupBy, Plan, ResultSetColumn, SelectPlan};
+use crate::translate::plan::{
+    Aggregate, AggregateMask, GroupBy, Plan, ResultSetColumn, SelectPlan,
+};
 use crate::translate::planner::{
     bind_column_references, break_predicate_at_and_boundaries, parse_from, parse_limit,
-    parse_limit_full, parse_where, resolve_aggregates, LimitValue,
+    parse_limit_full, parse_where, parse_with_ctes, resolve_aggregates, LimitValue,
 };
-use crate::util::normalize_ident;
+use crate::util::{alias_name, normalize_ident};
 use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode, TableRefIdCounter};
 use crate::vdbe::insn::Insn;
 use crate::SymbolTable;
@@ -100,12 +102,21 @@ pub fn prepare_select_plan<'a>(
     match compounds {
         None => {
             let limit = select.limit.take();
+            let with = select.with.take();
+            let with_for_display = with.clone();
+            let ctes = match with {
+                Some(with) => {
+                    parse_with_ctes(schema, with, syms, outer_query_refs, table_ref_counter)?
+                }
+                None => Vec::new(),
+            };
             Ok(Plan::Select(prepare_one_select_plan(
                 schema,
                 *select.body.select,
                 limit.as_deref(),
                 select.order_by.take(),
-                select.with.take(),
+                with_for_display,
+                &ctes,
                 syms,
                 outer_query_refs,
                 table_ref_counter,
@@ -113,12 +124,32 @@ pub fn prepare_select_plan<'a>(
             )?))
         }
         Some(compounds) => {
+            // The top-level `WITH` clause (if any present) applies to *every* arm of the
+            // compound chain, not merely the first one -- e.g. `WITH c AS (...) SELECT * FROM c
+            // UNION SELECT * FROM c WHERE ...` needs `c` visible to both arms. It is parsed
+            // exactly once here (instead of once per arm) and the resulting CTE templates are
+            // handed to every arm's `parse_from`/`parse_from_clause_table` call by reference;
+            // each arm independently clones + renumbers its own instance on lookup (see
+            // `parse_from_clause_table`'s CTE branch), which is what makes it safe for the same
+            // CTE to be referenced from more than one arm -- this relies on
+            // `planner::renumber_table_ids`, which already handles more than one reference
+            // *within* a single arm (e.g. a CTE self-join).
+            let with = select.with.take();
+            let with_for_display = with.clone();
+            let ctes = match with {
+                Some(with) => {
+                    parse_with_ctes(schema, with, syms, outer_query_refs, table_ref_counter)?
+                }
+                None => Vec::new(),
+            };
+
             let mut last = prepare_one_select_plan(
                 schema,
                 *select.body.select,
                 None,
                 None,
-                None,
+                with_for_display,
+                &ctes,
                 syms,
                 outer_query_refs,
                 table_ref_counter,
@@ -127,14 +158,6 @@ pub fn prepare_select_plan<'a>(
 
             let mut left = Vec::with_capacity(compounds.len());
             for CompoundSelect { select, operator } in compounds {
-                // TODO: add support for EXCEPT and INTERSECT
-                if operator != ast::CompoundOperator::UnionAll
-                    && operator != ast::CompoundOperator::Union
-                {
-                    crate::bail_parse_error!(
-                        "only UNION ALL and UNION are supported for compound SELECTs"
-                    );
-                }
                 left.push((last, operator));
                 last = prepare_one_select_plan(
                     schema,
@@ -142,6 +165,7 @@ pub fn prepare_select_plan<'a>(
                     None,
                     None,
                     None,
+                    &ctes,
                     syms,
                     outer_query_refs,
                     table_ref_counter,
@@ -158,24 +182,37 @@ pub fn prepare_select_plan<'a>(
             }
             let (limit, offset) = select.limit.map_or(Ok((None, None)), |l| parse_limit(&l))?;
 
-            // FIXME: handle OFFSET for compound selects
-            if offset.map_or(false, |o| o > 0) {
-                crate::bail_parse_error!("OFFSET is not supported for compound SELECTs yet");
-            }
-            // FIXME: handle ORDER BY for compound selects
-            if select.order_by.is_some() {
-                crate::bail_parse_error!("ORDER BY is not supported for compound SELECTs yet");
-            }
-            // FIXME: handle WITH for compound selects
-            if select.with.is_some() {
-                crate::bail_parse_error!("WITH is not supported for compound SELECTs yet");
-            }
+            let order_by = match select.order_by.take() {
+                Some(order_by) => {
+                    // Every arm's rows must be materialized into a shared `Sorter` for a
+                    // compound-level ORDER BY (see `compound_select::emit_program_for_compound_select`),
+                    // but `translate::values` (VALUES rows) only knows how to target
+                    // `ResultRows`/`CoroutineYield` -- reject cleanly here rather than reaching an
+                    // `unreachable!()` deep in bytecode generation for e.g. `SELECT x FROM t UNION
+                    // VALUES (1) ORDER BY x`.
+                    if !last.values.is_empty()
+                        || left.iter().any(|(plan, _)| !plan.values.is_empty())
+                    {
+                        crate::bail_parse_error!(
+                            "ORDER BY on a compound SELECT with a VALUES arm is not supported yet"
+                        );
+                    }
+                    // Column *names* in a compound SELECT's ORDER BY are resolved against the
+                    // left-most arm's output column names (ordinal positions need no resolution
+                    // beyond bounds-checking, since every arm is required -- checked just above --
+                    // to have the same number of result columns).
+                    let name_source = left.first().map(|(plan, _)| plan).unwrap_or(&last);
+                    Some(resolve_compound_order_by(order_by, name_source)?)
+                }
+                None => None,
+            };
+
             Ok(Plan::CompoundSelect {
                 left,
                 right_most: last,
                 limit,
                 offset,
-                order_by: None,
+                order_by,
                 limit_expr: None,
                 offset_expr: None,
             })
@@ -183,12 +220,64 @@ pub fn prepare_select_plan<'a>(
     }
 }
 
+/// Resolves a compound-SELECT-level `ORDER BY` clause into `(ordinal-position-as-numeric-literal,
+/// SortOrder)` pairs. Unlike a plain SELECT's own `ORDER BY`, a compound SELECT's `ORDER BY` may
+/// only reference the combined result set's output columns -- by ordinal position or by name --
+/// since there is no single FROM-clause table scope once rows from every arm are combined (see
+/// <https://sqlite.org/lang_select.html>, "each simple SELECT ... must return the same number of
+/// result columns" and its ORDER BY note). Resolved names are stored as a numeric-literal
+/// [`ast::Expr`] (the same representation a plain SELECT's `ORDER BY <n>` already normalizes to,
+/// see `replace_column_number_with_copy_of_column_expr`) purely so [`Plan::CompoundSelect`]'s
+/// existing `order_by: Option<Vec<(ast::Expr, SortOrder)>>` field shape doesn't need to change;
+/// `compound_select::emit_program_for_compound_select` parses the literal back out.
+fn resolve_compound_order_by(
+    order_by: Vec<ast::SortedColumn>,
+    name_source: &SelectPlan,
+) -> Result<Vec<(ast::Expr, SortOrder)>> {
+    let mut resolved = Vec::with_capacity(order_by.len());
+    for sorted_col in order_by {
+        let ordinal = match &sorted_col.expr {
+            ast::Expr::Literal(ast::Literal::Numeric(n)) => {
+                let ordinal = n.parse::<usize>()?;
+                if ordinal == 0 || ordinal > name_source.result_columns.len() {
+                    crate::bail_parse_error!("invalid column index: {}", ordinal);
+                }
+                ordinal
+            }
+            ast::Expr::Id(id) => {
+                let normalized = normalize_ident(id.0.as_str());
+                let pos = name_source.result_columns.iter().position(|rc| {
+                    rc.name(&name_source.table_references)
+                        .map_or(false, |name| name.eq_ignore_ascii_case(&normalized))
+                });
+                match pos {
+                    Some(pos) => pos + 1,
+                    None => crate::bail_parse_error!(
+                        "ORDER BY term does not match any column in the result set: {}",
+                        id.0
+                    ),
+                }
+            }
+            _ => crate::bail_parse_error!(
+                "ORDER BY terms in a compound SELECT must be a result column name or an ordinal position"
+            ),
+        };
+        resolved.push((
+            ast::Expr::Literal(ast::Literal::Numeric(ordinal.to_string())),
+            sorted_col.order.unwrap_or(ast::SortOrder::Asc),
+        ));
+    }
+    Ok(resolved)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn prepare_one_select_plan<'a>(
     schema: &Schema,
     select: ast::OneSelect,
     limit: Option<&ast::Limit>,
     order_by: Option<Vec<ast::SortedColumn>>,
-    with: Option<ast::With>,
+    with_for_display: Option<ast::With>,
+    ctes: &[JoinedTable],
     syms: &SymbolTable,
     outer_query_refs: &[OuterQueryReference],
     table_ref_counter: &mut TableRefIdCounter,
@@ -222,11 +311,16 @@ fn prepare_one_select_plan<'a>(
             let mut table_references = TableReferences::new(vec![], outer_query_refs.to_vec());
 
             // Parse the FROM clause into a vec of TableReferences. Fold all the join conditions expressions into the WHERE clause.
+            // `ctes` (built once by the caller from the statement's top-level `WITH`, see
+            // `prepare_select_plan`) is made available to `parse_from_clause_table` here so this
+            // arm's own FROM-clause references can resolve it -- each lookup clones + renumbers
+            // its own independent instance, so this is safe even when the very same CTE template
+            // is *also* handed to sibling compound-SELECT arms.
             parse_from(
                 schema,
                 from,
                 syms,
-                with,
+                ctes,
                 &mut where_predicates,
                 &mut table_references,
                 table_ref_counter,
@@ -281,6 +375,7 @@ fn prepare_one_select_plan<'a>(
                 query_destination,
                 distinctness: Distinctness::from_ast(distinctness.as_ref()),
                 values: vec![],
+                with: with_for_display,
             };
 
             let mut aggregate_expressions = Vec::new();
@@ -325,7 +420,7 @@ fn prepare_one_select_plan<'a>(
                                     is_rowid_alias,
                                 },
                                 alias: None,
-                                contains_aggregates: false,
+                                contains_aggregates: AggregateMask::EMPTY,
                             });
                             table.mark_column_used(idx);
                         }
@@ -389,22 +484,18 @@ fn prepare_one_select_plan<'a>(
                                         };
                                         aggregate_expressions.push(agg.clone());
                                         plan.result_columns.push(ResultSetColumn {
-                                            alias: maybe_alias.as_ref().map(|alias| match alias {
-                                                ast::As::Elided(alias) => alias.0.clone(),
-                                                ast::As::As(alias) => alias.0.clone(),
-                                            }),
+                                            alias: maybe_alias.as_ref().map(alias_name),
                                             expr: expr.clone(),
-                                            contains_aggregates: true,
+                                            contains_aggregates: AggregateMask::from_index(
+                                                aggregate_expressions.len() - 1,
+                                            ),
                                         });
                                     }
                                     Ok(_) => {
                                         let contains_aggregates =
                                             resolve_aggregates(expr, &mut aggregate_expressions)?;
                                         plan.result_columns.push(ResultSetColumn {
-                                            alias: maybe_alias.as_ref().map(|alias| match alias {
-                                                ast::As::Elided(alias) => alias.0.clone(),
-                                                ast::As::As(alias) => alias.0.clone(),
-                                            }),
+                                            alias: maybe_alias.as_ref().map(alias_name),
                                             expr: expr.clone(),
                                             contains_aggregates,
                                         });
@@ -418,14 +509,7 @@ fn prepare_one_select_plan<'a>(
                                                     &mut aggregate_expressions,
                                                 )?;
                                                 plan.result_columns.push(ResultSetColumn {
-                                                    alias: maybe_alias.as_ref().map(|alias| {
-                                                        match alias {
-                                                            ast::As::Elided(alias) => {
-                                                                alias.0.clone()
-                                                            }
-                                                            ast::As::As(alias) => alias.0.clone(),
-                                                        }
-                                                    }),
+                                                    alias: maybe_alias.as_ref().map(alias_name),
                                                     expr: expr.clone(),
                                                     contains_aggregates,
                                                 });
@@ -438,16 +522,11 @@ fn prepare_one_select_plan<'a>(
                                                 };
                                                 aggregate_expressions.push(agg.clone());
                                                 plan.result_columns.push(ResultSetColumn {
-                                                    alias: maybe_alias.as_ref().map(|alias| {
-                                                        match alias {
-                                                            ast::As::Elided(alias) => {
-                                                                alias.0.clone()
-                                                            }
-                                                            ast::As::As(alias) => alias.0.clone(),
-                                                        }
-                                                    }),
+                                                    alias: maybe_alias.as_ref().map(alias_name),
                                                     expr: expr.clone(),
-                                                    contains_aggregates: true,
+                                                    contains_aggregates: AggregateMask::from_index(
+                                                        aggregate_expressions.len() - 1,
+                                                    ),
                                                 });
                                             }
                                             continue; // Continue with the normal flow instead of returning
@@ -475,12 +554,11 @@ fn prepare_one_select_plan<'a>(
                                     };
                                     aggregate_expressions.push(agg.clone());
                                     plan.result_columns.push(ResultSetColumn {
-                                        alias: maybe_alias.as_ref().map(|alias| match alias {
-                                            ast::As::Elided(alias) => alias.0.clone(),
-                                            ast::As::As(alias) => alias.0.clone(),
-                                        }),
+                                        alias: maybe_alias.as_ref().map(alias_name),
                                         expr: expr.clone(),
-                                        contains_aggregates: true,
+                                        contains_aggregates: AggregateMask::from_index(
+                                            aggregate_expressions.len() - 1,
+                                        ),
                                     });
                                 } else {
                                     crate::bail_parse_error!(
@@ -493,10 +571,7 @@ fn prepare_one_select_plan<'a>(
                                 let contains_aggregates =
                                     resolve_aggregates(expr, &mut aggregate_expressions)?;
                                 plan.result_columns.push(ResultSetColumn {
-                                    alias: maybe_alias.as_ref().map(|alias| match alias {
-                                        ast::As::Elided(alias) => alias.0.clone(),
-                                        ast::As::As(alias) => alias.0.clone(),
-                                    }),
+                                    alias: maybe_alias.as_ref().map(alias_name),
                                     expr: expr.clone(),
                                     contains_aggregates,
                                 });
@@ -538,7 +613,7 @@ fn prepare_one_select_plan<'a>(
                             )?;
                             let contains_aggregates =
                                 resolve_aggregates(expr, &mut aggregate_expressions)?;
-                            if !contains_aggregates {
+                            if contains_aggregates.is_empty() {
                                 // TODO: sqlite allows HAVING clauses with non aggregate expressions like
                                 // HAVING id = 5. We should support this too eventually (I guess).
                                 // sqlite3-parser does not support HAVING without group by though, so we'll
@@ -611,7 +686,7 @@ fn prepare_one_select_plan<'a>(
                     // these result_columns work as placeholders for the values, so the expr doesn't matter
                     expr: ast::Expr::Literal(ast::Literal::Numeric(i.to_string())),
                     alias: None,
-                    contains_aggregates: false,
+                    contains_aggregates: AggregateMask::EMPTY,
                 });
             }
             let plan = SelectPlan {
@@ -630,6 +705,7 @@ fn prepare_one_select_plan<'a>(
                 query_destination,
                 distinctness: Distinctness::NonDistinct,
                 values,
+                with: with_for_display,
             };
 
             Ok(plan)
@@ -673,7 +749,7 @@ fn count_plan_required_cursors(plan: &SelectPlan) -> usize {
                 Search::Seek { index, .. } => 1 + index.is_some() as usize,
             }
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
-            count_plan_required_cursors(&from_clause_subquery.plan)
+            count_plan_required_cursors_any(&from_clause_subquery.plan)
         } else {
             0
         })
@@ -684,6 +760,56 @@ fn count_plan_required_cursors(plan: &SelectPlan) -> usize {
     num_table_cursors + num_sorter_cursors + num_pseudo_cursors
 }
 
+/// [`count_plan_required_cursors`] over any [`Plan`]: sums every SELECT arm of a
+/// compound subquery body. Used for the approximate cursor pre-count of a
+/// FROM-clause subquery whose body may be a compound SELECT (e.g. a view).
+fn count_plan_required_cursors_any(plan: &Plan) -> usize {
+    match plan {
+        Plan::Select(select) => count_plan_required_cursors(select),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            left.iter()
+                .map(|(p, _)| count_plan_required_cursors(p))
+                .sum::<usize>()
+                + count_plan_required_cursors(right_most)
+        }
+        Plan::Delete(_) | Plan::Update(_) => 0,
+    }
+}
+
+/// [`estimate_num_instructions`] over any [`Plan`] (sums compound arms).
+fn estimate_num_instructions_any(plan: &Plan) -> usize {
+    match plan {
+        Plan::Select(select) => estimate_num_instructions(select),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            left.iter()
+                .map(|(p, _)| estimate_num_instructions(p))
+                .sum::<usize>()
+                + estimate_num_instructions(right_most)
+        }
+        Plan::Delete(_) | Plan::Update(_) => 0,
+    }
+}
+
+/// [`estimate_num_labels`] over any [`Plan`] (sums compound arms).
+fn estimate_num_labels_any(plan: &Plan) -> usize {
+    match plan {
+        Plan::Select(select) => estimate_num_labels(select),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            left.iter()
+                .map(|(p, _)| estimate_num_labels(p))
+                .sum::<usize>()
+                + estimate_num_labels(right_most)
+        }
+        Plan::Delete(_) | Plan::Update(_) => 0,
+    }
+}
+
 fn estimate_num_instructions(select: &SelectPlan) -> usize {
     let table_instructions: usize = select
         .joined_tables()
@@ -692,7 +818,7 @@ fn estimate_num_instructions(select: &SelectPlan) -> usize {
             Operation::Scan { .. } => 10,
             Operation::Search(_) => 15,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
-            10 + estimate_num_instructions(&from_clause_subquery.plan)
+            10 + estimate_num_instructions_any(&from_clause_subquery.plan)
         } else {
             0
         })
@@ -721,7 +847,7 @@ fn estimate_num_labels(select: &SelectPlan) -> usize {
             Operation::Scan { .. } => 3,
             Operation::Search(_) => 3,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
-            3 + estimate_num_labels(&from_clause_subquery.plan)
+            3 + estimate_num_labels_any(&from_clause_subquery.plan)
         } else {
             0
         })

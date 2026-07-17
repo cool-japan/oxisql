@@ -9,7 +9,10 @@ use std::sync::Arc;
 
 impl Clock for VfsMod {
     fn now(&self) -> Instant {
-        let now = chrono::Local::now();
+        // UTC, not Local: `timestamp()`/`timestamp_subsec_micros()` return
+        // the same absolute Unix instant regardless of timezone, so there is
+        // no need for the host OS's local-timezone database here.
+        let now = chrono::Utc::now();
         Instant {
             secs: now.timestamp(),
             micros: now.timestamp_subsec_micros(),
@@ -43,8 +46,11 @@ impl IO for VfsMod {
         Ok(())
     }
 
-    fn wait_for_completion(&self, _c: Arc<Completion>) -> Result<()> {
-        todo!();
+    fn wait_for_completion(&self, c: Arc<Completion>) -> Result<()> {
+        while !c.is_completed() {
+            self.run_once()?;
+        }
+        Ok(())
     }
 
     fn generate_random_number(&self) -> i64 {
@@ -178,5 +184,131 @@ impl Drop for VfsMod {
         unsafe {
             let _ = Box::from_raw(self.ctx as *mut VfsImpl);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::WriteCompletion;
+    use limbo_ext::ResultCode;
+    use std::ffi::c_char;
+    use std::rc::Rc;
+
+    /// Sentinel "file handle" returned by [`stub_open`]. None of the stub
+    /// callbacks below ever dereference it, so any non-null value is safe
+    /// to hand back across this fake FFI boundary.
+    const FAKE_FILE_HANDLE: usize = 0xdead_beef;
+
+    extern "C" fn stub_open(
+        _ctx: *const c_void,
+        _path: *const c_char,
+        _flags: i32,
+        _direct: bool,
+    ) -> *const c_void {
+        FAKE_FILE_HANDLE as *const c_void
+    }
+
+    extern "C" fn stub_close(_file: *const c_void) -> ResultCode {
+        ResultCode::OK
+    }
+
+    extern "C" fn stub_read(
+        _file: *const c_void,
+        _buf: *mut u8,
+        count: usize,
+        _offset: i64,
+    ) -> i32 {
+        count as i32
+    }
+
+    extern "C" fn stub_write(
+        _file: *const c_void,
+        _buf: *const u8,
+        count: usize,
+        _offset: i64,
+    ) -> i32 {
+        count as i32
+    }
+
+    extern "C" fn stub_sync(_file: *const c_void) -> i32 {
+        0
+    }
+
+    extern "C" fn stub_lock(_file: *const c_void, _exclusive: bool) -> ResultCode {
+        ResultCode::OK
+    }
+
+    extern "C" fn stub_unlock(_file: *const c_void) -> ResultCode {
+        ResultCode::OK
+    }
+
+    extern "C" fn stub_size(_file: *const c_void) -> i64 {
+        0
+    }
+
+    extern "C" fn stub_run_once(_vfs: *const c_void) -> ResultCode {
+        ResultCode::OK
+    }
+
+    extern "C" fn stub_current_time() -> *const c_char {
+        std::ptr::null()
+    }
+
+    extern "C" fn stub_gen_random_number() -> i64 {
+        0
+    }
+
+    /// Builds a `VfsMod` around an all-stub `VfsImpl` vtable, mirroring how
+    /// `register_vfs`/`add_builtin_vfs_extensions` build one from a real
+    /// extension's FFI vtable (see `ext/dynamic.rs`). Ownership of the boxed
+    /// `VfsImpl` transfers to the returned `VfsMod`, which frees it on drop
+    /// (see `impl Drop for VfsMod` above).
+    fn make_test_vfs_mod() -> VfsMod {
+        let vfs_impl = Box::new(VfsImpl {
+            name: std::ptr::null(),
+            vfs: std::ptr::null(),
+            open: stub_open,
+            close: stub_close,
+            read: stub_read,
+            write: stub_write,
+            sync: stub_sync,
+            lock: stub_lock,
+            unlock: stub_unlock,
+            size: stub_size,
+            run_once: stub_run_once,
+            current_time: stub_current_time,
+            gen_random_number: stub_gen_random_number,
+        });
+        VfsMod {
+            ctx: Box::into_raw(vfs_impl),
+        }
+    }
+
+    #[test]
+    fn test_wait_for_completion_returns_ok_for_already_completed_operation() {
+        let vfs_mod = make_test_vfs_mod();
+        let file = vfs_mod
+            .open_file("test-file", OpenFlags::Create, false)
+            .expect("open_file should succeed against the stub VFS");
+
+        let drop_fn = Rc::new(|_buf| {});
+        let buf = Arc::new(RefCell::new(Buffer::allocate(8, drop_fn)));
+        let write_complete = Box::new(|_| {});
+        let completion = Arc::new(Completion::Write(WriteCompletion::new(write_complete)));
+
+        // `VfsFileImpl::pwrite` completes the operation synchronously before
+        // returning, so `completion` is already completed at this point.
+        file.pwrite(0, buf, completion.clone())
+            .expect("pwrite should succeed");
+        assert!(completion.is_completed());
+
+        // Regression coverage: for an already-completed operation the
+        // while-loop in `wait_for_completion` must not iterate (and must
+        // not hang) -- it should observe `is_completed() == true` right
+        // away and return `Ok(())` promptly.
+        vfs_mod.wait_for_completion(completion).expect(
+            "wait_for_completion should return Ok promptly for an already-completed operation",
+        );
     }
 }

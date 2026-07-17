@@ -1,6 +1,6 @@
 # oxisql-mysql — TODO
 
-**Status: Stable** · v0.3.2 · MSRV 1.89 · edition 2021 · Apache-2.0
+**Status: Stable** · v0.3.3 · MSRV 1.89 · edition 2021 · Apache-2.0
 
 Pure-Rust MySQL backend over `mysql_async`, no `libmysqlclient` and no
 `openssl-sys`. `MyConnection` implements `oxisql_core::Connection` over an
@@ -34,6 +34,10 @@ process-global `CryptoProvider` install (no `ring`).
 - [x] `MyConnectionBuilder` — `host` / `port` / `user` / `password` / `dbname` / `connect_timeout_secs` / `pool_min` / `pool_max` / `pool_idle_timeout` / `pool_ttl` → `connect`
 - [x] TLS builder methods — `ssl_disabled` / `ssl_skip_verify` / `ssl_with_ca_pem` via `SslOpts`
 - [x] `mysql_url_parts(url)` → `MysqlUrlParts` (`host` / `port` / `dbname` / `user`)
+- [x] `server_version()` — `async`, acquires a pooled connection and formats
+      `mysql_async::Conn::server_version()`'s `(u16, u16, u16)` as
+      `"{major}.{minor}.{patch}"`, matching `oxisql::BackendInfo::version`'s
+      `Option<String>` shape
 - [x] Rich `MysqlError` (`ConnectionTimeout`, `PoolExhausted`, `ConstraintViolation`, …)
 
 ### Ecosystem integration
@@ -54,12 +58,15 @@ process-global `CryptoProvider` install (no `ring`).
 
 ## Known limitations
 
-- Live-server integration tests are `#[ignore]`-gated (they require a real
-  MySQL 8.x server): CRUD cycles, transaction commit/rollback, concurrent
-  transactions, stored-procedure multi-result-sets, binary-protocol prepared
-  statements, pool behaviour, and the live TLS connect test. Run them with a
-  server up and the `integration-mysql` feature. Without one,
-  `cargo test -p oxisql-mysql` reports 95 passed with the live tests skipped.
+- Live-server integration tests are gated behind **both** `#[cfg(feature =
+  "integration-mysql")]` and `#[ignore]` (they require a real MySQL 8.x
+  server): CRUD cycles, transaction commit/rollback, concurrent transactions,
+  stored-procedure multi-result-sets, binary-protocol prepared statements,
+  pool behaviour, and the live TLS connect test. Run them with a server up and
+  `cargo test -p oxisql-mysql --features integration-mysql -- --include-ignored`.
+  Without the feature, `cargo test -p oxisql-mysql` reports 102 passed
+  (including 6 doctests) with the live tests absent (not merely skipped —
+  they are not compiled in at all).
 - Auto-reconnect is detected but deliberately not applied mid-transaction, to
   preserve transactional correctness.
 - `TlsMode::Rustls(_)` installs the RustCrypto provider but does not pass a

@@ -98,6 +98,38 @@ impl SqliteConnectionBlocking {
         Self::open(":memory:")
     }
 
+    /// Open a SQLite connection from an in-memory database image (blocking).
+    ///
+    /// The synchronous counterpart of
+    /// [`SqliteConnection::open_from_bytes`](crate::connection::SqliteConnection::open_from_bytes):
+    /// the `bytes` are copied into an in-memory page store, so no temporary
+    /// file is ever created.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "blocking")]
+    /// # fn run() -> Result<(), oxisql_core::OxiSqlError> {
+    /// use oxisql_sqlite_compat::blocking::SqliteConnectionBlocking;
+    ///
+    /// let image: &[u8] = include_bytes_placeholder();
+    /// let conn = SqliteConnectionBlocking::open_from_bytes(image)?;
+    /// conn.execute("CREATE TABLE t (id INTEGER)", &[])?;
+    /// # Ok(())
+    /// # }
+    /// # fn include_bytes_placeholder() -> &'static [u8] { &[] }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OxiSqlError`] if `bytes` is not a valid SQLite database image.
+    pub fn open_from_bytes(bytes: &[u8]) -> Result<Self, OxiSqlError> {
+        let bytes_owned = bytes.to_vec();
+        let inner =
+            block_static(async move { SqliteConnection::open_from_bytes(&bytes_owned).await })?;
+        Ok(Self(inner))
+    }
+
     /// Return the path this connection was opened with.
     pub fn path(&self) -> &str {
         self.0.path()

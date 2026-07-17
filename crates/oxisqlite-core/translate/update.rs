@@ -12,8 +12,8 @@ use limbo_sqlite3_parser::ast::{self, Expr, ResultColumn, SortOrder, Update};
 use super::emitter::emit_program;
 use super::optimizer::optimize_plan;
 use super::plan::{
-    ColumnUsedMask, IterationDirection, JoinedTable, Plan, ResultSetColumn, TableReferences,
-    UpdatePlan,
+    AggregateMask, ColumnUsedMask, IterationDirection, JoinedTable, Plan, ResultSetColumn,
+    TableReferences, UpdatePlan,
 };
 use super::planner::bind_column_references;
 use super::planner::{parse_limit_full, parse_where, LimitValue};
@@ -112,6 +112,9 @@ pub fn prepare_update_plan(
         Some(table) => table,
         None => bail_parse_error!("Parse error: no such table: {}", table_name),
     };
+    if matches!(table.as_ref(), crate::schema::Table::View(_)) {
+        bail_parse_error!("cannot modify {} because it is a view", table_name.0);
+    }
     let iter_dir = body
         .order_by
         .as_ref()
@@ -182,7 +185,7 @@ pub fn prepare_update_plan(
                             None
                         }
                     }),
-                    contains_aggregates: false,
+                    contains_aggregates: AggregateMask::EMPTY,
                 });
             } else {
                 bail_parse_error!("Only expressions are allowed in RETURNING clause");

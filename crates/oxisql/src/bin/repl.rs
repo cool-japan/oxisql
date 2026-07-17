@@ -439,7 +439,7 @@ SQL statements end with ';' or a blank line."#
                     .await
                     .context("failed to describe columns")?;
                 if columns.is_empty() {
-                    println!("(table '{table_name}' not found or has no columns)");
+                    eprintln!("(table '{table_name}' not found or has no columns)");
                 } else {
                     println!("Table: {table_name}");
                     println!("{:<30} {:<20} {:<10}", "COLUMN", "TYPE", "NULLABLE");
@@ -659,7 +659,7 @@ async fn execute_sql(conn: &dyn Connection, sql: &str, state: &mut ReplState) {
                     println!("Time: {:.3}ms", t.elapsed().as_secs_f64() * 1000.0);
                 }
             }
-            Err(e) => eprintln!("Error: {e}"),
+            Err(e) => eprintln!("Error: {}", oxisql::display_error(&e)),
         }
     } else {
         match conn.execute(sql, &[]).await {
@@ -673,7 +673,7 @@ async fn execute_sql(conn: &dyn Connection, sql: &str, state: &mut ReplState) {
                     println!("Time: {:.3}ms", t.elapsed().as_secs_f64() * 1000.0);
                 }
             }
-            Err(e) => eprintln!("Error: {e}"),
+            Err(e) => eprintln!("Error: {}", oxisql::display_error(&e)),
         }
     }
 }

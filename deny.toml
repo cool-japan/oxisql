@@ -1,3 +1,19 @@
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071: Marvin Attack (RSA PKCS#1 v1.5 timing side-channel) in
+    # `rsa` 0.9.10, pulled in transitively via `rustls-rustcrypto` (TLS crypto
+    # provider for oxisql-postgres / oxisql-mysql). UNREACHABLE here: OxiSQL only
+    # ever configures rustls as a *TLS client* — every `ClientConfig` builder in
+    # this workspace calls `.with_no_client_auth()` (see
+    # crates/oxisql-postgres/src/builder.rs, crates/oxisql-mysql/src/lib.rs) — so
+    # rustls never performs client-certificate RSA private-key operations (the
+    # only operation Marvin's timing side-channel targets). Server-certificate
+    # RSA signature *verification* (the only RSA path actually exercised) is not
+    # affected by this advisory. No upstream fix exists yet; re-check when
+    # `rustls-rustcrypto` or `rsa` publishes a patched release.
+    "RUSTSEC-2023-0071",
+]
+
 [bans]
 deny = [
     { name = "libsqlite3-sys" },

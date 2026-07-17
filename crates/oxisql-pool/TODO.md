@@ -1,6 +1,6 @@
 # oxisql-pool — TODO
 
-## Status: Stable (0.3.2)
+## Status: Stable (0.3.3)
 
 Pure Rust core, `#![forbid(unsafe_code)]`. Four pool backends behind opt-in
 features: `postgres` (`deadpool-postgres` wrapper), `mysql` (custom
@@ -11,8 +11,9 @@ with `health_check()` and `metrics()` dispatch; each concrete pool also exposes
 `backend_name()`. `PoolError` covers Postgres pool/create errors, MySQL pool/URL
 errors, and SQLite pool errors. The default feature set is empty.
 
-**Tests: 57 pass with `--all-features` (48 integration + 9 doc); 4 ignored** (the
-ignored tests are live-server-gated MySQL/Postgres pool tests). Zero clippy warnings.
+**Tests: 35 pass with default features; 62 pass with `--all-features`**
+(52 integration + 10 doc); **4 ignored** (the ignored tests are live-server-gated
+MySQL/Postgres pool tests). Zero clippy warnings.
 
 ## Done
 

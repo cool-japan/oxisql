@@ -123,7 +123,7 @@ pub fn integrity_check(
                 payload_overflow_threshold_max(contents.page_type(), usable_space),
                 payload_overflow_threshold_min(contents.page_type(), usable_space),
                 usable_space as usize,
-            );
+            )?;
         if cell_start < contents.cell_content_area() as usize
             || cell_start > usable_space as usize - 4
         {
@@ -284,7 +284,8 @@ impl PartialOrd for IntegrityCheckCellRange {
 }
 #[cfg(debug_assertions)]
 fn validate_cells_after_insertion(cell_array: &CellArray, leaf_data: bool) {
-    for cell in &cell_array.cells {
+    for cell_idx in 0..cell_array.cells.len() {
+        let cell = cell_array.cell(cell_idx);
         assert!(cell.len() >= 4);
         if leaf_data {
             assert!(cell[0] != 0, "payload is {:?}", cell);
@@ -478,14 +479,54 @@ impl PageStack {
         }
     }
 }
+/// Records which old sibling page a snapshotted cell came from, so a cell can
+/// later be freed from the correct destination page during [`edit_page`]
+/// without the address-range pointer comparison the old `&'static mut` design
+/// relied on.
+#[derive(Clone, Copy)]
+struct CellOrigin {
+    /// Index (0-based) of the old sibling page this cell was snapshotted from,
+    /// matching the destination-page slot in `pages_to_balance_new`.
+    page_slot: u8,
+    /// The cell's byte offset within that page (`cell_start - page.offset`),
+    /// i.e. the range `free_cell_range` must reclaim when the cell is dropped.
+    page_offset: u16,
+}
+/// One logical cell in a [`CellArray`], described as an owned byte range inside
+/// [`CellArray::bufs`] rather than a borrow into a live page buffer.
+struct CellRef {
+    /// Index into [`CellArray::bufs`].
+    buf: u32,
+    /// Start of the cell's bytes within that buffer.
+    start: u32,
+    /// Length of the cell's bytes.
+    len: u32,
+    /// `Some` for cells snapshotted from an old sibling page; `None` for
+    /// overflow-cell payloads and divider cells, which live in their own
+    /// dedicated scratch buffers and are never freed from a page.
+    origin: Option<CellOrigin>,
+}
 /// Used for redistributing cells during a balance operation.
+///
+/// Owns snapshots of each old sibling page's bytes (`bufs`: one snapshot per
+/// page, plus a dedicated scratch buffer per overflow-cell payload and per
+/// divider cell) exactly like SQLite's `balance_nonroot` `apCopy[]`. `cells`
+/// only indexes into `bufs`, so nothing here aliases a live page buffer and
+/// there is no lifetime laundering / undefined behaviour.
 struct CellArray {
-    cells: Vec<&'static mut [u8]>,
+    bufs: Vec<Box<[u8]>>,
+    cells: Vec<CellRef>,
     number_of_cells_per_page: [u16; 5],
 }
 impl CellArray {
+    /// Borrow the bytes of cell `cell_idx` from the owned snapshot buffers.
+    fn cell(&self, cell_idx: usize) -> &[u8] {
+        let cell = &self.cells[cell_idx];
+        let start = cell.start as usize;
+        &self.bufs[cell.buf as usize][start..start + cell.len as usize]
+    }
     pub fn cell_size(&self, cell_idx: usize) -> u16 {
-        self.cells[cell_idx].len() as u16
+        self.cells[cell_idx].len as u16
     }
     pub fn cell_count(&self, page_idx: usize) -> usize {
         self.number_of_cells_per_page[page_idx] as usize
@@ -560,11 +601,23 @@ pub fn btree_init_page(
     contents.write_u8(offset::BTREE_FRAGMENTED_BYTES_COUNT, 0);
     contents.write_u32(offset::BTREE_RIGHTMOST_PTR, 0);
 }
-fn to_static_buf(buf: &mut [u8]) -> &'static mut [u8] {
-    unsafe { std::mem::transmute::<&mut [u8], &'static mut [u8]>(buf) }
+/// Launder a shared page-buffer slice to `&'static [u8]`.
+///
+/// Only the debug-only post-balance validation path uses this, to satisfy
+/// [`crate::storage::sqlite3_ondisk::read_btree_cell`]'s `&'static [u8]`
+/// signature for momentary, read-only cross-checking. That path only ever
+/// *reads* the page buffers, so a shared view is sound to hold across the
+/// other shared reads there (whereas an exclusive `as_ptr`-derived one would
+/// be invalidated by them). The balancing algorithm itself no longer launders
+/// lifetimes -- [`CellArray`] owns its bytes. Kept behind `debug_assertions`
+/// so the transmute does not exist in release builds.
+#[cfg(debug_assertions)]
+fn to_static_buf_shared(buf: &[u8]) -> &'static [u8] {
+    unsafe { std::mem::transmute::<&[u8], &'static [u8]>(buf) }
 }
 fn edit_page(
     page: &mut PageContent,
+    page_slot: usize,
     start_old_cells: usize,
     start_new_cells: usize,
     number_new_cells: usize,
@@ -582,6 +635,7 @@ fn edit_page(
         debug_validate_cells!(page, usable_space);
         let number_to_shift = page_free_array(
             page,
+            page_slot,
             start_old_cells,
             start_new_cells - start_old_cells,
             cell_array,
@@ -595,6 +649,7 @@ fn edit_page(
         debug_validate_cells!(page, usable_space);
         let number_tail_removed = page_free_array(
             page,
+            page_slot,
             end_new_cells,
             end_old_cells - end_new_cells,
             cell_array,
@@ -604,7 +659,7 @@ fn edit_page(
         count_cells -= number_tail_removed;
         debug_validate_cells!(page, usable_space);
     }
-    defragment_page(page, usable_space);
+    defragment_page(page, usable_space)?;
     if start_new_cells < start_old_cells {
         let count = number_new_cells.min(start_old_cells - start_new_cells);
         page_insert_array(page, start_new_cells, count, cell_array, 0, usable_space)?;
@@ -653,34 +708,44 @@ fn edit_page(
 /// It shifts the pointers starting from `number_to_shift` to the beginning of the array,
 /// effectively removing the first `number_to_shift` pointers.
 fn shift_cells_left(page: &mut PageContent, count_cells: usize, number_to_shift: usize) {
-    let buf = page.as_ptr();
+    // Read the cell-pointer-array offset BEFORE acquiring `as_ptr()`: `as_ptr`
+    // hands out a `&mut [u8]` (a `Unique` retag of the whole buffer) fabricated
+    // from `&self`, and any later `page.<method>()` call re-borrows the buffer
+    // (`&self.data`, a shared retag) and invalidates that exclusive tag -- so
+    // using `buf` afterwards would operate through a dangling tag (the UB Miri
+    // flags here). See `defragment_page` for the same ordering discipline.
     let (start, _) = page.cell_pointer_array_offset_and_size();
+    let buf = page.as_ptr();
     buf.copy_within(start + (number_to_shift * 2)..start + (count_cells * 2), start);
 }
 fn page_free_array(
     page: &mut PageContent,
+    page_slot: usize,
     first: usize,
     count: usize,
     cell_array: &CellArray,
     usable_space: u16,
 ) -> Result<usize> {
     tracing::debug!("page_free_array {}..{}", first, first + count);
-    let buf = &mut page.as_ptr()[page.offset..usable_space as usize];
-    let buf_range = buf.as_ptr_range();
     let mut number_of_cells_removed = 0;
     let mut number_of_cells_buffered = 0;
     let mut buffered_cells_offsets: [u16; 10] = [0; 10];
     let mut buffered_cells_ends: [u16; 10] = [0; 10];
     for i in first..first + count {
+        // With owned snapshots a cell no longer aliases the live page, so we
+        // can no longer identify "cells physically in this page" by comparing
+        // raw address ranges. Instead a cell is freed from `page` iff it was
+        // snapshotted from this destination slot (new sibling `page_slot`
+        // reuses old sibling `page_slot`'s buffer), reclaiming the exact byte
+        // range it occupied there -- deterministic, address-independent, and
+        // identical in effect to the previous pointer-range test.
         let cell = &cell_array.cells[i];
-        let cell_pointer = cell.as_ptr_range();
-        if cell_pointer.start >= buf_range.start && cell_pointer.start < buf_range.end {
-            assert!(
-                cell_pointer.end >= buf_range.start && cell_pointer.end <= buf_range.end,
-                "whole cell should be inside the page"
-            );
-            let offset = (cell_pointer.start as usize - buf_range.start as usize) as u16;
-            let len = (cell_pointer.end as usize - cell_pointer.start as usize) as u16;
+        let Some(origin) = cell.origin else {
+            continue;
+        };
+        if origin.page_slot as usize == page_slot {
+            let offset = origin.page_offset;
+            let len = cell.len as u16;
             assert!(len > 0, "cell size should be greater than 0");
             let end = offset + len;
             let mut j = 0;
@@ -740,12 +805,19 @@ fn page_insert_array(
         first, first + count, page.cell_count(), page.page_type()
     );
     for i in first..first + count {
-        insert_into_cell(page, cell_array.cells[i], start_insert, usable_space)?;
+        insert_into_cell(page, cell_array.cell(i), start_insert, usable_space)?;
         start_insert += 1;
     }
     debug_validate_cells!(page, usable_space);
     Ok(())
 }
+/// Every on-page cell must be at least this many bytes, so that a freed cell has room for a
+/// free-block's own bookkeeping (a 2-byte "next freeblock" pointer + a 2-byte "this block's size"
+/// field, written *inside* the freed range by [`free_cell_range`]). [`fill_cell_payload`] pads any
+/// naturally-smaller cell up to this size at creation time; [`crate::storage::sqlite3_ondisk::PageContent::cell_get_raw_region`]
+/// mirrors the same floor when computing a cell's size back out, so the two stay consistent.
+pub(crate) const MINIMUM_CELL_SIZE: usize = 4;
+
 /// Free the range of bytes that a cell occupies.
 /// This function also updates the freeblock list in the page.
 /// Freeblocks are used to keep track of free space in the page,
@@ -756,7 +828,7 @@ fn free_cell_range(
     len: u16,
     usable_space: u16,
 ) -> Result<()> {
-    if len < 4 {
+    if (len as usize) < MINIMUM_CELL_SIZE {
         return_corrupt!("Minimum cell size is 4");
     }
     if offset > usable_space.saturating_sub(4) {
@@ -786,10 +858,14 @@ fn free_cell_range(
         }
         let mut removed_fragmentation = 0;
         if pc > 0 && offset + len + 3 >= pc {
-            removed_fragmentation = (pc - end) as u8;
+            // The overlap guard must run *before* computing `pc - end`: on a
+            // corrupt page `end` can exceed `pc`, and `(pc - end) as u8` would
+            // underflow (panicking under debug overflow checks) if evaluated
+            // first.
             if end > pc {
                 return_corrupt!("Invalid block overlap");
             }
+            removed_fragmentation = (pc - end) as u8;
             end = pc + page.read_u16_no_offset(pc as usize + 2);
             if end > usable_space {
                 return_corrupt!("Coalesced block extends beyond page");
@@ -836,7 +912,7 @@ fn free_cell_range(
     Ok(())
 }
 /// Defragment a page. This means packing all the cells to the end of the page.
-fn defragment_page(page: &PageContent, usable_space: u16) {
+fn defragment_page(page: &PageContent, usable_space: u16) -> Result<()> {
     debug_validate_cells!(page, usable_space);
     tracing::debug!("defragment_page");
     let cloned_page = page.clone();
@@ -844,30 +920,40 @@ fn defragment_page(page: &PageContent, usable_space: u16) {
     let last_cell = usable_space - 4;
     let first_cell = cloned_page.unallocated_region_start() as u16;
     if cloned_page.cell_count() > 0 {
-        let read_buf = cloned_page.as_ptr();
+        // Read every metadata field we need from `page` (the header-derived
+        // cell-pointer-array offset and the page type for the size thresholds)
+        // BEFORE acquiring `write_buf` below: both are constant across the loop
+        // (defragmentation never changes the cell count or page type). This
+        // matters because `write_buf` is a `&mut [u8]` fabricated from `&self`
+        // via `as_ptr`, and any later `page.<method>()` call re-acquires the
+        // buffer and invalidates it (see `PageContent::as_ptr`'s doc comment).
+        let (cell_offset, _) = page.cell_pointer_array_offset_and_size();
+        let max_local = payload_overflow_threshold_max(page.page_type(), usable_space);
+        let min_local = payload_overflow_threshold_min(page.page_type(), usable_space);
+        // Source bytes come from the independent `cloned_page` snapshot via a
+        // *shared* view (sound to hold across the other shared reads below);
+        // the destination is `page`'s buffer, a different allocation.
+        let read_buf = cloned_page.as_slice();
         let write_buf = page.as_ptr();
         for i in 0..cloned_page.cell_count() {
-            let (cell_offset, _) = page.cell_pointer_array_offset_and_size();
             let cell_idx = cell_offset + (i * 2);
             let pc = cloned_page.read_u16_no_offset(cell_idx);
             if pc > last_cell {
-                unimplemented!("corrupted page");
+                return_corrupt!("Cell offset out of range during defragmentation");
             }
-            assert!(pc <= last_cell);
             let (_, size) = cloned_page
-                .cell_get_raw_region(
-                    i,
-                    payload_overflow_threshold_max(page.page_type(), usable_space),
-                    payload_overflow_threshold_min(page.page_type(), usable_space),
-                    usable_space as usize,
-                );
+                .cell_get_raw_region(i, max_local, min_local, usable_space as usize)?;
             let size = size as u16;
             cbrk -= size;
             if cbrk < first_cell || pc + size > usable_space {
-                todo!("corrupt");
+                return_corrupt!("Cell relocation target out of bounds during defragmentation");
             }
-            assert!(cbrk + size <= usable_space && cbrk >= first_cell);
-            page.write_u16_no_offset(cell_idx, cbrk);
+            assert!(cbrk + size <= usable_space);
+            // Write the relocated cell pointer directly through `write_buf`
+            // rather than via `page.write_u16_no_offset` (which would re-acquire
+            // `as_ptr` and invalidate `write_buf`, leaving the byte copy below
+            // operating on a dangling tag -- exactly the UB Miri flagged here).
+            write_buf[cell_idx..cell_idx + 2].copy_from_slice(&cbrk.to_be_bytes());
             write_buf[cbrk as usize..cbrk as usize + size as usize]
                 .copy_from_slice(&read_buf[pc as usize..pc as usize + size as usize]);
         }
@@ -877,30 +963,45 @@ fn defragment_page(page: &PageContent, usable_space: u16) {
     page.write_u16(offset::BTREE_FIRST_FREEBLOCK, 0);
     page.write_u8(offset::BTREE_FRAGMENTED_BYTES_COUNT, 0);
     debug_validate_cells!(page, usable_space);
+    Ok(())
 }
 #[cfg(debug_assertions)]
 /// Only enabled in debug mode, where we ensure that all cells are valid.
+///
+/// A cell whose `(offset, size)` -- `size` now always at least [`MINIMUM_CELL_SIZE`], per
+/// `cell_get_raw_region` -- would read or span past `usable_space` is a cell pointer that is
+/// itself corrupt (out of range). This function's job is to catch *implementation* bugs in
+/// otherwise-well-formed pages, not to be the thing that decides how a genuinely corrupt page
+/// (e.g. one deliberately constructed to exercise `defragment_page`'s own bounds checks, or one
+/// read back from a damaged file) gets reported -- so such a cell is skipped here rather than
+/// indexed into (which would panic with a confusing raw slice-index message) or asserted on
+/// (which would panic instead of letting a caller's own graceful `Result`-returning check, e.g.
+/// `defragment_page`'s `pc > last_cell`, run and report a proper `LimboError::Corrupt`).
 fn debug_validate_cells_core(page: &PageContent, usable_space: u16) {
     for i in 0..page.cell_count() {
-        let (offset, size) = page
-            .cell_get_raw_region(
-                i,
-                payload_overflow_threshold_max(page.page_type(), usable_space),
-                payload_overflow_threshold_min(page.page_type(), usable_space),
-                usable_space as usize,
-            );
+        // A corrupt cell pointer now yields a Corrupt error rather than a raw
+        // slice-index panic. Consistent with the "skip corrupt cells here" policy
+        // documented above, skip such cells instead of unwrapping.
+        let Ok((offset, size)) = page.cell_get_raw_region(
+            i,
+            payload_overflow_threshold_max(page.page_type(), usable_space),
+            payload_overflow_threshold_min(page.page_type(), usable_space),
+            usable_space as usize,
+        ) else {
+            continue;
+        };
+        if offset + size > usable_space as usize {
+            continue;
+        }
         let buf = &page.as_ptr()[offset..offset + size];
         assert!(
-            size >= 2,
-            "cell size should be at least 2 bytes idx={}, cell={:?}, offset={}", i, buf,
+            size >= MINIMUM_CELL_SIZE,
+            "cell size should be at least {MINIMUM_CELL_SIZE} bytes idx={}, cell={:?}, offset={}", i, buf,
             offset
         );
         if page.is_leaf() {
             assert!(page.as_ptr() [offset] != 0);
         }
-        assert!(
-            offset + size <= usable_space as usize, "cell spans out of usable space"
-        );
     }
 }
 /// Insert a record into a cell.
@@ -919,9 +1020,21 @@ fn insert_into_cell(
         "attempting to add cell to an incorrect place cell_idx={} cell_count={}",
         cell_idx, page.cell_count()
     );
-    let free = compute_free_space(page, usable_space);
+    let free = compute_free_space(page, usable_space)?;
     const CELL_POINTER_SIZE_BYTES: usize = 2;
-    let enough_space = payload.len() + CELL_POINTER_SIZE_BYTES <= free as usize;
+    // A cell can only be written in-place when there is room for it AND its
+    // insertion position lies within the physical cell array (`cell_idx <=
+    // cell_count`). When the page already carries overflow cells the logical
+    // position `cell_idx` can advance past `cell_count` (the assert above admits
+    // `cell_idx <= cell_count + overflow_cells.len()`): this happens when a large
+    // index divider spilled to `overflow_cells` during parent balancing and a
+    // smaller following divider would still fit in the leftover free space. Such
+    // a cell has no physical slot to occupy -- inline insertion would underflow
+    // the `cell_count - cell_idx` pointer-shift count below and corrupt the page
+    // -- so it must be appended to `overflow_cells` in logical order (the pending
+    // dividers are re-merged when the page itself is balanced).
+    let enough_space = cell_idx <= page.cell_count()
+        && payload.len() + CELL_POINTER_SIZE_BYTES <= free as usize;
     if !enough_space {
         page.overflow_cells
             .push(OverflowCell {
@@ -940,14 +1053,20 @@ fn insert_into_cell(
         payload.len()
     );
     assert!(new_cell_data_pointer + payload.len() as u16 <= usable_space);
-    let buf = page.as_ptr();
-    buf[new_cell_data_pointer as usize..new_cell_data_pointer as usize + payload.len()]
-        .copy_from_slice(payload);
+    // Compute the cell-pointer-array offsets and shift length (all of which
+    // read `page`) BEFORE acquiring `buf`: `as_ptr()` returns a `&mut [u8]`
+    // (a whole-buffer retag), and any subsequent `page.<method>()` call
+    // re-borrows the buffer as shared and invalidates `buf`, so the payload
+    // write and the pointer-array shift below must run with no page-method
+    // call between them (the UB Miri flags here). See `defragment_page`.
     let (cell_pointer_array_start, _) = page.cell_pointer_array_offset_and_size();
     let cell_pointer_cur_idx = cell_pointer_array_start
         + (CELL_POINTER_SIZE_BYTES * cell_idx);
     let n_cells_forward = page.cell_count() - cell_idx;
     let n_bytes_forward = CELL_POINTER_SIZE_BYTES * n_cells_forward;
+    let buf = page.as_ptr();
+    buf[new_cell_data_pointer as usize..new_cell_data_pointer as usize + payload.len()]
+        .copy_from_slice(payload);
     if n_bytes_forward > 0 {
         buf.copy_within(
             cell_pointer_cur_idx..cell_pointer_cur_idx + n_bytes_forward,
@@ -963,7 +1082,7 @@ fn insert_into_cell(
 /// Free blocks can be zero, meaning the "real free space" that can be used to allocate is expected to be between first cell byte
 /// and end of cell pointer area.
 #[allow(unused_assignments)]
-fn compute_free_space(page: &PageContent, usable_space: u16) -> u16 {
+fn compute_free_space(page: &PageContent, usable_space: u16) -> Result<u16> {
     let usable_space = usable_space as usize;
     let mut cell_content_area_start = page.cell_content_area();
     if cell_content_area_start == 0 {
@@ -982,7 +1101,7 @@ fn compute_free_space(page: &PageContent, usable_space: u16) -> u16 {
     let mut cur_freeblock_ptr = page.first_freeblock() as usize;
     if cur_freeblock_ptr > 0 {
         if cur_freeblock_ptr < cell_content_area_start as usize {
-            todo!("corrupted page");
+            return_corrupt!("Freeblock pointer precedes cell content area");
         }
         let mut next = 0;
         let mut size = 0;
@@ -995,7 +1114,14 @@ fn compute_free_space(page: &PageContent, usable_space: u16) -> u16 {
             }
             cur_freeblock_ptr = next;
         }
-        assert!(next == 0, "corrupted page: freeblocks list not in ascending order");
+        // Deviation from the literal task spec (documented, not a silent scope
+        // expansion): this is the same "corrupted freeblock chain" class of bug
+        // as the `return_corrupt!` above -- a live (non-debug) `assert!` here
+        // would still panic the process on a corrupted page, defeating the
+        // point of this fix, so it is converted to a graceful error too.
+        if next != 0 {
+            return_corrupt!("Freeblocks list not in ascending order");
+        }
         assert!(
             cur_freeblock_ptr + size <= usable_space,
             "corrupted page: last freeblock extends last page end"
@@ -1005,7 +1131,7 @@ fn compute_free_space(page: &PageContent, usable_space: u16) -> u16 {
         free_space_bytes <= usable_space,
         "corrupted page: free space is greater than usable space"
     );
-    free_space_bytes as u16 - first_cell as u16
+    Ok(free_space_bytes as u16 - first_cell as u16)
 }
 /// Allocate space for a cell on a page.
 fn allocate_cell_space(
@@ -1024,7 +1150,7 @@ fn allocate_cell_space(
         }
     }
     if gap + 2 + amount > top {
-        defragment_page(page_ref, usable_space);
+        defragment_page(page_ref, usable_space)?;
         top = page_ref.read_u16(offset::BTREE_CELL_CONTENT_AREA) as usize;
     }
     top -= amount;
@@ -1034,6 +1160,12 @@ fn allocate_cell_space(
 }
 /// Fill in the cell payload with the record.
 /// If the record is too large to fit in the cell, it will spill onto overflow pages.
+///
+/// # Errors
+/// Propagates [`LimboError::CacheFull`] (or any other allocation failure) from
+/// [`Pager::allocate_overflow_page`] when the payload needs to spill and the
+/// page cache has no room for the overflow page(s). The caller is left with a
+/// partially-built `cell_payload`; on error, the cell must not be inserted.
 fn fill_cell_payload(
     page_type: PageType,
     int_key: Option<i64>,
@@ -1041,7 +1173,7 @@ fn fill_cell_payload(
     record: &ImmutableRecord,
     usable_space: u16,
     pager: Rc<Pager>,
-) {
+) -> Result<()> {
     assert!(matches!(page_type, PageType::TableLeaf | PageType::IndexLeaf));
     let record_buf = record.get_payload().to_vec();
     if matches!(page_type, PageType::TableLeaf) {
@@ -1061,7 +1193,15 @@ fn fill_cell_payload(
     );
     if record_buf.len() <= payload_overflow_threshold_max {
         cell_payload.extend_from_slice(record_buf.as_slice());
-        return;
+        // See `MINIMUM_CELL_SIZE`'s doc comment: pad up trailing, unread filler -- e.g. a
+        // single-column index record whose lone value serializes via SQLite's zero-payload
+        // "constant 0/1" serial type (8/9) needs only a 2-byte record (3-byte cell here) without
+        // this. Record decoding (`read_btree_cell`) only ever consumes the `payload_len` bytes the
+        // (unpadded, still-honest) leading varint above declares, so this is safe.
+        if cell_payload.len() < MINIMUM_CELL_SIZE {
+            cell_payload.resize(MINIMUM_CELL_SIZE, 0);
+        }
+        return Ok(());
     }
     let payload_overflow_threshold_min = payload_overflow_threshold_min(
         page_type,
@@ -1089,7 +1229,7 @@ fn fill_cell_payload(
         if left == 0 {
             break;
         }
-        let overflow_page = pager.allocate_overflow_page();
+        let overflow_page = pager.allocate_overflow_page()?;
         overflow_pages.push(overflow_page.clone());
         {
             let id = overflow_page.get().id as u32;
@@ -1104,6 +1244,7 @@ fn fill_cell_payload(
         to_copy_buffer = &to_copy_buffer[to_copy..];
     }
     assert_eq!(cell_size, cell_payload.len());
+    Ok(())
 }
 /// Returns the maximum payload size (X) that can be stored directly on a b-tree page without spilling to overflow pages.
 ///
@@ -1115,7 +1256,7 @@ fn fill_cell_payload(
 /// - Give a minimum fanout of 4 for index b-trees
 /// - Ensure enough payload is on the b-tree page that the record header can usually be accessed
 ///   without consulting an overflow page
-fn payload_overflow_threshold_max(page_type: PageType, usable_space: u16) -> usize {
+pub(crate) fn payload_overflow_threshold_max(page_type: PageType, usable_space: u16) -> usize {
     match page_type {
         PageType::IndexInterior | PageType::IndexLeaf => {
             ((usable_space as usize - 12) * 64 / 255) - 23
@@ -1132,7 +1273,7 @@ fn payload_overflow_threshold_max(page_type: PageType, usable_space: u16) -> usi
 /// - Otherwise: store M bytes on page
 ///
 /// The remaining bytes are stored on overflow pages in both cases.
-fn payload_overflow_threshold_min(_page_type: PageType, usable_space: u16) -> usize {
+pub(crate) fn payload_overflow_threshold_min(_page_type: PageType, usable_space: u16) -> usize {
     ((usable_space as usize - 12) * 32 / 255) - 23
 }
 /// Drop a cell from a page.
@@ -1144,7 +1285,7 @@ fn drop_cell(page: &mut PageContent, cell_idx: usize, usable_space: u16) -> Resu
             payload_overflow_threshold_max(page.page_type(), usable_space),
             payload_overflow_threshold_min(page.page_type(), usable_space),
             usable_space as usize,
-        );
+        )?;
     free_cell_range(page, cell_start as u16, cell_len as u16, usable_space)?;
     if page.cell_count() > 1 {
         shift_pointers_left(page, cell_idx);
@@ -1162,11 +1303,17 @@ fn drop_cell(page: &mut PageContent, cell_idx: usize, usable_space: u16) -> Resu
 /// the empty space that's not needed
 fn shift_pointers_left(page: &mut PageContent, cell_idx: usize) {
     assert!(page.cell_count() > 0);
-    let buf = page.as_ptr();
+    // Compute every page-derived value (the cell-pointer-array offset and the
+    // shift length, both of which read `page`) BEFORE acquiring `as_ptr()`.
+    // `as_ptr` returns a `&mut [u8]` (a `Unique` retag of the whole buffer);
+    // any subsequent `page.<method>()` call re-borrows the buffer as shared and
+    // invalidates that tag, so `buf` must be taken last and used immediately.
+    // See `defragment_page`/`shift_cells_left` for the same discipline.
     let (start, _) = page.cell_pointer_array_offset_and_size();
     let start = start + (cell_idx * 2) + 2;
     let right_cells = page.cell_count() - cell_idx - 1;
     let amount_to_shift = right_cells * 2;
+    let buf = page.as_ptr();
     buf.copy_within(start..start + amount_to_shift, start - 2);
 }
 

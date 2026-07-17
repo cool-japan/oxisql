@@ -413,9 +413,12 @@ mod tests_2 {
                 notnull: false,
                 default: None,
                 unique: false,
+                unique_conflict: limbo_sqlite3_parser::ast::ResolveType::Abort,
                 collation: None,
+                is_generated: false,
             }],
             unique_sets: None,
+            primary_key_conflict: limbo_sqlite3_parser::ast::ResolveType::Abort,
             foreign_keys: vec![],
         };
         let _result = Index::automatic_from_primary_key_and_unique(

@@ -1,5 +1,6 @@
 //! SQLite dialect
 
+use std::borrow::Cow;
 use std::fmt::Formatter;
 use std::str;
 use uncased::UncasedStr;
@@ -7,33 +8,44 @@ use uncased::UncasedStr;
 mod token;
 pub use token::TokenType;
 
-/// Token value (lexeme)
-#[derive(Clone, Copy)]
-pub struct Token<'i>(pub usize, pub &'i [u8], pub usize);
+/// Token value (lexeme).
+///
+/// The lexeme is stored as `Cow<'static, str>`: a keyword token whose source
+/// spelling matches its canonical form exactly (e.g. `SELECT`) borrows the
+/// associated `&'static str` from [`TokenType::as_str`] at zero cost, while
+/// every other token (identifiers, literals, differently-cased keywords, ...)
+/// owns a freshly allocated `String` copied from the input.
+#[derive(Clone)]
+pub struct Token(pub usize, pub Cow<'static, str>, pub usize);
 
-pub(crate) fn sentinel(start: usize) -> Token<'static> {
-    Token(start, b"", start)
+pub(crate) fn sentinel(start: usize) -> Token {
+    Token(start, Cow::Borrowed(""), start)
 }
 
-impl Token<'_> {
+impl Token {
     /// Access token value
     pub fn unwrap(self) -> String {
-        from_bytes(self.1)
+        self.1.into_owned()
     }
 }
 
-impl std::fmt::Debug for Token<'_> {
+impl std::fmt::Debug for Token {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("Token").field(&self.1).finish()
     }
 }
 
 impl TokenType {
-    // TODO try Cow<&'static, str> (Borrowed<&'static str> for keyword and Owned<String> for below),
-    // => Syntax error on keyword will be better
-    // => `from_token` will become unnecessary
-    pub(crate) fn to_token(self, start: usize, value: &[u8], end: usize) -> Token<'_> {
-        Token(start, value, end)
+    pub(crate) fn to_token(self, start: usize, value: &[u8], end: usize) -> Token {
+        let lexeme = match self.as_str() {
+            // Exact match with the canonical spelling: borrow the 'static
+            // constant instead of copying the input bytes.
+            Some(canonical) if canonical.as_bytes() == value => Cow::Borrowed(canonical),
+            // Anything else (differently-cased keyword, identifier, literal, ...)
+            // doesn't correspond to any 'static constant, so it must own its text.
+            _ => Cow::Owned(from_bytes(value)),
+        };
+        Token(start, lexeme, end)
     }
 }
 
@@ -75,7 +87,7 @@ pub(crate) fn is_identifier_continue(b: u8) -> bool {
 // keyword may become an identifier
 // see %fallback in parse.y
 pub(crate) fn from_token(_ty: u16, value: Token) -> String {
-    from_bytes(value.1)
+    value.1.into_owned()
 }
 
 impl TokenType {

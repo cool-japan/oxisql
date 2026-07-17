@@ -32,9 +32,7 @@ name = "limbo_ext"
 path = "src/lib.rs"
 
 [dependencies.limbo_macros]
-package = "oxisqlite-macros"
-version = "0.3"
-path = "../oxisqlite-macros"
+workspace = true
 
 [features]
 core_only = []
@@ -43,7 +41,10 @@ vfs = []
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies.chrono]
 workspace = true
-features = ["clock", "oldtime", "wasmbind"]
+# "now" (not "clock") — `get_current_time()` below only needs `Utc::now()`, not
+# the host OS timezone database that "clock" (`iana-time-zone` / macOS
+# `core-foundation-sys`) provides.
+features = ["now", "oldtime", "wasmbind"]
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies.getrandom]
 workspace = true

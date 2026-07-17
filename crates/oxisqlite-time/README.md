@@ -8,9 +8,18 @@ This crate provides the engine's date/time SQL functions, registered through the
 oxisqlite extension API.
 
 - **Role:** date/time SQL function extension.
-- **Approx LOC:** ~1,231.
+- **Version:** 0.3.3 (2026-07-17).
+- **Tests:** no dedicated unit tests in this crate; it is a thin extension
+  validated indirectly — its SQL functions are registered
+  (`register_extension_static`) into every `oxisqlite-core` connection when
+  the `time` feature is enabled, and are exercised as part of
+  `oxisqlite-core`'s `--all-features` integration suite (849 tests).
+- **Approx LOC:** ~1,263.
 - **Pure Rust / no C:** 100% Rust. No C allocator, no C parser generator, no
-  `cc` / `build.rs`.
+  `cc` / `build.rs`. Depends on `chrono` with the `"now"` feature (not
+  `"clock"`), so it never pulls in `iana-time-zone` (or, on macOS,
+  `core-foundation-sys`): this crate only does UTC-based arithmetic and never
+  needs the host's timezone database.
 - **Internal:** private member of the OxiSQL workspace; not published separately.
 
 ## Fork lineage & licensing

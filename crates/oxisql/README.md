@@ -23,19 +23,22 @@ URI-based dispatch, connection pooling, TLS, options, introspection, a
 ```toml
 [dependencies]
 # In-memory only
-oxisql = { version = "0.1.2", features = ["embedded"] }
+oxisql = { version = "0.3.3", features = ["embedded"] }
 
 # PostgreSQL
-oxisql = { version = "0.1.2", features = ["postgres"] }
+oxisql = { version = "0.3.3", features = ["postgres"] }
+
+# PostgreSQL with logical replication (CDC via pgoutput)
+oxisql = { version = "0.3.3", features = ["postgres-replication"] }
 
 # MySQL
-oxisql = { version = "0.1.2", features = ["mysql"] }
+oxisql = { version = "0.3.3", features = ["mysql"] }
 
 # Pure-Rust SQLite-compat (oxisqlite, C-free fork of limbo)
-oxisql = { version = "0.1.2", features = ["sqlite"] }
+oxisql = { version = "0.3.3", features = ["sqlite"] }
 
 # Everything + pooling + migrations
-oxisql = { version = "0.1.2", features = [
+oxisql = { version = "0.3.3", features = [
     "embedded", "postgres", "mysql", "sqlite", "datafusion",
     "pool-embedded", "pool-postgres", "pool-mysql",
     "migrate",
@@ -86,6 +89,8 @@ async fn main() -> Result<(), oxisql::OxiSqlError> {
 | `backend_info_for_uri(uri)` | `-> Option<BackendInfo>` | Which backend handles a URI, without connecting |
 | `BackendInfo` | `{ name, version, features }` | Backend identity / capability report |
 | `ConnectOptions` | builder | `new().timeout_ms(_).pool_size(_).require_tls(_)` |
+| `DEFAULT_CONNECT_TIMEOUT` | `Duration` (10s) | Default connect timeout applied to the PostgreSQL driver; override via `ConnectOptions::timeout_ms` |
+| `display_error(&err)` | `-> String` | Clean, user-facing error text (strips a GlueSQL parser debug-dump artifact) |
 | `MultiConnection` | struct | Fan a query out to several connections in parallel |
 | `prelude` | module | `use oxisql::prelude::*` brings in traits, `Value`, `Row`, errors |
 
@@ -127,6 +132,35 @@ async fn main() -> Result<(), oxisql::OxiSqlError> {
 }
 ```
 
+### Connection timeouts
+
+`connect` (and `connect_with_options` / `connect_with_tls`) bound the
+PostgreSQL driver with a `DEFAULT_CONNECT_TIMEOUT` of **10 seconds** — a
+firewalled or black-holed Postgres host now fails cleanly with
+`OxiSqlError::Timeout` instead of hanging indefinitely (previously
+unbounded, and often 60-130+s even once the OS TCP stack gave up on its
+own). Override it by building a `ConnectOptions` — either via
+`.timeout_ms(ms)` or by parsing a `?connect_timeout=<secs>` URI query
+parameter with `ConnectOptions::from_uri` — and passing it to
+`connect_with_options`:
+
+```rust,no_run
+#[tokio::main]
+async fn main() -> Result<(), oxisql::OxiSqlError> {
+    // Override the default 10-second timeout with a short one for a
+    // fast-fail health check against a possibly-unreachable host.
+    let opts = oxisql::ConnectOptions::new().timeout_ms(2_000);
+    let _conn = oxisql::connect_with_options("postgres://localhost/mydb", opts).await?;
+    Ok(())
+}
+```
+
+Embedded/local backends (`memory://`, `redb://`, `fjall://`, `sled://`,
+`sqlite://`) perform no blocking connect-time I/O and are unaffected; MySQL's
+`connect` dials lazily per checkout (`mysql_async` exposes no client-side
+connect-timeout hook to wire in), so only PostgreSQL is actually bounded
+today.
+
 ### DataFusion (OLAP)
 
 ```rust,no_run
@@ -151,6 +185,73 @@ assert_eq!(info.name, "postgres");
 // info.version == None (known only after the handshake)
 ```
 
+### Live server version
+
+`backend_info_for_uri` never connects, so `version` is always `None` for
+`postgres` / `mysql` there. Once a connection exists,
+`BackendInfo::from_postgres_connection` / `::from_mysql_connection` populate
+it from the live handshake instead:
+
+```rust,no_run
+#[tokio::main]
+async fn main() -> Result<(), oxisql::OxiSqlError> {
+    use oxisql::postgres::{PgConnection, TlsMode};
+
+    let conn = PgConnection::connect("host=localhost user=postgres", TlsMode::Disabled).await?;
+    let info = oxisql::BackendInfo::from_postgres_connection(&conn);
+    println!("server version: {:?}", info.version); // e.g. Some("16.2")
+    Ok(())
+}
+```
+
+`from_mysql_connection` is the `mysql`-feature analogue — it is `async`
+because `mysql_async` checks a connection out of its pool per call.
+
+### Logical replication (Postgres)
+
+With `postgres-replication` enabled (implies `postgres`), the facade
+re-exports a CDC-style logical-replication client from `oxisql-postgres`
+under `oxisql::postgres`: `PgReplicationConnection`, `ReplicationStream`,
+`ReplicationEvent`, `LogicalReplicationMessage`, `Lsn`, `IdentifySystem`,
+`CreatedSlot`, `ReplicaIdentity`, `TupleData`/`TupleColumn`/`CellValue`,
+`ColumnSpec`, `RelationBody`, and the `pg_micros_to_unix_micros` /
+`unix_micros_to_pg_micros` LSN-timestamp helpers. `tokio-postgres` cannot
+negotiate replication mode, so this drives the `pgoutput` wire protocol
+directly instead of going through the ordinary `PgConnection` path.
+
+```rust,no_run
+use futures::StreamExt;
+use oxisql::postgres::{LogicalReplicationMessage, PgReplicationConnection, ReplicationEvent, TlsMode};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut repl = PgReplicationConnection::connect(
+        "host=localhost user=postgres dbname=mydb",
+        TlsMode::Disabled,
+    ).await?;
+
+    let slot = repl.create_replication_slot("my_slot", false).await?;
+    let mut stream = repl
+        .start_logical_replication("my_slot", &["my_publication"], slot.consistent_point)
+        .await?;
+
+    while let Some(event) = stream.next().await {
+        if let ReplicationEvent::Logical {
+            message: LogicalReplicationMessage::Commit { commit_lsn, .. },
+            ..
+        } = event?
+        {
+            stream.ack(commit_lsn).await?; // acknowledge after durably applying
+        }
+    }
+    Ok(())
+}
+```
+
+See the [`oxisql-postgres` README](../oxisql-postgres/README.md) for the full
+pgoutput wire-protocol / tuple-decoding reference (requires PostgreSQL
+`wal_level=logical`).
+
 ### Re-exports
 
 At the crate root and via `prelude`: `Connection`, `Transaction`,
@@ -173,6 +274,7 @@ Feature-gated direct connection types: `EmbeddedConnection` (`embedded`),
 |---------|------------|-------------|
 | `embedded` | `memory://` | GlueSQL in-memory engine |
 | `postgres` | `postgres://` / `postgresql://` | tokio-postgres, Pure Rust |
+| `postgres-replication` | `postgres://` / `postgresql://` | Logical replication (pgoutput protocol, LSN tracking, COPY BOTH streaming) via `oxisql::postgres`; implies `postgres` |
 | `mysql` | `mysql://` | mysql_async, Pure Rust |
 | `redb` | `redb://` | redb-backed persistent embedded SQL (implies `embedded`) |
 | `fjall` | `fjall://` | fjall-backed persistent embedded SQL (implies `embedded`) |
@@ -190,8 +292,12 @@ Feature-gated direct connection types: `EmbeddedConnection` (`embedded`),
 
 With `--features repl`, the `oxisql-repl` binary connects to any URI (default
 `memory://`) and offers dot commands: `.help`, `.tables`, `.schema <table>`,
-`.quit`. `SELECT`/`WITH`/`EXPLAIN` render as tables; other statements report a
-row count.
+`.mode table|csv|json`, `.timer on|off`, `.read <file>`, `.history`, and
+`.quit` (aliases `.exit` / `.q`). `SELECT`/`WITH`/`EXPLAIN` render in the
+active `.mode` (table/CSV/JSON); other statements report a row count.
+Errors are rendered through `oxisql::display_error`, which strips a leaky
+GlueSQL parser debug-dump down to its clean message instead of printing a
+raw multi-line Rust `Debug` dump.
 
 ```bash
 cargo run --features repl --bin oxisql-repl -- "memory://"
@@ -199,15 +305,18 @@ cargo run --features repl --bin oxisql-repl -- "memory://"
 
 ## Test coverage
 
-**80 tests** pass with `--all-features` (2 are `#[ignore]`d live-server-gated
-portability tests requiring a running Postgres / MySQL).
+**60 tests** pass with default features; **135 tests** pass with
+`--all-features` (the jump comes from feature-gated `postgres-replication`
+unit tests) — 4 more are `#[ignore]`d live-server-gated tests (Postgres/MySQL
+portability plus `connect_or_create` auto-create) requiring a running
+Postgres / MySQL. Zero failures, zero clippy/rustdoc warnings either way.
 
 ## Part of the OxiSQL workspace
 
 `oxisql` is one of 17 crates in the OxiSQL workspace (10 facade/driver crates
 plus a 7-crate C-free `oxisqlite-*` engine). See the
 [workspace README](../../README.md) for the full architecture, backend matrix,
-and the 1,720 workspace tests.
+and the 2,157 workspace tests (2,651 with `--all-features`).
 
 ## License
 

@@ -33,9 +33,7 @@ crate-type = ["lib"]
 path = "src/lib.rs"
 
 [dependencies.limbo_ext]
-package = "oxisqlite-ext"
-version = "0.3"
-path = "../oxisqlite-ext"
+workspace = true
 features = ["static"]
 
 [dependencies.uuid]

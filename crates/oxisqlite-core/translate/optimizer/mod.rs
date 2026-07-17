@@ -31,6 +31,7 @@ use super::{
 pub(crate) mod access_method;
 pub(crate) mod constraints;
 pub(crate) mod cost;
+pub(crate) mod dml_safety;
 pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod order;
@@ -85,7 +86,20 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
     Ok(())
 }
 
-fn optimize_delete_plan(plan: &mut DeletePlan, _schema: &Schema) -> Result<()> {
+/// Index-based access for DELETE is only safe when the access method
+/// `optimize_table_access` would otherwise pick can never require looping over a
+/// SECONDARY index cursor while also deleting from that same cursor as part of
+/// per-row index maintenance -- a proven, upstream-reported corruption bug (see
+/// [`dml_safety`] module docs for the full explanation and a link to the
+/// upstream issue). We therefore always run the normal (SELECT-grade) access
+/// method selection, and then only keep its answer if it is one of the shapes
+/// [`dml_safety::delete_access_method_is_safe`] proves safe -- a rowid point
+/// lookup, or a range seek/scan over the table's own rowid cursor. Anything
+/// else (a secondary index) is reverted back to the pre-existing full
+/// table scan, undoing every side effect `optimize_table_access` made
+/// (`Operation`, WHERE-term `consumed` flags, and `order_by` elimination) so
+/// that the fallback behaves bit-for-bit like it did before this function ran.
+fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
     rewrite_exprs_delete(plan)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
@@ -94,20 +108,43 @@ fn optimize_delete_plan(plan: &mut DeletePlan, _schema: &Schema) -> Result<()> {
         return Ok(());
     }
 
-    // FIXME: don't use indexes for delete right now because it's buggy. See for example:
-    // https://github.com/tursodatabase/limbo/issues/1714
-    // let _ = optimize_table_access(
-    //     &mut plan.table_references,
-    //     &schema.indexes,
-    //     &mut plan.where_clause,
-    //     &mut plan.order_by,
-    //     &mut None,
-    // )?;
+    let Some(table) = plan.table_references.joined_tables().first() else {
+        return Ok(());
+    };
+    let snapshot =
+        dml_safety::AccessMethodSnapshot::capture(table, &plan.where_clause, &plan.order_by);
+
+    let _ = optimize_table_access(
+        &mut plan.table_references,
+        schema,
+        &mut plan.where_clause,
+        &mut plan.order_by,
+        &mut None,
+    )?;
+
+    let is_safe = match plan.table_references.joined_tables().first() {
+        Some(table) => dml_safety::delete_access_method_is_safe(&table.op),
+        None => true,
+    };
+    if !is_safe {
+        if let Some(table) = plan.table_references.joined_tables_mut().first_mut() {
+            snapshot.restore(table, &plan.where_clause, &mut plan.order_by);
+        }
+    }
 
     Ok(())
 }
 
-fn optimize_update_plan(plan: &mut UpdatePlan, _schema: &Schema) -> Result<()> {
+/// Index-based access for UPDATE is only safe when the traversal order the
+/// chosen access method depends on is provably untouched by the SET clause --
+/// otherwise the driving cursor's own key can shift under it mid-scan, causing
+/// rows to be skipped or updated more than once (see [`dml_safety`] module docs
+/// for the full explanation). As with DELETE above, we run the normal access
+/// method selection unconditionally and then only keep its answer if
+/// [`dml_safety::update_access_method_is_safe`] proves it safe for this SET
+/// clause, reverting every side effect otherwise so the statement falls back
+/// to exactly the pre-existing full table scan behavior.
+fn optimize_update_plan(plan: &mut UpdatePlan, schema: &Schema) -> Result<()> {
     rewrite_exprs_update(plan)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
@@ -115,25 +152,38 @@ fn optimize_update_plan(plan: &mut UpdatePlan, _schema: &Schema) -> Result<()> {
         plan.contains_constant_false_condition = true;
         return Ok(());
     }
-    // FIXME: don't use indexes for update right now because it's not safe to traverse an index
-    // while also updating the same table, things go wrong.
-    // e.g. in 'explain update t set x=x+5 where x > 10;' where x is an indexed column,
-    // sqlite first creates an ephemeral index to store the current values so the tree traversal
-    // doesn't get messed up while updating.
-    // let _ = optimize_table_access(
-    //     &mut plan.table_references,
-    //     &schema.indexes,
-    //     &mut plan.where_clause,
-    //     &mut plan.order_by,
-    //     &mut None,
-    // )?;
+
+    let Some(table) = plan.table_references.joined_tables().first() else {
+        return Ok(());
+    };
+    let snapshot =
+        dml_safety::AccessMethodSnapshot::capture(table, &plan.where_clause, &plan.order_by);
+
+    let _ = optimize_table_access(
+        &mut plan.table_references,
+        schema,
+        &mut plan.where_clause,
+        &mut plan.order_by,
+        &mut None,
+    )?;
+
+    let is_safe = match plan.table_references.joined_tables().first() {
+        Some(table) => dml_safety::update_access_method_is_safe(table, plan),
+        None => true,
+    };
+    if !is_safe {
+        if let Some(table) = plan.table_references.joined_tables_mut().first_mut() {
+            snapshot.restore(table, &plan.where_clause, &mut plan.order_by);
+        }
+    }
+
     Ok(())
 }
 
 fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     for table in plan.table_references.joined_tables_mut() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
-            optimize_select_plan(&mut from_clause_subquery.plan, schema)?;
+            optimize_plan(from_clause_subquery.plan.as_mut(), schema)?;
         }
     }
 
@@ -838,6 +888,9 @@ fn ephemeral_index_build(
             .table
             .btree()
             .map_or(false, |btree| btree.has_rowid),
+        // Ephemeral: never registered in `Schema`, never consulted by DML
+        // conflict-resolution codegen.
+        on_conflict: ast::ResolveType::Abort,
     };
 
     ephemeral_index

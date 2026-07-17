@@ -87,14 +87,17 @@ impl ToSqlString for Expr {
             }
             Expr::FunctionCall {
                 name,
-                distinctness: _,
+                distinctness,
                 args,
-                order_by: _,
+                order_by,
                 filter_over,
             } => {
                 ret.push_str(&name.0);
-                // TODO: pretty sure there should be no ORDER_BY nor DISTINCT
                 ret.push('(');
+                if let Some(distinctness) = distinctness {
+                    ret.push_str(&distinctness.to_string());
+                    ret.push(' ');
+                }
                 if let Some(args) = args {
                     let joined_args = args
                         .iter()
@@ -102,6 +105,15 @@ impl ToSqlString for Expr {
                         .collect::<Vec<_>>()
                         .join(", ");
                     ret.push_str(&joined_args);
+                }
+                if let Some(order_by) = order_by {
+                    let joined_order_by = order_by
+                        .iter()
+                        .map(|sorted_col| sorted_col.to_sql_string(context))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    ret.push_str(" ORDER BY ");
+                    ret.push_str(&joined_order_by);
                 }
                 ret.push(')');
                 if let Some(filter_over) = filter_over {
@@ -425,4 +437,26 @@ impl ToSqlString for ast::Over {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use crate::to_sql_string_test;
+
+    to_sql_string_test!(
+        test_function_call_distinct,
+        "SELECT COUNT(DISTINCT x) FROM t;"
+    );
+
+    to_sql_string_test!(
+        test_function_call_order_by,
+        "SELECT GROUP_CONCAT(x ORDER BY y) FROM t;"
+    );
+
+    to_sql_string_test!(
+        test_function_call_distinct_and_order_by,
+        "SELECT GROUP_CONCAT(DISTINCT x ORDER BY y) FROM t;"
+    );
+
+    to_sql_string_test!(
+        test_function_call_order_by_multiple_columns_and_direction,
+        "SELECT GROUP_CONCAT(x ORDER BY y ASC, z DESC) FROM t;"
+    );
+}

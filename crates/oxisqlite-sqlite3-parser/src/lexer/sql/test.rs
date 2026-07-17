@@ -48,13 +48,27 @@ fn duplicate_column() {
         b"CREATE TABLE t (x TEXT, x TEXT)",
         "duplicate column name: x",
     );
+    // The duplicate column name is unquoted before being interpolated into
+    // the error message, regardless of which quoting style (if any) was
+    // used in the source: the user should see the clean identifier, not the
+    // raw quoted/escaped source text.
     expect_parser_err_msg(
         b"CREATE TABLE t (x TEXT, \"x\" TEXT)",
-        "duplicate column name: \"x\"",
+        "duplicate column name: x",
     );
     expect_parser_err_msg(
         b"CREATE TABLE t (x TEXT, `x` TEXT)",
-        "duplicate column name: `x`",
+        "duplicate column name: x",
+    );
+    expect_parser_err_msg(
+        b"CREATE TABLE t (x TEXT, [x] TEXT)",
+        "duplicate column name: x",
+    );
+    // A name whose *logical* content contains an escaped quote character
+    // must have that escaping undone too.
+    expect_parser_err_msg(
+        b"CREATE TABLE t (\"a\"\"b\" TEXT, \"a\"\"b\" TEXT)",
+        "duplicate column name: a\"b",
     );
 }
 

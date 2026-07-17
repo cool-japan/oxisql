@@ -25,12 +25,38 @@ pub struct Vector {
 }
 
 impl Vector {
-    pub fn as_f32_slice(&self) -> &[f32] {
-        unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const f32, self.dims) }
+    /// Decodes the little-endian `f32` payload out of the raw byte buffer
+    /// into a freshly allocated, properly aligned `Vec<f32>`.
+    ///
+    /// `data` is stored as a `Vec<u8>` because that is also the on-disk /
+    /// blob representation (see `vector_serialize_f32`/`vector_deserialize_f32`),
+    /// which only guarantees 1-byte alignment. Reinterpreting its pointer as
+    /// `*const f32` via `slice::from_raw_parts` would be undefined behavior
+    /// whenever the backing allocation isn't 4-byte aligned, so each element
+    /// is decoded explicitly instead of reinterpret-cast.
+    pub fn to_f32_vec(&self) -> Vec<f32> {
+        self.data
+            .chunks_exact(4)
+            .take(self.dims)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect()
     }
 
-    pub fn as_f64_slice(&self) -> &[f64] {
-        unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const f64, self.dims) }
+    /// Decodes the little-endian `f64` payload out of the raw byte buffer
+    /// into a freshly allocated, properly aligned `Vec<f64>`.
+    ///
+    /// See [`Vector::to_f32_vec`] for why this cannot be a zero-copy
+    /// reinterpret cast of `data`.
+    pub fn to_f64_vec(&self) -> Vec<f64> {
+        self.data
+            .chunks_exact(8)
+            .take(self.dims)
+            .map(|chunk| {
+                f64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ])
+            })
+            .collect()
     }
 }
 
@@ -137,7 +163,7 @@ pub fn vector_to_text(vector: &Vector) -> String {
     text.push('[');
     match vector.vector_type {
         VectorType::Float32 => {
-            let data = vector.as_f32_slice();
+            let data = vector.to_f32_vec();
             for i in 0..vector.dims {
                 text.push_str(&data[i].to_string());
                 if i < vector.dims - 1 {
@@ -146,7 +172,7 @@ pub fn vector_to_text(vector: &Vector) -> String {
             }
         }
         VectorType::Float64 => {
-            let data = vector.as_f64_slice();
+            let data = vector.to_f64_vec();
             for i in 0..vector.dims {
                 text.push_str(&data[i].to_string());
                 if i < vector.dims - 1 {
@@ -212,8 +238,8 @@ pub fn vector_f32_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
         ));
     }
     let (mut dot, mut norm1, mut norm2) = (0.0, 0.0, 0.0);
-    let v1_data = v1.as_f32_slice();
-    let v2_data = v2.as_f32_slice();
+    let v1_data = v1.to_f32_vec();
+    let v2_data = v2.to_f32_vec();
 
     // Check for non-finite values
     if v1_data.iter().any(|x| !x.is_finite()) || v2_data.iter().any(|x| !x.is_finite()) {
@@ -252,8 +278,8 @@ pub fn vector_f64_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
         ));
     }
     let (mut dot, mut norm1, mut norm2) = (0.0, 0.0, 0.0);
-    let v1_data = v1.as_f64_slice();
-    let v2_data = v2.as_f64_slice();
+    let v1_data = v1.to_f64_vec();
+    let v2_data = v2.to_f64_vec();
 
     // Check for non-finite values
     if v1_data.iter().any(|x| !x.is_finite()) || v2_data.iter().any(|x| !x.is_finite()) {
@@ -470,14 +496,14 @@ mod tests {
     fn test_slice_conversion<const DIMS: usize>(v: Vector) -> bool {
         match v.vector_type {
             VectorType::Float32 => {
-                let slice = v.as_f32_slice();
-                // Check if the slice length matches the dimensions and the data length is correct (4 bytes per float)
-                slice.len() == DIMS && (slice.len() * 4 == v.data.len())
+                let values = v.to_f32_vec();
+                // Check if the vec length matches the dimensions and the data length is correct (4 bytes per float)
+                values.len() == DIMS && (values.len() * 4 == v.data.len())
             }
             VectorType::Float64 => {
-                let slice = v.as_f64_slice();
-                // Check if the slice length matches the dimensions and the data length is correct (8 bytes per float)
-                slice.len() == DIMS && (slice.len() * 8 == v.data.len())
+                let values = v.to_f64_vec();
+                // Check if the vec length matches the dimensions and the data length is correct (8 bytes per float)
+                values.len() == DIMS && (values.len() * 8 == v.data.len())
             }
         }
     }
@@ -631,13 +657,13 @@ mod tests {
 
                 match v.vector_type {
                     VectorType::Float32 => {
-                        let original = v.as_f32_slice();
-                        let parsed = parsed_vector.as_f32_slice();
+                        let original = v.to_f32_vec();
+                        let parsed = parsed_vector.to_f32_vec();
                         original.iter().zip(parsed.iter()).all(|(a, b)| a == b)
                     }
                     VectorType::Float64 => {
-                        let original = v.as_f64_slice();
-                        let parsed = parsed_vector.as_f64_slice();
+                        let original = v.to_f64_vec();
+                        let parsed = parsed_vector.to_f64_vec();
                         original.iter().zip(parsed.iter()).all(|(a, b)| a == b)
                     }
                 }

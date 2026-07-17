@@ -240,6 +240,51 @@ async fn integration_connect_and_ping() {
     let _rows = conn.query("SELECT 1 AS val", &[]).await.expect("SELECT 1");
 }
 
+// ── server_version ────────────────────────────────────────────────────────────
+//
+// Unlike `oxisql-postgres`, this crate has no hand-rolled wire-protocol
+// implementation of its own (the MySQL handshake — capability negotiation,
+// pluggable auth methods, etc. — is entirely delegated to `mysql_async`), so
+// there is no existing fake-server test-harness pattern here to reuse for a
+// unit-level test. `server_version_fails_gracefully_without_server` below
+// still exercises the method with no live server needed, using the same
+// deliberately-unreachable-port idiom as `connect_disabled_tls_fails_gracefully`
+// above; the `Some(...)`-returning happy path requires a real server and is
+// covered by the `#[ignore]`d integration test that follows it.
+
+/// Verify that `server_version()` fails gracefully (typed error, no panic)
+/// when no MySQL server is reachable.  No live server needed.
+#[tokio::test]
+async fn server_version_fails_gracefully_without_server() {
+    let conn = MyConnection::connect("mysql://root@127.0.0.1:19999/test", TlsMode::Disabled)
+        .await
+        .expect("connect is lazy — pool construction alone should not fail");
+
+    let result = conn.server_version().await;
+    assert!(
+        result.is_err(),
+        "expected an error with no server reachable, got {result:?}"
+    );
+}
+
+/// Placeholder integration test — skipped unless a real MySQL server is present.
+///
+/// Run with: `cargo test -p oxisql-mysql --features integration-mysql -- --ignored`
+#[cfg(feature = "integration-mysql")]
+#[ignore]
+#[tokio::test]
+async fn integration_server_version_reports_dotted_version() {
+    let conn = MyConnection::connect("mysql://root@localhost/test", TlsMode::Disabled)
+        .await
+        .expect("connect to MySQL");
+
+    let version = conn.server_version().await.expect("server_version");
+    assert!(
+        version.split('.').count() >= 2 && version.chars().next().is_some_and(char::is_numeric),
+        "expected a dotted version string starting with a digit, got {version:?}"
+    );
+}
+
 // ── oxisql-parse integration — is_read_only_query / normalize_query ──────────
 
 #[test]

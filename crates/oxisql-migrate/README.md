@@ -19,11 +19,11 @@ every applied file is recorded so later runs can detect post-apply modification.
 Re-runs are idempotent, and an optional `.down.sql` file enables rollback to a target
 version.
 
-## Installation (0.1.2)
+## Installation (0.3.3)
 
 ```toml
 [dependencies]
-oxisql-migrate = { version = "0.1.2", features = ["migrate"] }
+oxisql-migrate = { version = "0.3.3", features = ["migrate"] }
 ```
 
 The `migrate` feature enables the runner, tracker, and the `sqlparser`/`gluesql`/
@@ -187,10 +187,12 @@ oxisql-migrate rollback --version 20230101000000   # revert down to a target ver
 
 ## Test coverage
 
-With `--all-features`: **37 tests pass**, 0 ignored. Coverage includes multi-file
-ordering, idempotent re-runs, checksum-mismatch detection, orphaned-migration
-detection, concurrent runs (no double-apply), malformed-SQL handling, empty-directory
-handling, down-migration rollback, and pooled execution.
+**47 tests pass** with default features; **51 tests pass** with `--all-features`
+(49 integration + 2 doc), **1 ignored** (a live-server-gated PostgreSQL
+advisory-lock test). Coverage includes multi-file ordering, idempotent re-runs,
+checksum-mismatch detection, orphaned-migration detection, concurrent runs (no
+double-apply), malformed-SQL handling, empty-directory handling, down-migration
+rollback, distributed locking, and pooled execution.
 
 ## See also
 

@@ -76,6 +76,10 @@ pub fn translate_create_index(
         unique: unique_if_not_exists.0,
         ephemeral: false,
         has_rowid: tbl.has_rowid,
+        // `CREATE INDEX` has no `ON CONFLICT` clause of its own in SQLite's
+        // grammar; only a table's own UNIQUE/PRIMARY KEY constraints carry one
+        // (see `schema::index::Index::automatic_from_primary_key_and_unique`).
+        on_conflict: ast::ResolveType::Abort,
     });
 
     // Allocate the necessary cursors:

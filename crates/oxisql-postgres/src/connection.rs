@@ -114,6 +114,20 @@ pub struct PgConnection {
     /// (no `tokio_postgres::Connection` object was available to intercept
     /// notifications).  `Some` when created via [`PgConnection::connect`].
     notif_tx: Option<tokio::sync::broadcast::Sender<PgNotification>>,
+    /// PostgreSQL server version string reported during the connection
+    /// handshake.
+    ///
+    /// Captured from the `server_version` `ParameterStatus` message via
+    /// `tokio_postgres::Connection::parameter` in [`PgConnection::connect`],
+    /// *before* the connection driver is handed to
+    /// [`notify::spawn_connection_driver`] — `tokio_postgres::Client` itself
+    /// does not retain runtime parameters; only the (about-to-be-spawned)
+    /// `tokio_postgres::Connection` driver does, so this is the only point at
+    /// which it can be read. `None` when the connection was created via
+    /// [`PgConnection::from_client`] (no `Connection` driver was ever
+    /// available to this type) or in the practically-impossible case that the
+    /// server did not report the parameter.
+    server_version: Option<String>,
 }
 
 impl PgConnection {
@@ -145,6 +159,7 @@ impl PgConnection {
             reconnect_uri: None,
             reconnect_tls: TlsMode::Disabled,
             notif_tx: None,
+            server_version: None,
         }
     }
 
@@ -161,18 +176,23 @@ impl PgConnection {
     pub async fn connect(conn_str: &str, tls: TlsMode) -> Result<Self, PgError> {
         // Preserve the TLS mode for reconnect before moving it into the match.
         let tls_clone = tls.clone();
-        let (client, notif_tx) = match tls {
+        let (client, notif_tx, server_version) = match tls {
             TlsMode::Disabled => {
                 let (client, connection) = tokio_postgres::connect(conn_str, NoTls).await?;
-                // Spawn the notification-forwarding connection driver.
+                // `Client` does not retain the handshake's `ParameterStatus`
+                // values — only `Connection` does — so `server_version` must
+                // be read here, before `connection` is handed off and spawned
+                // away as the notification-forwarding background driver.
+                let server_version = connection.parameter("server_version").map(str::to_string);
                 let tx = notify::spawn_connection_driver(connection);
-                (client, tx)
+                (client, tx, server_version)
             }
             TlsMode::Rustls(cfg) => {
                 let tls_connector = PgTls::new(cfg);
                 let (client, connection) = tokio_postgres::connect(conn_str, tls_connector).await?;
+                let server_version = connection.parameter("server_version").map(str::to_string);
                 let tx = notify::spawn_connection_driver(connection);
-                (client, tx)
+                (client, tx, server_version)
             }
         };
         Ok(Self {
@@ -181,6 +201,7 @@ impl PgConnection {
             reconnect_uri: Some(conn_str.to_string()),
             reconnect_tls: tls_clone,
             notif_tx: Some(notif_tx),
+            server_version,
         })
     }
 
@@ -280,6 +301,40 @@ impl PgConnection {
     /// ```
     pub async fn connect_with_ca(conn_str: &str, ca_pem: Vec<u8>) -> Result<Self, PgError> {
         Self::connect(conn_str, TlsMode::with_ca_pem(ca_pem)?).await
+    }
+
+    /// Return the PostgreSQL server version string reported during the
+    /// connection handshake, if known.
+    ///
+    /// This is the raw `server_version` runtime parameter as reported by the
+    /// server in a `ParameterStatus` message during startup (e.g.
+    /// `"16.4 (Debian 16.4-1.pgdg120+1)"`) — not a parsed/normalized version
+    /// number. It is captured once, in [`PgConnection::connect`], before the
+    /// `tokio_postgres::Connection` driver is spawned away; `tokio-postgres`
+    /// does not expose this parameter on `Client` itself.
+    ///
+    /// Returns `None` when this connection was created via
+    /// [`PgConnection::from_client`] (no `Connection` driver was available to
+    /// read the parameter from) or in the practically-impossible case that
+    /// the server did not report `server_version` at all.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use oxisql_postgres::{PgConnection, TlsMode};
+    ///
+    /// let conn = PgConnection::connect("host=localhost user=postgres", TlsMode::Disabled).await?;
+    /// if let Some(version) = conn.server_version() {
+    ///     println!("connected to PostgreSQL {version}");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn server_version(&self) -> Option<&str> {
+        self.server_version.as_deref()
     }
 }
 

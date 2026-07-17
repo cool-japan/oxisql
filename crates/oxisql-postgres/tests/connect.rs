@@ -151,6 +151,68 @@ fn connect_with_timeout_signature_compiles() {
     let _ = std::mem::size_of_val(&_check);
 }
 
+// ── connect_with_timeout runtime behaviour ─────────────────────────────────────
+//
+// The signature-shape test above only proves `connect_with_timeout` compiles
+// with the expected types; it never calls it. This test adds one real,
+// bounded runtime check that the timeout actually fires — still without a
+// live PostgreSQL server: `192.0.2.1` is TEST-NET-1 (RFC 5737), reserved for
+// documentation and guaranteed never to be routed on the public internet.
+//
+// Note: `tests/integration.rs`'s `pg_timeout::test_connect_with_timeout_fires`
+// covers the same mechanism against the same black-hole address, but is
+// `#[ignore = "requires live Postgres"]`, along with every other test in that
+// file's `pg_timeout` module (including its sibling `test_connect_with_timeout_success`,
+// which genuinely does need one). That means it never actually runs in a
+// normal `cargo nextest run` / CI pass — it wasn't real regression coverage
+// in practice, only in principle. Rather than touch an `#[ignore]`d test
+// (out of scope here), this is a fresh, always-on test asserting the same
+// property.
+
+/// `connect_with_timeout` must return `Err` within (approximately) the
+/// requested duration when the target host never responds, rather than
+/// hanging for however long the OS TCP stack takes to give up on its own —
+/// often 60-130+ seconds, and previously unbounded entirely from
+/// `oxisql::connect()`'s perspective, which is what this mechanism fixes
+/// (see `oxisql::DEFAULT_CONNECT_TIMEOUT`'s doc comment in the `oxisql`
+/// facade crate, which wraps this exact function).
+///
+/// A short 2-second duration is used so this test cannot meaningfully slow
+/// down the suite even if the timeout mechanism were broken and the call
+/// fell through to some other, faster error path (e.g. an immediate
+/// connection-refused/unreachable from a network policy that actively
+/// rejects the address rather than silently dropping packets — both are
+/// acceptable outcomes here, since the property under test is "does not
+/// hang", not the specific error variant, which is legitimately
+/// environment-dependent). The outer 10-second
+/// `tokio::time::timeout` is a test-harness guard: if the *inner* mechanism
+/// were somehow inert, this converts what would otherwise be an
+/// indefinitely-hanging test into a clear, fast failure instead.
+#[tokio::test]
+async fn connect_with_timeout_fires_on_unroutable_host() {
+    let start = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        PgConnection::connect_with_timeout(
+            "postgres://baduser:badpass@192.0.2.1:5432/nonexistent",
+            TlsMode::Disabled,
+            Duration::from_secs(2),
+        ),
+    )
+    .await
+    .expect("connect_with_timeout itself must not hang past the 10s outer guard");
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_err(),
+        "connecting to an unroutable host must fail, not hang or succeed"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "connect_with_timeout must respect its own 2s duration; took {elapsed:?}"
+    );
+}
+
 // ── savepoint inherent-method API shape ───────────────────────────────────────
 
 // The `savepoint_pg`, `rollback_to_savepoint_pg`, and `release_savepoint_pg`
@@ -201,7 +263,8 @@ fn test_pg_builder_tls_with_ca_pem_no_panic() {
 
 /// Placeholder integration test — requires a live TLS-enabled PostgreSQL server.
 ///
-/// This test validates that a real TLS handshake with `rustls-rustcrypto`
+/// This test validates that a real TLS handshake with the pure-Rust
+/// RustCrypto provider (via `oxitls`)
 /// succeeds end-to-end.  It is marked `#[ignore]` because no server is
 /// available in the standard CI environment.
 ///
