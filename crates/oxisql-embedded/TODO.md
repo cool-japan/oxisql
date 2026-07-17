@@ -1,6 +1,6 @@
 # oxisql-embedded — TODO
 
-**Status:** Stable · v0.3.3 · 263 tests pass (default features), 281 tests pass (`--all-features`).
+**Status:** Stable · v0.4.0 · 263 tests pass (default features), 281 tests pass (`--all-features`).
 
 In-memory SQL engine backed by GlueSQL `MemoryStorage`, with optional Pure-Rust persistent backends (fjall LSM-tree, redb B-tree, sled key-value). `EmbeddedConnection` implements `oxisql_core::Connection`; parameters are bound client-side via an `sqlparser` AST pass with a string-scan fallback. Full schema introspection, CSV/SQL import/export, host-side UDFs, virtual tables, full-text search, and B-tree secondary indexes are implemented.
 

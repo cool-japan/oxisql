@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.3"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.89"
 authors = ["COOLJAPAN OU (Team Kitasan)"]
@@ -31,15 +31,15 @@ repository = "https://github.com/cool-japan/oxisql"
 description = "OxiSQL is the COOLJAPAN-blessed Pure-Rust database layer: a unified SQL surface that spans embedded engines, OLTP wire-protocol clients (Postgres, MySQL), and a SQLite-compatible embedded path — without `libpq`, `mysqlclient`, `libsqlite3`, or any C/C++ DB driver."
 
 [workspace.dependencies]
-oxisql-core           = { path = "crates/oxisql-core",           version = "0.3" }
-oxisql-parse          = { path = "crates/oxisql-parse",          version = "0.3" }
-oxisql-embedded       = { path = "crates/oxisql-embedded",       version = "0.3" }
-oxisql-postgres       = { path = "crates/oxisql-postgres",       version = "0.3" }
-oxisql-mysql          = { path = "crates/oxisql-mysql",          version = "0.3" }
-oxisql-datafusion     = { path = "crates/oxisql-datafusion",     version = "0.3" }
-oxisql-pool           = { path = "crates/oxisql-pool",           version = "0.3" }
-oxisql-migrate        = { path = "crates/oxisql-migrate",        version = "0.3" }
-oxisql-sqlite-compat  = { path = "crates/oxisql-sqlite-compat",  version = "0.3" }
+oxisql-core           = { path = "crates/oxisql-core",           version = "0.4" }
+oxisql-parse          = { path = "crates/oxisql-parse",          version = "0.4" }
+oxisql-embedded       = { path = "crates/oxisql-embedded",       version = "0.4" }
+oxisql-postgres       = { path = "crates/oxisql-postgres",       version = "0.4" }
+oxisql-mysql          = { path = "crates/oxisql-mysql",          version = "0.4" }
+oxisql-datafusion     = { path = "crates/oxisql-datafusion",     version = "0.4" }
+oxisql-pool           = { path = "crates/oxisql-pool",           version = "0.4" }
+oxisql-migrate        = { path = "crates/oxisql-migrate",        version = "0.4" }
+oxisql-sqlite-compat  = { path = "crates/oxisql-sqlite-compat",  version = "0.4" }
 
 # DataFusion backend — default-features=false avoids parquet/compression *-sys crates
 # arrow must match the version datafusion 54 (latest release) re-exports: 58.3.0.
@@ -106,14 +106,14 @@ anyhow = { version = "1" }
 
 # oxisqlite — Pure-Rust SQLite-compatible engine (C-stripped fork of limbo 0.0.22; no C/C++ deps)
 # index_experimental enables CREATE INDEX support
-oxisqlite = { path = "crates/oxisqlite", version = "0.3", features = ["index_experimental"] }
+oxisqlite = { path = "crates/oxisqlite", version = "0.4", features = ["index_experimental"] }
 
 # limbo_ext / limbo_macros — path-renamed local crates (rename of oxisqlite-ext /
 # oxisqlite-macros via `package =`); internal source still says `use limbo_ext::...`
 # / `use limbo_macros::...`. Consumed by oxisqlite-core, oxisqlite-time, oxisqlite-uuid
 # (limbo_ext) and oxisqlite-core, oxisqlite-ext (limbo_macros).
-limbo_ext    = { package = "oxisqlite-ext",    path = "crates/oxisqlite-ext",    version = "0.3" }
-limbo_macros = { package = "oxisqlite-macros", path = "crates/oxisqlite-macros", version = "0.3" }
+limbo_ext    = { package = "oxisqlite-ext",    path = "crates/oxisqlite-ext",    version = "0.4" }
+limbo_macros = { package = "oxisqlite-macros", path = "crates/oxisqlite-macros", version = "0.4" }
 
 # oxisqlite-* family — shared third-party deps (oxisqlite-core, oxisqlite-sqlite3-parser,
 # oxisqlite-time, oxisqlite-ext)

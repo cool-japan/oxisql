@@ -1,4 +1,4 @@
-# OxiSQL TODO — v0.3.3
+# OxiSQL TODO — v0.4.0
 
 Last updated: 2026-07-17
 

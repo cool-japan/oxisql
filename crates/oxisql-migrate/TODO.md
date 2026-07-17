@@ -1,6 +1,6 @@
 # oxisql-migrate — TODO
 
-## Status: Stable (0.3.3)
+## Status: Stable (0.4.0)
 
 Pure Rust, `#![forbid(unsafe_code)]`. The scanner parses
 `{14-digit-timestamp}__{name}.sql` (and optional `.down.sql`) filenames and returns
