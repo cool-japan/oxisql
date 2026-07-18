@@ -5,7 +5,11 @@ All notable changes to OxiSQL will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.0] - Unreleased
+## [0.3.4] - 2026-07-18
+
+### Fixed
+
+- **Inter-crate dependency lower bounds tightened to prevent stale-lock breakage** (all crates): internal dependency requirements that were declared with the minor-only caret `"0.3"` / `"0.4"` (i.e. `>= 0.3.0`) are now pinned to the exact patch floor `"0.3.4"` (`>= 0.3.4, < 0.4.0`). The loose lower bound let a stale `Cargo.lock` keep an older engine paired with a newer caller: `oxisql-sqlite-compat` / `oxisqlite` `0.3.3` call the `open_from_bytes` API introduced in `oxisqlite` / `oxisqlite-core` `0.3.3`, but the `"0.3"` requirement was still satisfied by a locked `0.3.2` engine that predates that API — producing a resolve that "met" the version requirement yet failed to compile (`open_from_bytes` not found). The same looseness existed one level down (`oxisqlite` → `oxisqlite-core`, `oxisqlite-core` → `oxisqlite-sqlite3-parser` / `oxisqlite-time` / `oxisqlite-uuid`). Pinning every internal floor to `0.3.4` makes the resolver reject any pre-`0.3.4` family member, so the whole set always resolves consistently. **No source-code changes** — engine behavior is identical to `0.3.3`; this is a packaging-metadata-only patch.
 
 ## [0.3.3] - 2026-07-17
 
