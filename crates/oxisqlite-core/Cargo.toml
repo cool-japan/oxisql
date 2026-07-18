@@ -194,19 +194,19 @@ workspace = true
 
 [dependencies.limbo_sqlite3_parser]
 package = "oxisqlite-sqlite3-parser"
-version = "0.3"
+version = "0.4.0"
 path = "../oxisqlite-sqlite3-parser"
 
 [dependencies.limbo_time]
 package = "oxisqlite-time"
-version = "0.3"
+version = "0.4.0"
 path = "../oxisqlite-time"
 features = ["static"]
 optional = true
 
 [dependencies.limbo_uuid]
 package = "oxisqlite-uuid"
-version = "0.3"
+version = "0.4.0"
 path = "../oxisqlite-uuid"
 features = ["static"]
 optional = true

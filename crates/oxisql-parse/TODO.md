@@ -2,7 +2,7 @@
 
 ## Status
 
-**Stable** · version 0.3.3 · **191 tests** (178 unit + 13 doc).
+**Stable** · version 0.4.0 · **191 tests** (178 unit + 13 doc).
 
 A `sqlparser` facade with dialect-aware parsing, a fluent `QueryBuilder`, a
 logical planner with subquery decorrelation, a rule-based optimizer (plus an

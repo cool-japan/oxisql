@@ -28,11 +28,23 @@ CC=/usr/bin/false cargo build --workspace   # → exit 0
 cargo build --workspace                      # → 0 warnings
 ```
 
-**Version 0.3.3 — 2026-07-17.**
+**Version 0.4.0 — 2026-07-18.**
 17 workspace crates (plus 3 non-published, internal patch-shim crates) · 2,157 tests passing (2,651 with `--all-features`) · 0 failing · 0 clippy warnings.
 ~178,591 lines of Rust across 484 source files.
 
 ---
+
+## What's new in 0.4.0
+
+Version 0.4.0 is a **packaging / release-hygiene** minor bump — there are **no
+source-code changes since 0.3.3**. Every inter-crate dependency floor across the
+17-crate workspace is now pinned to the exact full-triple `0.4.0` (rather than a
+loose minor-only caret), carrying the 0.3.4 fix forward as the `0.4.x` baseline:
+the resolver can no longer pair a newer caller with an older family member held
+back by a stale `Cargo.lock`. The minor bump also gives the two internal breaking
+changes that shipped in 0.3.3 (`oxisqlite::Params::Named`'s key type;
+`oxisqlite-sqlite3-parser`'s lexer `Token` lifetime) a proper semver home. Engine
+behavior, wire protocols, and the public `oxisql` API are identical to 0.3.3.
 
 ## What's new in 0.3.3
 
@@ -399,14 +411,14 @@ Add to your workspace's root `Cargo.toml`:
 ```toml
 # Workspace root Cargo.toml
 [workspace.dependencies]
-oxisql = { version = "0.3.3", features = ["embedded"] }
+oxisql = { version = "0.4.0", features = ["embedded"] }
 ```
 
 Or add to a single crate:
 
 ```toml
 [dependencies]
-oxisql = { version = "0.3.3", features = ["embedded", "postgres", "pool-embedded", "migrate"] }
+oxisql = { version = "0.4.0", features = ["embedded", "postgres", "pool-embedded", "migrate"] }
 ```
 
 ### Downstream `[patch.crates-io]` requirement (whoami / zstd)
@@ -686,26 +698,26 @@ cross-backend OLAP queries (filter / projection / limit pushdown).
 
 ```toml
 # In-memory only
-oxisql = { version = "0.3.3", features = ["embedded"] }
+oxisql = { version = "0.4.0", features = ["embedded"] }
 
 # PostgreSQL + pooling
-oxisql = { version = "0.3.3", features = ["postgres", "pool-postgres"] }
+oxisql = { version = "0.4.0", features = ["postgres", "pool-postgres"] }
 
 # MySQL + migrations
-oxisql = { version = "0.3.3", features = ["mysql", "pool-mysql", "migrate"] }
+oxisql = { version = "0.4.0", features = ["mysql", "pool-mysql", "migrate"] }
 
 # C-free SQLite + pooling
-oxisql = { version = "0.3.3", features = ["sqlite", "pool-sqlite-compat"] }
+oxisql = { version = "0.4.0", features = ["sqlite", "pool-sqlite-compat"] }
 
 # All OLTP backends + pooling + migrations
-oxisql = { version = "0.3.3", features = [
+oxisql = { version = "0.4.0", features = [
     "embedded", "postgres", "mysql", "sqlite",
     "pool-embedded", "pool-postgres", "pool-mysql", "pool-sqlite-compat",
     "migrate",
 ] }
 
 # Full stack including DataFusion OLAP, logical replication, and the REPL
-oxisql = { version = "0.3.3", features = [
+oxisql = { version = "0.4.0", features = [
     "embedded", "postgres", "postgres-replication", "mysql", "sqlite", "datafusion",
     "pool-embedded", "pool-postgres", "pool-mysql",
     "migrate", "repl",

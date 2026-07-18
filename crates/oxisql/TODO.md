@@ -2,7 +2,7 @@
 
 ## Status
 
-**Stable** · version 0.3.3 · **60 tests** (default features) / **135 tests**
+**Stable** · version 0.4.0 · **60 tests** (default features) / **135 tests**
 (`--all-features` — the jump comes from feature-gated `postgres-replication`
 unit tests; 4 more `#[ignore]`d are live-server-gated tests: Postgres/MySQL
 portability plus `connect_or_create` auto-create). 0 failures, 0

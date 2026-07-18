@@ -1,6 +1,6 @@
 # oxisql-sqlite-compat — TODO
 
-## Status: Alpha (0.3.3)
+## Status: Alpha (0.4.0)
 
 Pure-Rust SQLite-compatible backend over the C-free **`oxisqlite`** engine (a
 COOLJAPAN fork of limbo 0.0.22 with all C/C++ dependencies stripped). Implements
