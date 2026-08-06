@@ -26,7 +26,7 @@ the compat layer.
 
 ```toml
 [dependencies]
-oxisql-sqlite-compat = "0.3.3"
+oxisql-sqlite-compat = "0.4.1"
 ```
 
 - MSRV: **1.89** · edition **2021** · `#![forbid(unsafe_code)]`
@@ -233,7 +233,7 @@ maintain the engine ourselves.
 
 ## Test coverage
 
-**85 tests pass, 0 ignored** with default features (`cargo nextest run`); **94
+**88 tests pass, 0 ignored** with default features (`cargo nextest run`); **97
 tests pass, 0 ignored** with every feature enabled (`cargo nextest run
 --all-features`) — the `blocking` feature adds 9 tests: the pre-existing 5 in
 `tests/blocking.rs` plus 4 new blocking `open_from_bytes` cases in

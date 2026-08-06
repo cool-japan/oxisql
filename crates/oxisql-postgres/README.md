@@ -35,8 +35,8 @@ backend selected when you open a `postgres://` URL through the `oxisql` facade.
 
 ```toml
 [dependencies]
-oxisql-postgres = "0.3.3"
-# oxisql-postgres = { version = "0.3.3", features = ["replication"] }  # PostgreSQL logical replication (pgoutput)
+oxisql-postgres = "0.4.1"
+# oxisql-postgres = { version = "0.4.1", features = ["replication"] }  # PostgreSQL logical replication (pgoutput)
 ```
 
 MSRV 1.89 · edition 2021 · Apache-2.0.
@@ -341,8 +341,8 @@ cargo nextest run -p oxisql-postgres --all-features --run-ignored all  # also ru
 
 ## Part of the OxiSQL workspace
 
-This crate is one of 17 crates in the Pure-Rust [OxiSQL workspace](../../README.md)
-(2,157 workspace tests pass, 2,651 with `--all-features`). It is the PostgreSQL backend behind the unified
+This crate is one of 18 crates in the Pure-Rust [OxiSQL workspace](../../README.md)
+(2,261 workspace tests pass, 2,755 with `--all-features`). It is the PostgreSQL backend behind the unified
 `oxisql` facade; see the workspace README for the embedded engine, MySQL
 backend, connection pool, migrations, and DataFusion integration.
 

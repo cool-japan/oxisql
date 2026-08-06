@@ -205,6 +205,7 @@ mod tests {
 
     fn rowid_table(name: &str, columns: Vec<Column>) -> Rc<crate::schema::BTreeTable> {
         Rc::new(crate::schema::BTreeTable {
+            db_index: 0,
             root_page: 2,
             name: name.to_string(),
             primary_key_columns: vec![],
@@ -223,6 +224,7 @@ mod tests {
         pk_count: usize,
     ) -> Rc<crate::schema::BTreeTable> {
         Rc::new(crate::schema::BTreeTable {
+            db_index: 0,
             root_page: 2,
             name: name.to_string(),
             primary_key_columns: columns[..pk_count]

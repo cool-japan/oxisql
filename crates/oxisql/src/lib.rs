@@ -714,6 +714,17 @@ pub mod migrate {
     };
 }
 
+/// Re-exports from the SQL query-result / prepared-plan cache (requires the
+/// `cache` feature).
+///
+/// Provides `SqlQueryCache` (query-result LRU + TTL cache), `SqlPlanCache`
+/// (prepared-statement plan cache), `CachedQueryRunner` (a read-through
+/// caching adapter over any executor closure), and `QueryCacheStats`.
+#[cfg(feature = "cache")]
+pub mod cache {
+    pub use oxisql_cache::{CachedQueryRunner, QueryCacheStats, SqlPlanCache, SqlQueryCache};
+}
+
 /// Pool-related re-exports (feature-gated).
 ///
 /// Provides the unified `OxidbPool` enum, `PoolConfig`, `PoolConfigBuilder`,

@@ -171,6 +171,17 @@ pub enum Expr {
     Qualified(Name, Name),
     /// `RAISE` function call
     Raise(ResolveType, Option<Box<Expr>>),
+    /// A value that already lives in a VDBE register.
+    ///
+    /// Never produced by the parser — the grammar has no syntax for it. It is
+    /// created by the code generator when an expression tree has to reference a
+    /// value that was computed earlier in the same program, most notably the
+    /// `OLD.<col>` / `NEW.<col>` row images of a `CREATE TRIGGER` body (see
+    /// `oxisqlite_core::translate::trigger`). Rewriting those references into
+    /// `Register` before the body statement is translated means every existing
+    /// planner/optimizer/emitter path handles them for free, with no special
+    /// "am I inside a trigger?" plumbing threaded through the query planner.
+    Register(usize),
     /// Subquery expression
     Subquery(Box<Select>),
     /// Unary expression

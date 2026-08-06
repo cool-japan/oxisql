@@ -188,6 +188,27 @@ impl Page {
     pub fn get_contents(&self) -> &PageContent {
         self.get_ref().contents.as_ref().unwrap()
     }
+    /// [`Self::get_contents`], as a typed error instead of a panic.
+    ///
+    /// A page whose `contents` is `None` has not been read in (or its read
+    /// failed). Callers that can be reached with a not-yet-loaded page — the
+    /// b-tree cursors, which resume across I/O suspensions — must report that
+    /// rather than abort the embedding process.
+    pub fn try_get_contents(&self) -> crate::Result<&PageContent> {
+        self.get_ref().contents.as_ref().ok_or_else(|| {
+            crate::LimboError::Corrupt(format!("page {} has no contents loaded", self.get_ref().id))
+        })
+    }
+    /// Exclusive counterpart of [`Self::try_get_contents`]. Subject to the same
+    /// access discipline as [`Self::get`].
+    #[allow(clippy::mut_from_ref)]
+    pub fn try_get_contents_mut(&self) -> crate::Result<&mut PageContent> {
+        let id = self.get_ref().id;
+        self.get()
+            .contents
+            .as_mut()
+            .ok_or_else(|| crate::LimboError::Corrupt(format!("page {id} has no contents loaded")))
+    }
     /// Exclusive access to this page's `PageContent`, for call sites that
     /// mutate its struct fields directly (e.g. `overflow_cells.push(..)`).
     /// Subject to the same "gather everything else first, use last, no

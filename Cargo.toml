@@ -10,6 +10,7 @@ members = [
     "crates/oxisql-pool",
     "crates/oxisql-migrate",
     "crates/oxisql-sqlite-compat",
+    "crates/oxisql-cache",
     "crates/oxisql",
     # oxisqlite C-stripped fork (formerly vendor/limbo)
     "crates/oxisqlite",
@@ -22,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 rust-version = "1.89"
 authors = ["COOLJAPAN OU (Team Kitasan)"]
@@ -31,15 +32,16 @@ repository = "https://github.com/cool-japan/oxisql"
 description = "OxiSQL is the COOLJAPAN-blessed Pure-Rust database layer: a unified SQL surface that spans embedded engines, OLTP wire-protocol clients (Postgres, MySQL), and a SQLite-compatible embedded path — without `libpq`, `mysqlclient`, `libsqlite3`, or any C/C++ DB driver."
 
 [workspace.dependencies]
-oxisql-core           = { path = "crates/oxisql-core",           version = "0.4.0" }
-oxisql-parse          = { path = "crates/oxisql-parse",          version = "0.4.0" }
-oxisql-embedded       = { path = "crates/oxisql-embedded",       version = "0.4.0" }
-oxisql-postgres       = { path = "crates/oxisql-postgres",       version = "0.4.0" }
-oxisql-mysql          = { path = "crates/oxisql-mysql",          version = "0.4.0" }
-oxisql-datafusion     = { path = "crates/oxisql-datafusion",     version = "0.4.0" }
-oxisql-pool           = { path = "crates/oxisql-pool",           version = "0.4.0" }
-oxisql-migrate        = { path = "crates/oxisql-migrate",        version = "0.4.0" }
-oxisql-sqlite-compat  = { path = "crates/oxisql-sqlite-compat",  version = "0.4.0" }
+oxisql-core           = { path = "crates/oxisql-core",           version = "0.4.1" }
+oxisql-parse          = { path = "crates/oxisql-parse",          version = "0.4.1" }
+oxisql-embedded       = { path = "crates/oxisql-embedded",       version = "0.4.1" }
+oxisql-postgres       = { path = "crates/oxisql-postgres",       version = "0.4.1" }
+oxisql-mysql          = { path = "crates/oxisql-mysql",          version = "0.4.1" }
+oxisql-datafusion     = { path = "crates/oxisql-datafusion",     version = "0.4.1" }
+oxisql-pool           = { path = "crates/oxisql-pool",           version = "0.4.1" }
+oxisql-migrate        = { path = "crates/oxisql-migrate",        version = "0.4.1" }
+oxisql-sqlite-compat  = { path = "crates/oxisql-sqlite-compat",  version = "0.4.1" }
+oxisql-cache          = { path = "crates/oxisql-cache",          version = "0.4.1" }
 
 # DataFusion backend — default-features=false avoids parquet/compression *-sys crates
 # arrow must match the version datafusion 54 (latest release) re-exports: 58.3.0.
@@ -75,7 +77,7 @@ rustls                  = { version = "0.23", default-features = false, features
 rustls-pki-types        = { version = "1" }
 rustls-pemfile          = { version = "2" }
 tokio-rustls            = { version = "0.26", default-features = false, features = ["tls12"] }
-oxitls                  = { version = "0.2.1", default-features = false, features = ["pure", "webpki-roots"] }
+oxitls                  = { version = "0.3.0", default-features = false, features = ["pure", "webpki-roots"] }
 bytes                   = { version = "1" }
 time                    = { version = "0.3.53", default-features = false, features = ["std", "formatting", "macros"] }
 tracing                 = { version = "0.1" }
@@ -106,14 +108,14 @@ anyhow = { version = "1" }
 
 # oxisqlite — Pure-Rust SQLite-compatible engine (C-stripped fork of limbo 0.0.22; no C/C++ deps)
 # index_experimental enables CREATE INDEX support
-oxisqlite = { path = "crates/oxisqlite", version = "0.4.0", features = ["index_experimental"] }
+oxisqlite = { path = "crates/oxisqlite", version = "0.4.1", features = ["index_experimental"] }
 
 # limbo_ext / limbo_macros — path-renamed local crates (rename of oxisqlite-ext /
 # oxisqlite-macros via `package =`); internal source still says `use limbo_ext::...`
 # / `use limbo_macros::...`. Consumed by oxisqlite-core, oxisqlite-time, oxisqlite-uuid
 # (limbo_ext) and oxisqlite-core, oxisqlite-ext (limbo_macros).
-limbo_ext    = { package = "oxisqlite-ext",    path = "crates/oxisqlite-ext",    version = "0.4.0" }
-limbo_macros = { package = "oxisqlite-macros", path = "crates/oxisqlite-macros", version = "0.4.0" }
+limbo_ext    = { package = "oxisqlite-ext",    path = "crates/oxisqlite-ext",    version = "0.4.1" }
+limbo_macros = { package = "oxisqlite-macros", path = "crates/oxisqlite-macros", version = "0.4.1" }
 
 # oxisqlite-* family — shared third-party deps (oxisqlite-core, oxisqlite-sqlite3-parser,
 # oxisqlite-time, oxisqlite-ext)
@@ -155,26 +157,81 @@ serde_json = { version = "1" }
 
 # OxiStore columnar Parquet backend (Pure Rust, optional)
 # Pinned to the 0.1.x line — see the arrow/datafusion note above before bumping to 0.2.x.
-# Re-confirmed 2026-07-17 (skip-ledger check, `until = 2026-08-02` not yet reached):
-# datafusion is still at 54.0.0 (crates.io latest; no arrow-59-based release
-# exists yet) and oxistore-columnar's latest is still 0.2.0, still bundling
-# arrow/parquet 59.0.0 — the conflict is unchanged from the 2026-07-02 check.
-# oxisql-datafusion/src/parquet.rs bridges oxistore_columnar::{Schema,RecordBatch}
-# directly into datafusion/arrow types by relying on identical arrow versions;
-# bumping to 0.2.0 breaks that bridge with E0308 (two `arrow_schema` versions in
-# the dependency graph). See ~/work/cargo-upgrade/oxisql.toml for the tracked skip.
+# Re-confirmed 2026-08-04 (skip-ledger check, prior `until = 2026-08-02` had
+# lapsed): re-verified directly against the crates.io sparse index (not just
+# `cargo info`) — datafusion's newest published version is now 54.1.0 (up
+# from 54.0.0), but its manifest still declares `arrow = "^58.3.0"` /
+# `arrow-schema = "^58.3.0"` (index.crates.io/da/ta/datafusion), so it has
+# not moved to arrow 59. oxistore-columnar's newest published version is
+# still 0.2.0 and still declares `arrow = "^59.0.0"`
+# (index.crates.io/ox/is/oxistore-columnar) — no 0.1.x-line release has been
+# cut that would narrow the gap either. The conflict is unchanged from the
+# 2026-07-17 check. oxisql-datafusion/src/parquet.rs bridges
+# oxistore_columnar::{Schema,RecordBatch} directly into datafusion/arrow
+# types by relying on identical arrow versions; bumping to 0.2.0 breaks that
+# bridge with E0308 (two `arrow_schema` versions in the dependency graph).
+# Next re-check due 2026-09-04. See ~/work/cargo-upgrade/oxisql.toml for the
+# tracked skip (external ledger file, not updated by this pass — see the
+# hygiene-wave notes for why).
 oxistore-columnar = { version = "0.1.3" }
+
+# OxiStore cache eviction primitives (Pure Rust, LRU/ARC/LFU/W-TinyLFU).
+# `oxisql-cache` builds SQL query-result / prepared-plan caching on top of
+# this crate's `LruCache` + `Cache` trait. Direction is deliberately
+# `oxisql-cache` -> `oxistore-cache` (crates.io), not the reverse: this is the
+# sanctioned dependency-inversion fix for a former repo-level cycle where
+# `oxistore-cache`'s now-removed `sql` feature depended back on
+# `oxisql-core`. Default features only — the old `sql` feature (which pulled
+# `oxisql-core` into `oxistore-cache` itself) is intentionally left disabled.
+oxistore-cache = { version = "0.3.0" }
 
 # ── Security patches ───────────────────────────────────────────────────────────
 # RUSTSEC-2026-0104: rustls-webpki 0.102.x panic in CRL parsing.
 # The CryptoProvider is now supplied CVE-clean by oxitls (via its published
 # oxitls-rustcrypto-provider fork, webpki-free), so no rustls-rustcrypto patch
 # is needed here anymore.
+# ══ KNOWN PUBLISH HOLE — read before cutting a release ═════════════════════════
+#
+# Cargo `[patch]` sections are honoured ONLY at the root manifest of the
+# workspace actually being built. They are stripped from a published `.crate`
+# and are never inherited by a downstream consumer. Everything below therefore
+# makes *this* repository's build Pure Rust and does nothing at all for anyone
+# who depends on the published `oxisql*` crates from crates.io:
+#
+#   * `oxisql-postgres` (published) → tokio-postgres → whoami (upstream)
+#     → objc2-system-configuration on macOS. C/ObjC binding, Pure Rust Policy
+#     v2 §3 violation, silent — the downstream build simply succeeds.
+#   * `oxisql-datafusion` with the `columnar`/`parquet` feature (published)
+#     → arrow-ipc → zstd (upstream) → zstd-sys. C compile, same silence.
+#
+# What has been done about it (in decreasing order of strength):
+#   1. Upstream removal was investigated for both and found not currently
+#      possible — see the README version-history entries for
+#      `objc2-system-configuration` (0.3.0) and `zstd-sys` (0.3.2).
+#   2. README carries the exact copy-into-your-own-workspace-root recipe:
+#      "Downstream `[patch.crates-io]` requirement (whoami / zstd)".
+#   3. TODO.md's release checklist carries this hole as an explicit, still-open
+#      pre-publish item ("KNOWN PUBLISH HOLE (whoami / zstd)").
+#
+# What actually CLOSES it (not done — requires publishing new crates, which is
+# deliberately out of scope for any automated pass):
+#   Mirror the rustls fix (Q1→Q2, which is what made `rustls-rustcrypto-patched`
+#   disappear from this block): publish the two shims under package-renamed
+#   names — `oxisql-whoami-compat` and `oxiarc-zstd-compat` — and consume them
+#   through `package = "..."` renames in `crates/oxisql-postgres/Cargo.toml`
+#   and `crates/oxisql-datafusion/Cargo.toml` respectively. A rename dependency
+#   DOES travel with a published crate, so the hole closes for downstream
+#   consumers too. Both `crates/whoami-patched` and `crates/zstd-shim` are
+#   `publish = false` today precisely because that rename has not happened yet;
+#   flipping them to publishable is step 1 of that work.
+# ═══════════════════════════════════════════════════════════════════════════════
 [patch.crates-io]
 # Pure-Rust patch: drop objc2-system-configuration (macOS SCDynamicStore) from
 # whoami's std feature — pulled via tokio-postgres; see COOLJAPAN Pure Rust Policy v2 §3 Role-A.
+# LOCAL BUILD ONLY — see the publish-hole banner above.
 whoami = { path = "crates/whoami-patched" }
 # Pure-Rust patch: replace the C-FFI `zstd` (zstd-sys) with a pure shim backed by
 # oxiarc-zstd; arrow-ipc (via datafusion) is the only consumer (COOLJAPAN Pure Rust v2).
+# LOCAL BUILD ONLY — see the publish-hole banner above.
 zstd = { path = "crates/zstd-shim" }
 

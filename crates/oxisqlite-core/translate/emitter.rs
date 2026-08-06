@@ -545,6 +545,39 @@ fn emit_delete_insns(
         dest: key_reg,
     });
 
+    // Row triggers: the OLD image has to be captured while the cursor is still
+    // positioned on the row, i.e. before `Insn::Delete` below, because AFTER
+    // triggers read it too.
+    let trigger_ctx = prepare_delete_trigger_context(
+        program,
+        t_ctx,
+        table_reference,
+        main_table_cursor_id,
+        key_reg,
+    )?;
+    if let Some((btree, old_image, ignore_jump)) = trigger_ctx.as_ref() {
+        crate::translate::trigger::emit_triggers(
+            program,
+            &t_ctx.resolver,
+            &crate::translate::trigger::TriggerFireArgs {
+                table: btree.as_ref(),
+                time: limbo_sqlite3_parser::ast::TriggerTime::Before,
+                event: crate::translate::trigger::TriggerEventKind::Delete,
+                old: Some(*old_image),
+                new: None,
+                ignore_jump: *ignore_jump,
+            },
+        )?;
+        // A BEFORE trigger body may have written to this table and moved the
+        // cursor, or deleted this very row. Re-seek; if the row is gone, skip
+        // it — upstream emits the same `OP_NotExists` guard.
+        program.emit_insn(Insn::NotExists {
+            cursor: main_table_cursor_id,
+            rowid_reg: key_reg,
+            target_pc: *ignore_jump,
+        });
+    }
+
     if let Some(_) = table_reference.virtual_table() {
         let conflict_action = 0u16;
         let start_reg = key_reg;
@@ -614,6 +647,22 @@ fn emit_delete_insns(
             cursor_id: main_table_cursor_id,
         });
     }
+
+    if let Some((btree, old_image, ignore_jump)) = trigger_ctx.as_ref() {
+        crate::translate::trigger::emit_triggers(
+            program,
+            &t_ctx.resolver,
+            &crate::translate::trigger::TriggerFireArgs {
+                table: btree.as_ref(),
+                time: limbo_sqlite3_parser::ast::TriggerTime::After,
+                event: crate::translate::trigger::TriggerEventKind::Delete,
+                old: Some(*old_image),
+                new: None,
+                ignore_jump: *ignore_jump,
+            },
+        )?;
+    }
+
     if let Some(limit_ctx) = t_ctx.limit_ctx {
         program.emit_insn(Insn::DecrJumpZero {
             reg: limit_ctx.reg_limit,
@@ -624,6 +673,70 @@ fn emit_delete_insns(
     }
 
     Ok(())
+}
+
+/// Normalized names of the columns an `UPDATE` assigns, for matching
+/// `CREATE TRIGGER ... UPDATE OF (a, b)`.
+fn changed_column_names(btree: &crate::schema::BTreeTable, plan: &UpdatePlan) -> Vec<String> {
+    plan.set_clauses
+        .iter()
+        .filter_map(|(idx, _)| {
+            btree
+                .columns
+                .get(*idx)
+                .and_then(|c| c.name.as_deref())
+                .map(crate::util::normalize_ident)
+        })
+        .collect()
+}
+
+/// Materialize the `OLD` row image for `DELETE` triggers, if the table has any.
+///
+/// Returns `None` when the table has no triggers at all, so the common case
+/// costs one hash-map scan and emits no extra instructions. The image must be
+/// built while the table cursor is still positioned on the victim row: `AFTER
+/// DELETE` bodies read `OLD.*` after `Insn::Delete` has moved the cursor.
+#[allow(clippy::type_complexity)]
+fn prepare_delete_trigger_context(
+    program: &mut ProgramBuilder,
+    t_ctx: &TranslateCtx,
+    table_reference: &crate::translate::plan::JoinedTable,
+    main_table_cursor_id: usize,
+    rowid_reg: usize,
+) -> Result<
+    Option<(
+        Rc<crate::schema::BTreeTable>,
+        crate::translate::trigger::RowImage,
+        BranchOffset,
+    )>,
+> {
+    let Some(btree) = table_reference.table.btree() else {
+        return Ok(None);
+    };
+    if !crate::translate::trigger::table_has_triggers(&t_ctx.resolver, &btree.name) {
+        return Ok(None);
+    }
+    let cols_start_reg = program.alloc_registers(btree.columns.len().max(1));
+    for (idx, _) in btree.columns.iter().enumerate() {
+        program.emit_column(main_table_cursor_id, idx, cols_start_reg + idx);
+    }
+    // `RAISE(IGNORE)` abandons this row and resumes the statement, which for a
+    // scan-driven DELETE means jumping to the loop's `Next`.
+    let ignore_jump = t_ctx
+        .labels_main_loop
+        .first()
+        .map(|labels| labels.next)
+        .ok_or_else(|| {
+            LimboError::InternalError("DELETE: main loop labels not initialized".to_string())
+        })?;
+    Ok(Some((
+        btree,
+        crate::translate::trigger::RowImage {
+            rowid_reg,
+            cols_start_reg,
+        },
+        ignore_jump,
+    )))
 }
 
 #[instrument(skip_all, level = Level::TRACE)]
@@ -680,7 +793,13 @@ fn emit_program_for_update(
         None,
         OperationMode::UPDATE,
     )?;
-    // Open indexes for update.
+    // Open indexes for update. An index always lives in the same database as
+    // the table it indexes, so the update target's registry index is reused.
+    let table_db_index = plan
+        .table_references
+        .joined_tables()
+        .first()
+        .map_or(crate::multidb::DB_MAIN, |joined| joined.table.db_index());
     let mut index_cursors = Vec::with_capacity(plan.indexes_to_update.len());
     for index in &plan.indexes_to_update {
         if let Some(index_cursor) = program.resolve_cursor_id_safe(&CursorKey::index(
@@ -698,6 +817,8 @@ fn emit_program_for_update(
         }
         let index_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
         program.emit_insn(Insn::OpenWrite {
+            // An index always lives in the same database as its table.
+            db: table_db_index,
             cursor_id: index_cursor,
             root_page: RegisterOrLiteral::Literal(index.root_page),
             name: index.name.clone(),
@@ -707,10 +828,14 @@ fn emit_program_for_update(
     }
     // Determine if statement-level savepoint is needed for UPDATE OR ABORT/ROLLBACK.
     use limbo_sqlite3_parser::ast::ResolveType;
-    let needs_stmt_savepoint = matches!(
-        plan.or_conflict,
-        None | Some(ResolveType::Abort) | Some(ResolveType::Rollback)
-    );
+    // A nested statement (an inlined trigger body) must not open the "_stmt"
+    // savepoint: releasing a transaction-owning savepoint commits and halts the
+    // enclosing program, dropping everything emitted after it.
+    let needs_stmt_savepoint = !program.is_nested()
+        && matches!(
+            plan.or_conflict,
+            None | Some(ResolveType::Abort) | Some(ResolveType::Rollback)
+        );
     if needs_stmt_savepoint {
         use crate::vdbe::insn::SavepointOp;
         program.emit_insn(Insn::Savepoint {
@@ -906,6 +1031,22 @@ fn emit_update_insns(
         program.preassign_label_to_next_insn(jump_target);
     }
 
+    // Row triggers: capture the OLD image while the cursor is still on the
+    // pre-update row and before any SET expression has been evaluated.
+    let trigger_table = table_ref.table.btree().filter(|btree| {
+        crate::translate::trigger::table_has_triggers(&t_ctx.resolver, &btree.name)
+    });
+    let old_image = trigger_table.as_ref().map(|btree| {
+        let cols_start_reg = program.alloc_registers(btree.columns.len().max(1));
+        for idx in 0..btree.columns.len() {
+            program.emit_column(cursor_id, idx, cols_start_reg + idx);
+        }
+        crate::translate::trigger::RowImage {
+            rowid_reg: beg,
+            cols_start_reg,
+        }
+    });
+
     // we scan a column at a time, loading either the column's values, or the new value
     // from the Set expression, into registers so we can emit a MakeRecord and update the row.
     let start = if is_virtual { beg + 2 } else { beg + 1 };
@@ -985,6 +1126,37 @@ fn emit_update_insns(
                 program.emit_column(cursor_id, column_idx_in_index.unwrap_or(idx), target_reg);
             }
         }
+    }
+
+    // BEFORE UPDATE triggers run once both row images exist and before any
+    // index or table write.
+    if let (Some(btree), Some(old_image)) = (trigger_table.as_ref(), old_image) {
+        let new_image = crate::translate::trigger::RowImage {
+            rowid_reg: rowid_set_clause_reg.unwrap_or(beg),
+            cols_start_reg: start,
+        };
+        let changed_columns = changed_column_names(btree.as_ref(), plan);
+        crate::translate::trigger::emit_triggers(
+            program,
+            &t_ctx.resolver,
+            &crate::translate::trigger::TriggerFireArgs {
+                table: btree.as_ref(),
+                time: limbo_sqlite3_parser::ast::TriggerTime::Before,
+                event: crate::translate::trigger::TriggerEventKind::Update(&changed_columns),
+                old: Some(old_image),
+                new: Some(new_image),
+                ignore_jump: loop_labels.next,
+            },
+        )?;
+        // A BEFORE trigger body may have written to this very table, moving the
+        // cursor (or deleting the row outright). Re-seek to the row being
+        // updated; if it is gone, skip it — this is what upstream's
+        // `OP_NotExists` after `sqlite3CodeRowTrigger` does.
+        program.emit_insn(Insn::NotExists {
+            cursor: cursor_id,
+            rowid_reg: beg,
+            target_pc: loop_labels.next,
+        });
     }
 
     for (index, (idx_cursor_id, record_reg)) in plan.indexes_to_update.iter().zip(&index_cursors) {
@@ -1186,6 +1358,26 @@ fn emit_update_insns(
             flag: InsertFlags::new().update(true),
             table_name: table_ref.identifier.clone(),
         });
+
+        if let (Some(btree), Some(old_image)) = (trigger_table.as_ref(), old_image) {
+            let new_image = crate::translate::trigger::RowImage {
+                rowid_reg: rowid_set_clause_reg.unwrap_or(beg),
+                cols_start_reg: start,
+            };
+            let changed_columns = changed_column_names(btree.as_ref(), plan);
+            crate::translate::trigger::emit_triggers(
+                program,
+                &t_ctx.resolver,
+                &crate::translate::trigger::TriggerFireArgs {
+                    table: btree.as_ref(),
+                    time: limbo_sqlite3_parser::ast::TriggerTime::After,
+                    event: crate::translate::trigger::TriggerEventKind::Update(&changed_columns),
+                    old: Some(old_image),
+                    new: Some(new_image),
+                    ignore_jump: loop_labels.next,
+                },
+            )?;
+        }
     } else if let Some(_) = table_ref.virtual_table() {
         let arg_count = table_ref.columns().len() + 2;
         program.emit_insn(Insn::VUpdate {
@@ -1334,7 +1526,11 @@ fn emit_conflict_halt(
     use limbo_sqlite3_parser::ast::ResolveType;
     let effective = stmt_conflict.unwrap_or(constraint_default);
     match effective {
-        ResolveType::Abort | ResolveType::Rollback => {
+        // A nested statement never opened the "_stmt" savepoint (see
+        // `ProgramBuilder::is_nested`), so rolling back to it would fail with
+        // "no such savepoint" and mask the real constraint error. The enclosing
+        // `Halt` still discards the uncommitted page cache.
+        ResolveType::Abort | ResolveType::Rollback if !program.is_nested() => {
             program.emit_insn(Insn::Savepoint {
                 op: SavepointOp::RollbackTo,
                 name: "_stmt".to_string(),
@@ -1345,8 +1541,13 @@ fn emit_conflict_halt(
             });
         }
         // FAIL, and (for now, see doc comment above) IGNORE/REPLACE: halt
-        // without rolling back prior writes from this statement.
-        ResolveType::Fail | ResolveType::Ignore | ResolveType::Replace => {
+        // without rolling back prior writes from this statement. Also the
+        // nested ABORT/ROLLBACK case guarded above.
+        ResolveType::Abort
+        | ResolveType::Rollback
+        | ResolveType::Fail
+        | ResolveType::Ignore
+        | ResolveType::Replace => {
             program.emit_insn(Insn::Halt {
                 err_code,
                 description,

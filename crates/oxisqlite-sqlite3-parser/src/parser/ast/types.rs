@@ -148,6 +148,10 @@ pub enum PragmaName {
     CacheSize,
     /// returns foreign key constraint information for a table
     ForeignKeyList,
+    /// returns one row for each column in a named index (`index_info(idx)`)
+    IndexInfo,
+    /// returns one row for each index associated with a table (`index_list(tbl)`)
+    IndexList,
     /// Run integrity check on the database file
     IntegrityCheck,
     /// `journal_mode` pragma

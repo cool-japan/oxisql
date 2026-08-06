@@ -77,7 +77,14 @@ impl JsonbHeader {
                         }
                         Err(e) => return Err(e),
                     },
-                    _ => unreachable!(),
+                    // `header_byte >> 4` can be 15, which SQLite's JSONB
+                    // encoding reserves for an 8-byte size field. This arm was
+                    // `unreachable!()`, so any blob whose header nibble was 15
+                    // (e.g. a first byte of `0xFB`) aborted the process. This
+                    // decoder tops out at the 4-byte form -- an 8-byte payload
+                    // size cannot describe anything this engine can hold -- so
+                    // rejecting it as malformed is the correct behaviour here.
+                    _ => bail_parse_error!("Invalid JSONB header size marker: {}", header_size),
                 };
                 Ok((Self(element_type.try_into()?, total_size), offset))
             }

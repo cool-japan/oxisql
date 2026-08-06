@@ -62,11 +62,25 @@ workspace = true
 [dependencies.fallible-iterator]
 workspace = true
 
+# indexmap/memchr/phf (below), and the env_logger dev-dependency further
+# down, intentionally stay crate-local version pins rather than
+# workspace = true: this manifest is the C-free fork of limbo's
+# `sqlite3-parser` crate, and none of these is shared with another workspace
+# member at a *different* version, so pinning them locally keeps this
+# Cargo.toml diffable line-for-line against upstream limbo 0.0.22 for future
+# merges. (env_logger specifically also can't cleanly inherit here: this
+# crate wants `default-features = false`, but `workspace.dependencies`
+# doesn't set that, and Cargo warns — soon errors — on a member overriding
+# `default-features` the workspace declaration didn't itself set.)
+# `log` (above) WAS swept to workspace = true: it is already a shared
+# workspace-wide dep and had drifted from the workspace's declared version
+# (0.4.33 pinned here vs "0.4" workspace-wide) — the concrete hygiene bug
+# workspace-level deps exist to prevent.
 [dependencies.indexmap]
 version = "2.14"
 
 [dependencies.log]
-version = "0.4.33"
+workspace = true
 
 [dependencies.memchr]
 version = "2.8"

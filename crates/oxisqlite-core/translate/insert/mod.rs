@@ -254,9 +254,10 @@ pub fn translate_insert(
         }
     }
     let table_name = &tbl_name.name;
-    let table = match schema.get_table(table_name.0.as_str()) {
+    let table_db_name = tbl_name.db_name.as_ref().map(|db| db.0.clone());
+    let table = match schema.get_table_qualified(table_db_name.as_deref(), table_name.0.as_str()) {
         Some(table) => table,
-        None => crate::bail_parse_error!("no such table: {}", table_name),
+        None => crate::bail_parse_error!("no such table: {}", tbl_name),
     };
     if matches!(table.as_ref(), crate::schema::Table::View(_)) {
         crate::bail_parse_error!("cannot modify {} because it is a view", table_name.0);
@@ -296,6 +297,7 @@ pub fn translate_insert(
     }
 
     let root_page = btree_table.root_page;
+    let table_db = btree_table.db_index;
 
     // Extract the upsert clause from the INSERT body *before* body is consumed
     // by the pre-pass below.  Taking it here avoids borrowing `body` mutably
@@ -329,7 +331,12 @@ pub fn translate_insert(
         InsertBody::DefaultValues => false,
     };
     // Savepoint is only needed for multi-row inserts; single-row has no partial state.
-    let needs_stmt_savepoint = on_conflict_needs_savepoint && inserting_multiple_rows;
+    // Nested statements (inlined trigger bodies) must not open the "_stmt"
+    // savepoint: releasing a transaction-owning savepoint commits and halts the
+    // enclosing program, silently dropping every instruction emitted after it.
+    // See `ProgramBuilder::is_nested`.
+    let needs_stmt_savepoint =
+        on_conflict_needs_savepoint && inserting_multiple_rows && !program.is_nested();
 
     let halt_label = program.allocate_label();
     let loop_start_label = program.allocate_label();
@@ -452,6 +459,7 @@ pub fn translate_insert(
                         });
                     }
                     program.emit_insn(Insn::OpenWrite {
+                        db: table_db,
                         cursor_id,
                         root_page: RegisterOrLiteral::Literal(root_page),
                         name: table_name.0.clone(),
@@ -464,6 +472,7 @@ pub fn translate_insert(
                         });
                     }
                     program.emit_insn(Insn::OpenWrite {
+                        db: table_db,
                         cursor_id,
                         root_page: RegisterOrLiteral::Literal(root_page),
                         name: table_name.0.clone(),
@@ -567,6 +576,7 @@ pub fn translate_insert(
             });
         }
         program.emit_insn(Insn::OpenWrite {
+            db: table_db,
             cursor_id,
             root_page: RegisterOrLiteral::Literal(root_page),
             name: table_name.0.clone(),
@@ -585,6 +595,7 @@ pub fn translate_insert(
     // Open all the index btrees for writing
     for idx_cursor in idx_cursors.iter() {
         program.emit_insn(Insn::OpenWrite {
+            db: table_db,
             cursor_id: idx_cursor.2,
             root_page: idx_cursor.1.into(),
             name: idx_cursor.0.clone(),
@@ -635,6 +646,29 @@ pub fn translate_insert(
     // the table Insert below, i.e. the natural continue point: single-row falls
     // through to the end; multi-row continues via Next / Goto loop_start.
     let next_record_label = program.allocate_label();
+
+    // Row triggers. `NEW.*` is the freshly populated column-register block plus
+    // `rowid_reg`; there is no `OLD` image for an INSERT. Fired here, before the
+    // conflict/NOT NULL checks, matching upstream's ordering in
+    // `sqlite3Insert()` (BEFORE triggers, then `GenerateConstraintChecks`).
+    let trigger_resolver = Resolver::new(schema, syms);
+    let insert_trigger_table =
+        crate::translate::trigger::table_has_triggers(&trigger_resolver, &btree_table.name)
+            .then(|| btree_table.clone());
+    let new_image = crate::translate::trigger::RowImage {
+        rowid_reg,
+        cols_start_reg: column_registers_start,
+    };
+    if let Some(btree) = insert_trigger_table.as_ref() {
+        crate::translate::trigger::fire::emit_insert_triggers(
+            &mut program,
+            &trigger_resolver,
+            btree.as_ref(),
+            limbo_sqlite3_parser::ast::TriggerTime::Before,
+            new_image,
+            next_record_label,
+        )?;
+    }
 
     // ---------------------------------------------------------------------
     // CONFLICT-CHECK PHASE
@@ -1113,6 +1147,17 @@ pub fn translate_insert(
         flag: InsertFlags::new(),
         table_name: table_name.to_string(),
     });
+
+    if let Some(btree) = insert_trigger_table.as_ref() {
+        crate::translate::trigger::fire::emit_insert_triggers(
+            &mut program,
+            &trigger_resolver,
+            btree.as_ref(),
+            limbo_sqlite3_parser::ast::TriggerTime::After,
+            new_image,
+            next_record_label,
+        )?;
+    }
 
     // IGNORE jumps here, skipping all inserts; a successful insert falls through.
     program.preassign_label_to_next_insn(next_record_label);
@@ -1668,6 +1713,7 @@ fn translate_insert_without_rowid(
     // right IndexKeyInfo (sort order, num_cols = pk_count, has_rowid = false).
     let synthetic_idx = Index::synthetic_for_without_rowid(btree_table);
     let root_page = btree_table.root_page;
+    let table_db = btree_table.db_index;
     // `synthetic_idx.columns` contains ALL table columns (needed for emit_column lookup),
     // so we must derive the PK count from the table's primary_key_columns list, not from
     // the synthetic index's column count.
@@ -1713,7 +1759,12 @@ fn translate_insert_without_rowid(
         },
         InsertBody::DefaultValues => false,
     };
-    let needs_stmt_savepoint = on_conflict_needs_savepoint && inserting_multiple_rows;
+    // Nested statements (inlined trigger bodies) must not open the "_stmt"
+    // savepoint: releasing a transaction-owning savepoint commits and halts the
+    // enclosing program, silently dropping every instruction emitted after it.
+    // See `ProgramBuilder::is_nested`.
+    let needs_stmt_savepoint =
+        on_conflict_needs_savepoint && inserting_multiple_rows && !program.is_nested();
 
     // --- Open the cursor as BTreeIndex ---
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(synthetic_idx.clone()));
@@ -1763,6 +1814,7 @@ fn translate_insert_without_rowid(
             });
         }
         program.emit_insn(Insn::OpenWrite {
+            db: table_db,
             cursor_id,
             root_page: RegisterOrLiteral::Literal(root_page),
             name: table_name.clone(),
@@ -1782,6 +1834,7 @@ fn translate_insert_without_rowid(
             });
         }
         program.emit_insn(Insn::OpenWrite {
+            db: table_db,
             cursor_id,
             root_page: RegisterOrLiteral::Literal(root_page),
             name: table_name.clone(),

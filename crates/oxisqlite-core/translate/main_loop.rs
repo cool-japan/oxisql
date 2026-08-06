@@ -247,12 +247,14 @@ pub fn init_loop(
                     let root_page = btree.root_page;
                     if let Some(cursor_id) = table_cursor_id {
                         program.emit_insn(Insn::OpenRead {
+                            db: table.table.db_index(),
                             cursor_id,
                             root_page,
                         });
                     }
                     if let Some(index_cursor_id) = index_cursor_id {
                         program.emit_insn(Insn::OpenRead {
+                            db: table.table.db_index(),
                             cursor_id: index_cursor_id,
                             root_page: index.as_ref().unwrap().root_page,
                         });
@@ -261,6 +263,7 @@ pub fn init_loop(
                 (OperationMode::DELETE, Table::BTree(btree)) => {
                     let root_page = btree.root_page;
                     program.emit_insn(Insn::OpenWrite {
+                        db: table.table.db_index(),
                         cursor_id: table_cursor_id
                             .expect("table cursor is always opened in OperationMode::DELETE"),
                         root_page: root_page.into(),
@@ -268,6 +271,7 @@ pub fn init_loop(
                     });
                     if let Some(index_cursor_id) = index_cursor_id {
                         program.emit_insn(Insn::OpenWrite {
+                            db: table.table.db_index(),
                             cursor_id: index_cursor_id,
                             root_page: index.as_ref().unwrap().root_page.into(),
                             name: index.as_ref().unwrap().name.clone(),
@@ -288,6 +292,7 @@ pub fn init_loop(
                                 CursorType::BTreeIndex(index.clone()),
                             );
                             program.emit_insn(Insn::OpenWrite {
+                                db: table.table.db_index(),
                                 cursor_id,
                                 root_page: index.root_page.into(),
                                 name: index.name.clone(),
@@ -298,6 +303,7 @@ pub fn init_loop(
                 (OperationMode::UPDATE, Table::BTree(btree)) => {
                     let root_page = btree.root_page;
                     program.emit_insn(Insn::OpenWrite {
+                        db: table.table.db_index(),
                         cursor_id: table_cursor_id
                             .expect("table cursor is always opened in OperationMode::UPDATE"),
                         root_page: root_page.into(),
@@ -305,6 +311,7 @@ pub fn init_loop(
                     });
                     if let Some(index_cursor_id) = index_cursor_id {
                         program.emit_insn(Insn::OpenWrite {
+                            db: table.table.db_index(),
                             cursor_id: index_cursor_id,
                             root_page: index.as_ref().unwrap().root_page.into(),
                             name: index.as_ref().unwrap().name.clone(),
@@ -323,16 +330,18 @@ pub fn init_loop(
                     OperationMode::SELECT => {
                         if let Some(table_cursor_id) = table_cursor_id {
                             program.emit_insn(Insn::OpenRead {
+                                db: table.table.db_index(),
                                 cursor_id: table_cursor_id,
-                                root_page: table.table.get_root_page(),
+                                root_page: table.table.get_root_page()?,
                             });
                         }
                     }
                     OperationMode::DELETE | OperationMode::UPDATE => {
                         let table_cursor_id = table_cursor_id.expect("table cursor is always opened in OperationMode::DELETE or OperationMode::UPDATE");
                         program.emit_insn(Insn::OpenWrite {
+                            db: table.table.db_index(),
                             cursor_id: table_cursor_id,
-                            root_page: table.table.get_root_page().into(),
+                            root_page: table.table.get_root_page()?.into(),
                             name: table.table.get_name().to_string(),
                         });
                         // For DELETE, we need to open all the indexes for writing
@@ -354,6 +363,7 @@ pub fn init_loop(
                                         CursorType::BTreeIndex(index.clone()),
                                     );
                                     program.emit_insn(Insn::OpenWrite {
+                                        db: table.table.db_index(),
                                         cursor_id,
                                         root_page: index.root_page.into(),
                                         name: index.name.clone(),
@@ -382,6 +392,7 @@ pub fn init_loop(
                         match mode {
                             OperationMode::SELECT => {
                                 program.emit_insn(Insn::OpenRead {
+                                    db: table.table.db_index(),
                                     cursor_id: index_cursor_id
                                         .expect("index cursor is always opened in Seek with index"),
                                     root_page: index.root_page,
@@ -389,6 +400,7 @@ pub fn init_loop(
                             }
                             OperationMode::UPDATE | OperationMode::DELETE => {
                                 program.emit_insn(Insn::OpenWrite {
+                                    db: table.table.db_index(),
                                     cursor_id: index_cursor_id
                                         .expect("index cursor is always opened in Seek with index"),
                                     root_page: index.root_page.into(),

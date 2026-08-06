@@ -142,6 +142,26 @@ path = "tests/autoindex_balance.rs"
 name = "views"
 path = "tests/views.rs"
 
+[[test]]
+name = "pragma_panic_hardening"
+path = "tests/pragma_panic_hardening.rs"
+
+[[test]]
+name = "triggers"
+path = "tests/triggers.rs"
+
+[[test]]
+name = "json_malformed_blob"
+path = "tests/json_malformed_blob.rs"
+
+[[test]]
+name = "pragma_index_introspection"
+path = "tests/pragma_index_introspection.rs"
+
+[[test]]
+name = "multi_database"
+path = "tests/multi_database.rs"
+
 [dependencies.bitflags]
 workspace = true
 
@@ -166,6 +186,18 @@ workspace = true
 # `cargo tree -i core-foundation-sys`.
 features = ["clock"]
 
+# ── Crate-local third-party version pins (deliberate, not an oversight) ────
+# The pins below (crossbeam-skiplist, hex, libc, libm, parking_lot, rand,
+# regex, regex-syntax, ryu, tracing; plus quickcheck/quickcheck_macros and
+# the criterion feature set under [dev-dependencies] further down) are kept
+# crate-local rather than swept to `workspace = true`. `oxisqlite-core` is
+# the C-free fork of limbo 0.0.22's `core` crate, and matching upstream's own
+# per-crate version pins keeps this manifest diffable line-for-line against
+# limbo for future upstream merges — none of these are shared with another
+# workspace member at a *different* version (which would be the actual bug
+# worth fixing; see `log`/`env_logger` in oxisqlite-sqlite3-parser and
+# `tokio` in oxisqlite, which WERE swept to `workspace = true` because they
+# had drifted from an already-shared workspace-level requirement).
 [dependencies.crossbeam-skiplist]
 version = "0.1.3"
 
@@ -194,19 +226,19 @@ workspace = true
 
 [dependencies.limbo_sqlite3_parser]
 package = "oxisqlite-sqlite3-parser"
-version = "0.4.0"
+version = "0.4.1"
 path = "../oxisqlite-sqlite3-parser"
 
 [dependencies.limbo_time]
 package = "oxisqlite-time"
-version = "0.4.0"
+version = "0.4.1"
 path = "../oxisqlite-time"
 features = ["static"]
 optional = true
 
 [dependencies.limbo_uuid]
 package = "oxisqlite-uuid"
-version = "0.4.0"
+version = "0.4.1"
 path = "../oxisqlite-uuid"
 features = ["static"]
 optional = true

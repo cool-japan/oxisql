@@ -8,7 +8,7 @@ impl BTreeCursor {
             let page = self.read_page(page_id)?;
             return_if_locked_maybe_load!(self.pager, page);
             let page = page.get();
-            let contents = page.get().contents.as_ref().unwrap();
+            let contents = page.try_get_contents()?;
             if contents.is_leaf() {
                 self.stack.set_cell_index(contents.cell_count() as i32);
                 return Ok(CursorResult::Ok(()));
@@ -300,8 +300,7 @@ impl BTreeCursor {
             let delete_state = {
                 let delete_info = self
                     .state
-                    .delete_info()
-                    .expect("cannot get delete info");
+                    .delete_info_or_err()?;
                 delete_info.state.clone()
             };
             tracing::debug!(? delete_state);
@@ -327,7 +326,7 @@ impl BTreeCursor {
                             return Ok(CursorResult::Ok(()));
                         }
                     }
-                    let delete_info = self.state.mut_delete_info().unwrap();
+                    let delete_info = self.state.mut_delete_info_or_err()?;
                     delete_info.state = DeleteState::DeterminePostBalancingSeekKey;
                 }
                 DeleteState::DeterminePostBalancingSeekKey => {
@@ -345,7 +344,7 @@ impl BTreeCursor {
                         };
                         DeleteSavepoint::Rowid(rowid)
                     };
-                    let delete_info = self.state.mut_delete_info().unwrap();
+                    let delete_info = self.state.mut_delete_info_or_err()?;
                     delete_info.state = DeleteState::LoadPage {
                         post_balancing_seek_key: Some(target_key),
                     };
@@ -353,7 +352,7 @@ impl BTreeCursor {
                 DeleteState::LoadPage { post_balancing_seek_key } => {
                     let page = self.stack.top();
                     return_if_locked_maybe_load!(self.pager, page);
-                    let delete_info = self.state.mut_delete_info().unwrap();
+                    let delete_info = self.state.mut_delete_info_or_err()?;
                     delete_info.state = DeleteState::FindCell {
                         post_balancing_seek_key,
                     };
@@ -362,7 +361,7 @@ impl BTreeCursor {
                     let page = self.stack.top();
                     let cell_idx = self.stack.current_cell_index() as usize;
                     let page = page.get();
-                    let contents = page.get().contents.as_ref().unwrap();
+                    let contents = page.try_get_contents()?;
                     if cell_idx >= contents.cell_count() {
                         return_corrupt!(
                             format!("Corrupted page: cell index {} is out of bounds for page with {} cells",
@@ -395,7 +394,7 @@ impl BTreeCursor {
                         }
                         _ => None,
                     };
-                    let delete_info = self.state.mut_delete_info().unwrap();
+                    let delete_info = self.state.mut_delete_info_or_err()?;
                     delete_info.state = DeleteState::ClearOverflowPages {
                         cell_idx,
                         cell,
@@ -415,7 +414,7 @@ impl BTreeCursor {
                     let contents = page.get_contents();
                     let is_last_cell = cell_idx
                         == contents.cell_count().saturating_sub(1);
-                    let delete_info = self.state.mut_delete_info().unwrap();
+                    let delete_info = self.state.mut_delete_info_or_err()?;
                     if !contents.is_leaf() {
                         delete_info.state = DeleteState::InteriorNodeReplacement {
                             cell_idx,
@@ -423,9 +422,9 @@ impl BTreeCursor {
                             post_balancing_seek_key,
                         };
                     } else {
-                        let contents = page.get().contents.as_mut().unwrap();
+                        let contents = page.try_get_contents_mut()?;
                         drop_cell(contents, cell_idx, self.usable_space() as u16)?;
-                        let delete_info = self.state.mut_delete_info().unwrap();
+                        let delete_info = self.state.mut_delete_info_or_err()?;
                         delete_info.state = DeleteState::CheckNeedsBalancing {
                             rightmost_cell_was_dropped: is_last_cell,
                             post_balancing_seek_key,
@@ -441,7 +440,7 @@ impl BTreeCursor {
                     let (cell_payload, leaf_cell_idx) = {
                         let leaf_page_ref = self.stack.top();
                         let leaf_page = leaf_page_ref.get();
-                        let leaf_contents = leaf_page.get().contents.as_ref().unwrap();
+                        let leaf_contents = leaf_page.try_get_contents()?;
                         assert!(leaf_contents.is_leaf());
                         assert!(leaf_contents.cell_count() > 0);
                         let leaf_cell_idx = leaf_contents.cell_count() - 1;
@@ -527,7 +526,7 @@ impl BTreeCursor {
                             self.usable_space() as u16,
                         )?;
                     }
-                    let delete_info = self.state.mut_delete_info().unwrap();
+                    let delete_info = self.state.mut_delete_info_or_err()?;
                     delete_info.state = DeleteState::CheckNeedsBalancing {
                         rightmost_cell_was_dropped: false,
                         post_balancing_seek_key,
@@ -540,7 +539,7 @@ impl BTreeCursor {
                     let page = self.stack.top();
                     return_if_locked_maybe_load!(self.pager, page);
                     let page = page.get();
-                    let contents = page.get().contents.as_ref().unwrap();
+                    let contents = page.try_get_contents()?;
                     let free_space = compute_free_space(
                         contents,
                         self.usable_space() as u16,
@@ -551,7 +550,7 @@ impl BTreeCursor {
                         self.stack.retreat();
                     }
                     if needs_balancing {
-                        let delete_info = self.state.mut_delete_info().unwrap();
+                        let delete_info = self.state.mut_delete_info_or_err()?;
                         if delete_info.balance_write_info.is_none() {
                             let mut write_info = WriteInfo::new();
                             write_info.state = WriteState::BalanceStart;
@@ -567,7 +566,7 @@ impl BTreeCursor {
                     }
                 }
                 DeleteState::WaitForBalancingToComplete { target_key } => {
-                    let delete_info = self.state.mut_delete_info().unwrap();
+                    let delete_info = self.state.mut_delete_info_or_err()?;
                     let write_info = delete_info.balance_write_info.take().unwrap();
                     self.state = CursorState::Write(write_info);
                     match self.balance()? {
@@ -707,7 +706,7 @@ impl BTreeCursor {
                     let page = self.read_page(next_page as usize)?;
                     return_if_locked_maybe_load!(self.pager, page);
                     let page = page.get();
-                    let contents = page.get().contents.as_ref().unwrap();
+                    let contents = page.try_get_contents()?;
                     let next = contents.read_u32(0);
                     self.pager.free_page(Some(page), next_page as usize)?;
                     if next != 0 {
@@ -752,18 +751,14 @@ impl BTreeCursor {
             let destroy_state = {
                 let destroy_info = self
                     .state
-                    .destroy_info()
-                    .expect("unable to get a mut reference to destroy state in cursor");
+                    .destroy_info_or_err()?;
                 destroy_info.state.clone()
             };
             match destroy_state {
                 DestroyState::Start => {
                     let destroy_info = self
                         .state
-                        .mut_destroy_info()
-                        .expect(
-                            "unable to get a mut reference to destroy state in cursor",
-                        );
+                        .mut_destroy_info_or_err()?;
                     destroy_info.state = DestroyState::LoadPage;
                 }
                 DestroyState::LoadPage => {
@@ -771,10 +766,7 @@ impl BTreeCursor {
                     return_if_locked_maybe_load!(self.pager, page);
                     let destroy_info = self
                         .state
-                        .mut_destroy_info()
-                        .expect(
-                            "unable to get a mut reference to destroy state in cursor",
-                        );
+                        .mut_destroy_info_or_err()?;
                     destroy_info.state = DestroyState::ProcessPage;
                 }
                 DestroyState::ProcessPage => {
@@ -782,17 +774,14 @@ impl BTreeCursor {
                     self.stack.advance();
                     assert!(page.get().is_loaded());
                     let page = page.get();
-                    let contents = page.get().contents.as_ref().unwrap();
+                    let contents = page.try_get_contents()?;
                     let cell_idx = self.stack.current_cell_index();
                     if cell_idx >= contents.cell_count() as i32 {
                         match (contents.is_leaf(), cell_idx) {
                             (true, n) if n >= contents.cell_count() as i32 => {
                                 let destroy_info = self
                                     .state
-                                    .mut_destroy_info()
-                                    .expect(
-                                        "unable to get a mut reference to destroy state in cursor",
-                                    );
+                                    .mut_destroy_info_or_err()?;
                                 destroy_info.state = DestroyState::FreePage;
                                 continue;
                             }
@@ -802,18 +791,12 @@ impl BTreeCursor {
                                     self.stack.push(rightmost_page);
                                     let destroy_info = self
                                         .state
-                                        .mut_destroy_info()
-                                        .expect(
-                                            "unable to get a mut reference to destroy state in cursor",
-                                        );
+                                        .mut_destroy_info_or_err()?;
                                     destroy_info.state = DestroyState::LoadPage;
                                 } else {
                                     let destroy_info = self
                                         .state
-                                        .mut_destroy_info()
-                                        .expect(
-                                            "unable to get a mut reference to destroy state in cursor",
-                                        );
+                                        .mut_destroy_info_or_err()?;
                                     destroy_info.state = DestroyState::FreePage;
                                 }
                                 continue;
@@ -821,10 +804,7 @@ impl BTreeCursor {
                             (false, n) if n > contents.cell_count() as i32 => {
                                 let destroy_info = self
                                     .state
-                                    .mut_destroy_info()
-                                    .expect(
-                                        "unable to get a mut reference to destroy state in cursor",
-                                    );
+                                    .mut_destroy_info_or_err()?;
                                 destroy_info.state = DestroyState::FreePage;
                                 continue;
                             }
@@ -848,10 +828,7 @@ impl BTreeCursor {
                         true => {
                             let destroy_info = self
                                 .state
-                                .mut_destroy_info()
-                                .expect(
-                                    "unable to get a mut reference to destroy state in cursor",
-                                );
+                                .mut_destroy_info_or_err()?;
                             destroy_info.state = DestroyState::ClearOverflowPages {
                                 cell,
                             };
@@ -862,10 +839,7 @@ impl BTreeCursor {
                                 BTreeCell::IndexInteriorCell(_) => {
                                     let destroy_info = self
                                         .state
-                                        .mut_destroy_info()
-                                        .expect(
-                                            "unable to get a mut reference to destroy state in cursor",
-                                        );
+                                        .mut_destroy_info_or_err()?;
                                     destroy_info.state = DestroyState::ClearOverflowPages {
                                         cell,
                                     };
@@ -881,10 +855,7 @@ impl BTreeCursor {
                                     self.stack.push(child_page);
                                     let destroy_info = self
                                         .state
-                                        .mut_destroy_info()
-                                        .expect(
-                                            "unable to get a mut reference to destroy state in cursor",
-                                        );
+                                        .mut_destroy_info_or_err()?;
                                     destroy_info.state = DestroyState::LoadPage;
                                     continue;
                                 }
@@ -902,10 +873,7 @@ impl BTreeCursor {
                                     self.stack.push(child_page);
                                     let destroy_info = self
                                         .state
-                                        .mut_destroy_info()
-                                        .expect(
-                                            "unable to get a mut reference to destroy state in cursor",
-                                        );
+                                        .mut_destroy_info_or_err()?;
                                     destroy_info.state = DestroyState::LoadPage;
                                     continue;
                                 }
@@ -913,10 +881,7 @@ impl BTreeCursor {
                                 | BTreeCell::IndexLeafCell(_) => {
                                     let destroy_info = self
                                         .state
-                                        .mut_destroy_info()
-                                        .expect(
-                                            "unable to get a mut reference to destroy state in cursor",
-                                        );
+                                        .mut_destroy_info_or_err()?;
                                     destroy_info.state = DestroyState::LoadPage;
                                 }
                                 _ => panic!("unexpected cell type"),
@@ -933,10 +898,7 @@ impl BTreeCursor {
                         self.stack.pop();
                         let destroy_info = self
                             .state
-                            .mut_destroy_info()
-                            .expect(
-                                "unable to get a mut reference to destroy state in cursor",
-                            );
+                            .mut_destroy_info_or_err()?;
                         destroy_info.state = DestroyState::ProcessPage;
                     } else {
                         self.state = CursorState::None;
@@ -955,7 +917,7 @@ impl BTreeCursor {
         cell_idx: usize,
         record: &ImmutableRecord,
     ) -> Result<CursorResult<()>> {
-        let page_type = page_ref.get().get().contents.as_ref().unwrap().page_type();
+        let page_type = page_ref.get().try_get_contents()?.page_type();
         let mut new_payload = Vec::with_capacity(record.len());
         let rowid = return_if_io!(self.rowid());
         fill_cell_payload(
@@ -968,7 +930,7 @@ impl BTreeCursor {
         )?;
         let (old_offset, old_local_size) = {
             let page_ref = page_ref.get();
-            let page = page_ref.get().contents.as_ref().unwrap();
+            let page = page_ref.try_get_contents()?;
             page.cell_get_raw_region(
                 cell_idx,
                 payload_overflow_threshold_max(page_type, self.usable_space() as u16),
@@ -1002,7 +964,7 @@ impl BTreeCursor {
     ) -> Result<CursorResult<()>> {
         return_if_locked!(page_ref.get());
         let page_ref = page_ref.get();
-        let buf = page_ref.get().contents.as_mut().unwrap().as_ptr();
+        let buf = page_ref.try_get_contents_mut()?.as_ptr();
         buf[dest_offset..dest_offset + new_payload.len()].copy_from_slice(&new_payload);
         Ok(CursorResult::Ok(()))
     }
@@ -1051,7 +1013,7 @@ impl BTreeCursor {
             mem_page_rc = self.stack.top();
             return_if_locked_maybe_load!(self.pager, mem_page_rc);
             mem_page = mem_page_rc.get();
-            contents = mem_page.get().contents.as_ref().unwrap();
+            contents = mem_page.try_get_contents()?;
             if !matches!(contents.page_type(), PageType::TableInterior) {
                 self.count += contents.cell_count();
             }
@@ -1067,7 +1029,7 @@ impl BTreeCursor {
                     mem_page_rc = self.stack.top();
                     return_if_locked_maybe_load!(self.pager, mem_page_rc);
                     mem_page = mem_page_rc.get();
-                    contents = mem_page.get().contents.as_ref().unwrap();
+                    contents = mem_page.try_get_contents()?;
                     let cell_idx = self.stack.current_cell_index() as usize;
                     if cell_idx <= contents.cell_count() {
                         break;

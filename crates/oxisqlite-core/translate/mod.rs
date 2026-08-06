@@ -32,6 +32,7 @@ pub(crate) mod schema;
 pub(crate) mod select;
 pub(crate) mod subquery;
 pub(crate) mod transaction;
+pub(crate) mod trigger;
 pub(crate) mod update;
 pub(crate) mod upsert;
 mod values;
@@ -85,6 +86,7 @@ pub fn translate(
         approx_num_labels: 2,
     });
 
+    program.connection = Some(connection.clone());
     program.prologue();
     program.schema_cookie = database_header.lock().schema_cookie;
 
@@ -121,7 +123,9 @@ pub fn translate_inner(
     let program = match stmt {
         ast::Stmt::AlterTable(alter) => translate_alter_table(*alter, syms, schema, program)?,
         ast::Stmt::Analyze(name) => analyze::translate_analyze(query_mode, schema, name, program)?,
-        ast::Stmt::Attach { .. } => bail_parse_error!("ATTACH not supported yet"),
+        ast::Stmt::Attach {
+            expr, db_name, key, ..
+        } => transaction::translate_attach(schema, syms, *expr, *db_name, key, program)?,
         ast::Stmt::Begin(tx_type, tx_name) => translate_tx_begin(tx_type, tx_name, program)?,
         ast::Stmt::Commit(tx_name) => translate_tx_commit(tx_name, program)?,
         ast::Stmt::CreateIndex {
@@ -155,7 +159,9 @@ pub fn translate_inner(
             syms,
             program,
         )?,
-        ast::Stmt::CreateTrigger { .. } => bail_parse_error!("CREATE TRIGGER not supported yet"),
+        ast::Stmt::CreateTrigger(create) => {
+            trigger::translate_create_trigger(query_mode, *create, schema, program)?
+        }
         ast::Stmt::CreateView {
             temporary,
             if_not_exists,
@@ -192,7 +198,7 @@ pub fn translate_inner(
                 program,
             )?
         }
-        ast::Stmt::Detach(_) => bail_parse_error!("DETACH not supported yet"),
+        ast::Stmt::Detach(name) => transaction::translate_detach(schema, syms, *name, program)?,
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
@@ -201,7 +207,10 @@ pub fn translate_inner(
             if_exists,
             tbl_name,
         } => translate_drop_table(query_mode, tbl_name, if_exists, schema, program)?,
-        ast::Stmt::DropTrigger { .. } => bail_parse_error!("DROP TRIGGER not supported yet"),
+        ast::Stmt::DropTrigger {
+            if_exists,
+            trigger_name,
+        } => trigger::translate_drop_trigger(query_mode, trigger_name, if_exists, schema, program)?,
         ast::Stmt::DropView {
             if_exists,
             view_name,

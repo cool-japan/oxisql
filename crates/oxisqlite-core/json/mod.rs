@@ -185,12 +185,12 @@ pub fn json_array_length(
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
 
-    if path.is_none() {
+    let Some(path_value) = path else {
         let len = json.array_len()?;
         return Ok(Value::Integer(len as i64));
-    }
+    };
 
-    let path = json_path_from_owned_value(path.expect("We already checked none"), true)?;
+    let path = json_path_from_owned_value(path_value, true)?;
 
     if let Some(path) = path {
         let mut op = SearchOperation::new(json.len() / 2);
@@ -423,7 +423,15 @@ fn json_string_to_db_type(
         ElementType::ARRAY | ElementType::OBJECT => Ok(Value::Text(Text::json(json_string))),
         ElementType::TEXT | ElementType::TEXT5 | ElementType::TEXTJ | ElementType::TEXTRAW => {
             if matches!(flag, OutputVariant::ElementType) {
-                json_string.remove(json_string.len() - 1);
+                // Strip the quotes `Jsonb::to_string` wraps text elements in. A
+                // rendering shorter than two characters can only come from a
+                // malformed document, and `String::remove(len - 1)` panics on it
+                // (empty string, or a byte index that is not a char boundary
+                // when the final character is multi-byte). `pop()` is
+                // char-boundary-safe by construction.
+                if json_string.pop().is_none() || json_string.is_empty() {
+                    crate::bail_parse_error!("malformed JSON")
+                }
                 json_string.remove(0);
                 Ok(Value::Text(Text {
                     value: json_string.into_bytes(),
@@ -436,9 +444,13 @@ fn json_string_to_db_type(
                 }))
             }
         }
-        ElementType::FLOAT5 | ElementType::FLOAT => Ok(Value::Float(
-            json_string.parse().expect("Should be valid f64"),
-        )),
+        // The textual rendering comes from a FLOAT/FLOAT5 element of a possibly
+        // attacker-supplied JSONB blob (JSON5 allows shapes such as `1e`, `+.`
+        // or a bare `-`), so this must not `expect()`.
+        ElementType::FLOAT5 | ElementType::FLOAT => match json_string.parse::<f64>() {
+            Ok(float) => Ok(Value::Float(float)),
+            Err(_) => crate::bail_parse_error!("malformed JSON"),
+        },
         ElementType::INT | ElementType::INT5 => {
             let result = i64::from_str(&json_string);
             if let Ok(int) = result {
@@ -462,17 +474,21 @@ pub fn json_type(value: &Value, path: Option<&Value>) -> crate::Result<Value> {
     if let Value::Null = value {
         return Ok(Value::Null);
     }
-    if path.is_none() {
+    let Some(path_value) = path else {
         let json = convert_dbtype_to_jsonb(value, Conv::Strict)?;
         let element_type = json.is_valid()?;
 
         return Ok(Value::Text(Text::json(element_type.into())));
-    }
-    if let Some(path) = json_path_from_owned_value(path.expect("path validated by caller"), true)? {
+    };
+    if let Some(path) = json_path_from_owned_value(path_value, true)? {
         let mut json = convert_dbtype_to_jsonb(value, Conv::Strict)?;
 
         if let Ok(mut path) = json.navigate_path(&path, PathOperationMode::ReplaceExisting) {
-            let target = path.pop().expect("Should exist");
+            // `navigate_path` can legitimately return an empty stack; popping it
+            // used to `expect()` and abort the process.
+            let Some(target) = path.pop() else {
+                return Ok(Value::Null);
+            };
             let element_type = if let Some(el_index) = target.get_array_index() {
                 json.element_type_at(el_index)
             } else {

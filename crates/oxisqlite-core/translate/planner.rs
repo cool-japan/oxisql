@@ -122,6 +122,7 @@ pub fn bind_column_references(
     top_level_expr: &mut Expr,
     referenced_tables: &mut TableReferences,
     result_columns: Option<&[ResultSetColumn]>,
+    catalog: &Schema,
 ) -> Result<()> {
     walk_expr_mut(top_level_expr, &mut |expr: &mut Expr| -> Result<()> {
         match expr {
@@ -250,12 +251,13 @@ pub fn bind_column_references(
                 Ok(())
             }
             Expr::DoublyQualified(schema, tbl, id) => {
-                // This engine has no ATTACH support, so "main" is the only valid
-                // schema-name for a `schema.table.column` reference; error cleanly on
-                // anything else instead of silently misresolving it. Once the schema
-                // is validated, the rest mirrors the `Qualified` arm above exactly.
+                // `schema.table.column`: the table must already be in scope under
+                // its own (unqualified) name, so the schema part only has to name
+                // a database this connection actually has. `main`, `temp` and any
+                // `ATTACH` alias qualify; anything else is an error rather than a
+                // silent misresolution.
                 let normalized_schema_name = normalize_ident(schema.0.as_str());
-                if normalized_schema_name != "main" {
+                if !catalog.has_database(&normalized_schema_name) {
                     crate::bail_parse_error!("unknown database {}", schema.0);
                 }
                 let normalized_table_name = normalize_ident(tbl.0.as_str());
@@ -478,8 +480,22 @@ fn parse_from_clause_table<'a>(
                 return Ok(());
             };
 
-            // Check if our top level schema has this table.
-            if let Some(table) = schema.get_table(&normalized_qualified_name) {
+            // Check if our top level schema has this table. A schema qualifier
+            // (`main.t`, `temp.t`, `alias.t`) addresses exactly that database;
+            // an unqualified name follows upstream's `temp` -> `main` ->
+            // attached search order, which the merged catalog already encodes.
+            let db_qualifier = qualified_name.db_name.as_ref().map(|db| db.0.clone());
+            if let Some(db_qualifier) = db_qualifier.as_deref() {
+                // Report the *database* when the qualifier names none, instead of
+                // blaming the table -- and never fall back to `main`, which would
+                // silently misresolve `detached_alias.t`.
+                if !schema.has_database(db_qualifier) {
+                    crate::bail_parse_error!("unknown database {}", db_qualifier);
+                }
+            }
+            if let Some(table) =
+                schema.get_table_qualified(db_qualifier.as_deref(), &normalized_qualified_name)
+            {
                 let alias = maybe_alias
                     .map(|a| match a {
                         ast::As::As(id) => id,
@@ -824,12 +840,13 @@ pub fn parse_where(
     table_references: &mut TableReferences,
     result_columns: Option<&[ResultSetColumn]>,
     out_where_clause: &mut Vec<WhereTerm>,
+    catalog: &Schema,
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
         let mut predicates = vec![];
         break_predicate_at_and_boundaries(where_expr, &mut predicates);
         for expr in predicates.iter_mut() {
-            bind_column_references(expr, table_references, result_columns)?;
+            bind_column_references(expr, table_references, result_columns, catalog)?;
         }
         for expr in predicates {
             out_where_clause.push(WhereTerm {
@@ -1106,7 +1123,7 @@ fn parse_join<'a>(
                 let mut preds = vec![];
                 break_predicate_at_and_boundaries(expr, &mut preds);
                 for predicate in preds.iter_mut() {
-                    bind_column_references(predicate, table_references, None)?;
+                    bind_column_references(predicate, table_references, None, schema)?;
                 }
                 for pred in preds {
                     out_where_clause.push(WhereTerm {

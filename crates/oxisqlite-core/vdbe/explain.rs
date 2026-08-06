@@ -360,11 +360,12 @@ pub fn insn_to_str(
             Insn::OpenRead {
                 cursor_id,
                 root_page,
+                db,
             } => (
                 "OpenRead",
                 *cursor_id as i32,
                 *root_page as i32,
-                0,
+                *db as i32,
                 Value::build_text(""),
                 0,
                 {
@@ -1220,6 +1221,7 @@ pub fn insn_to_str(
                 cursor_id,
                 root_page,
                 name,
+                db,
                 ..
             } => (
                 "OpenWrite",
@@ -1228,7 +1230,7 @@ pub fn insn_to_str(
                     RegisterOrLiteral::Literal(i) => *i as _,
                     RegisterOrLiteral::Register(i) => *i as _,
                 },
-                0,
+                *db as i32,
                 Value::build_text(""),
                 0,
                 format!("root={}; {}", root_page, name),
@@ -1285,6 +1287,37 @@ pub fn insn_to_str(
                 0,
                 format!("DROP TABLE {}", table_name),
             ),
+            Insn::DropTrigger { trigger_name } => (
+                "DropTrigger",
+                0,
+                0,
+                0,
+                Value::build_text(trigger_name),
+                0,
+                format!("DROP TRIGGER {}", trigger_name),
+            ),
+            Insn::DropTriggersForTable { table_name } => (
+                "DropTriggersForTable",
+                0,
+                0,
+                0,
+                Value::build_text(table_name),
+                0,
+                format!("drop triggers of {}", table_name),
+            ),
+            Insn::ChangeCounterSnapshot { reg, save } => (
+                "ChangeCounterSnapshot",
+                *reg as i32,
+                i32::from(*save),
+                0,
+                Value::build_text(""),
+                0,
+                if *save {
+                    format!("r[{reg}]=changes()")
+                } else {
+                    format!("changes()=r[{reg}]")
+                },
+            ),
             Insn::DropIndex { db: _, index } => (
                 "DropIndex",
                 0,
@@ -1323,6 +1356,27 @@ pub fn insn_to_str(
                 Value::build_text(""),
                 0,
                 format!("if (r[{}]==NULL) goto {}", reg, target_pc.to_debug_int()),
+            ),
+            Insn::Attach {
+                path_reg,
+                alias_reg,
+            } => (
+                "Attach",
+                *path_reg as i32,
+                *alias_reg as i32,
+                0,
+                Value::build_text(""),
+                0,
+                format!("ATTACH r[{path_reg}] AS r[{alias_reg}]"),
+            ),
+            Insn::Detach { alias_reg } => (
+                "Detach",
+                *alias_reg as i32,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                format!("DETACH r[{alias_reg}]"),
             ),
             Insn::ParseSchema { db, where_clause } => (
                 "ParseSchema",

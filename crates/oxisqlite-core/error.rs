@@ -91,3 +91,6 @@ impl From<limbo_ext::ResultCode> for LimboError {
 pub const SQLITE_CONSTRAINT: usize = 19;
 pub const SQLITE_CONSTRAINT_PRIMARYKEY: usize = SQLITE_CONSTRAINT | (6 << 8);
 pub const SQLITE_CONSTRAINT_NOTNULL: usize = SQLITE_CONSTRAINT | (5 << 8);
+/// `SQLITE_CONSTRAINT_TRIGGER` (1811) — raised by `RAISE(ABORT|FAIL|ROLLBACK)`
+/// inside a trigger body.
+pub const SQLITE_CONSTRAINT_TRIGGER: usize = SQLITE_CONSTRAINT | (7 << 8);

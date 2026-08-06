@@ -1,0 +1,11 @@
+# OxiSQL rustfmt configuration.
+#
+# Deliberately minimal: verified via `cargo fmt --all -- --check` that the
+# entire pre-existing tracked codebase already matches rustfmt's *default*
+# settings (only `edition` needs to be pinned explicitly here, for plain
+# `rustfmt` invocations outside of `cargo fmt`, which reads each crate's
+# Cargo.toml `edition` automatically). Do not add stricter/opinionated
+# options without re-running `cargo fmt --all -- --check` across the whole
+# workspace first — the whole point of this file is to describe the style
+# that is already in place, not to trigger a repo-wide reformat.
+edition = "2021"

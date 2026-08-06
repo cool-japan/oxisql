@@ -5,6 +5,7 @@ pub mod column;
 pub mod container;
 pub mod index;
 pub mod table;
+pub mod trigger;
 
 // Re-export all types
 pub use bootstrap::*;
@@ -12,6 +13,7 @@ pub use column::*;
 pub use container::*;
 pub use index::*;
 pub use table::*;
+pub use trigger::*;
 
 #[cfg(test)]
 mod tests;

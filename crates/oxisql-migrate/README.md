@@ -23,7 +23,7 @@ version.
 
 ```toml
 [dependencies]
-oxisql-migrate = { version = "0.3.3", features = ["migrate"] }
+oxisql-migrate = { version = "0.4.1", features = ["migrate"] }
 ```
 
 The `migrate` feature enables the runner, tracker, and the `sqlparser`/`gluesql`/

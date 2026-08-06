@@ -318,6 +318,28 @@ impl CursorState {
             _ => None,
         }
     }
+    /// [`CursorState::write_info`], as a typed error instead of `None`.
+    ///
+    /// The write/balance state machine is an internal invariant, but it is
+    /// re-entered across I/O suspensions, so a mismatch is a *bug*, not a
+    /// user-visible condition — and a library must report a bug as an error
+    /// rather than abort its embedder's process. Callers used to `.unwrap()`
+    /// the `Option`.
+    fn write_info_or_err(&self) -> crate::Result<&WriteInfo> {
+        self.write_info().ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "b-tree cursor is not in a write/balance state".to_string(),
+            )
+        })
+    }
+    /// Mutable counterpart of [`CursorState::write_info_or_err`].
+    fn mut_write_info_or_err(&mut self) -> crate::Result<&mut WriteInfo> {
+        self.mut_write_info().ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "b-tree cursor is not in a write/balance state".to_string(),
+            )
+        })
+    }
     fn destroy_info(&self) -> Option<&DestroyInfo> {
         match self {
             CursorState::Destroy(x) => Some(x),
@@ -341,6 +363,31 @@ impl CursorState {
             CursorState::Delete(x) => Some(x),
             _ => None,
         }
+    }
+    /// [`CursorState::destroy_info`], as a typed error instead of `None`.
+    /// See [`CursorState::write_info_or_err`] for why these exist.
+    fn destroy_info_or_err(&self) -> crate::Result<&DestroyInfo> {
+        self.destroy_info().ok_or_else(|| {
+            crate::LimboError::InternalError("b-tree cursor is not in a destroy state".to_string())
+        })
+    }
+    /// Mutable counterpart of [`CursorState::destroy_info_or_err`].
+    fn mut_destroy_info_or_err(&mut self) -> crate::Result<&mut DestroyInfo> {
+        self.mut_destroy_info().ok_or_else(|| {
+            crate::LimboError::InternalError("b-tree cursor is not in a destroy state".to_string())
+        })
+    }
+    /// [`CursorState::delete_info`], as a typed error instead of `None`.
+    fn delete_info_or_err(&self) -> crate::Result<&DeleteInfo> {
+        self.delete_info().ok_or_else(|| {
+            crate::LimboError::InternalError("b-tree cursor is not in a delete state".to_string())
+        })
+    }
+    /// Mutable counterpart of [`CursorState::delete_info_or_err`].
+    fn mut_delete_info_or_err(&mut self) -> crate::Result<&mut DeleteInfo> {
+        self.mut_delete_info().ok_or_else(|| {
+            crate::LimboError::InternalError("b-tree cursor is not in a delete state".to_string())
+        })
     }
 }
 impl Debug for CursorState {

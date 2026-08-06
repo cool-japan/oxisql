@@ -399,6 +399,7 @@ mod tests_2 {
     #[should_panic]
     fn test_automatic_index_nonexistent_column() {
         let table = BTreeTable {
+            db_index: 0,
             root_page: 0,
             name: "t1".to_string(),
             has_rowid: true,

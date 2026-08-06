@@ -7,6 +7,6 @@ license = "Apache-2.0"
 description = "Pure-Rust zstd-API shim backed by oxiarc-zstd (COOLJAPAN Pure Rust Policy v2). Local [patch.crates-io] override for oxisql — NOT the upstream zstd crate; implements only the bulk surface arrow-ipc uses."
 
 [dependencies]
-oxiarc-zstd = "0.3.6"
+oxiarc-zstd = "0.4.1"
 
 [workspace]

@@ -302,3 +302,59 @@ fn match_operator_errors_cleanly() {
     );
     cleanup(&path);
 }
+
+/// `x IN <table>` (the table / table-function form of `IN`, as opposed to
+/// `IN (SELECT ...)` or `IN (list)`) parses but has no emitter. It used to hit a
+/// bare `todo!()` in `translate_expr`'s `Expr::InTable` arm and abort the host
+/// process; it must now be a clean parse error.
+#[test]
+fn in_table_errors_cleanly_instead_of_panicking() {
+    let (_io, conn, path) = open("in_table");
+    exec(&conn, "CREATE TABLE t (a INTEGER)");
+    exec(&conn, "INSERT INTO t VALUES (1)");
+
+    for sql in [
+        "SELECT 1 WHERE 1 IN t",
+        "SELECT 1 WHERE 1 NOT IN t",
+        "SELECT (1 IN t)",
+        "SELECT 1 WHERE 1 IN main.t",
+    ] {
+        let err = conn
+            .query(sql)
+            .err()
+            .unwrap_or_else(|| panic!("{sql} must be a clean error, not a panic"));
+        assert!(
+            format!("{err}").contains("IN <table> is not supported yet"),
+            "{sql} must reach the InTable guard, got: {err}"
+        );
+    }
+    cleanup(&path);
+}
+
+/// `RAISE(...)` is only meaningful inside a trigger body, and `CREATE TRIGGER`
+/// is itself rejected by this engine. Writing `RAISE()` anywhere else used to
+/// hit a bare `todo!()` in `translate_expr`'s `Expr::Raise` arm and abort the
+/// host process; it must now be a clean parse error.
+#[test]
+fn raise_outside_trigger_errors_cleanly_instead_of_panicking() {
+    let (_io, conn, path) = open("raise_expr");
+    exec(&conn, "CREATE TABLE t (a INTEGER)");
+
+    for sql in [
+        "SELECT RAISE(IGNORE)",
+        "SELECT RAISE(ABORT, 'boom')",
+        "SELECT RAISE(FAIL, 'boom')",
+        "SELECT RAISE(ROLLBACK, 'boom')",
+        "SELECT * FROM t WHERE a = RAISE(IGNORE)",
+    ] {
+        let err = conn
+            .query(sql)
+            .err()
+            .unwrap_or_else(|| panic!("{sql} must be a clean error, not a panic"));
+        assert!(
+            format!("{err}").contains("RAISE() may only be used within a trigger-program"),
+            "{sql} must reach the Raise guard, got: {err}"
+        );
+    }
+    cleanup(&path);
+}

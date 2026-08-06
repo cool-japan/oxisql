@@ -1,0 +1,7 @@
+# OxiSQL clippy configuration.
+#
+# `msrv` matches the workspace's declared `rust-version` (Cargo.toml
+# `[workspace.package] rust-version = "1.89"`) so MSRV-aware lints (e.g.
+# `clippy::incompatible_msrv`) check against the version this workspace
+# actually promises, not clippy's own toolchain default.
+msrv = "1.89"

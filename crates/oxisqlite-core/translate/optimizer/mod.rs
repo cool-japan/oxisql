@@ -622,6 +622,8 @@ impl Optimizable for ast::Expr {
             // May appear in DO UPDATE SET expressions before rewriting; not known to be non-null.
             Expr::Qualified(..) => false,
             Expr::Raise(..) => false,
+            // Whatever a register holds is only known at run time.
+            Expr::Register(..) => false,
             Expr::Subquery(..) => false,
             Expr::Unary(_, expr) => expr.is_nonnull(tables),
             Expr::Variable(..) => false,
@@ -705,9 +707,13 @@ impl Optimizable for ast::Expr {
             Expr::Parenthesized(exprs) => exprs.iter().all(|expr| expr.is_constant(resolver)),
             // See Expr::Id note above.
             Expr::Qualified(_, _) => false,
-            Expr::Raise(_, expr) => expr
-                .as_ref()
-                .map_or(true, |expr| expr.is_constant(resolver)),
+            // NOT constant, even with a literal message: `RAISE` is a control
+            // transfer (halt, or the trigger's IGNORE jump), so hoisting it into
+            // the program's constant prologue would fire it unconditionally,
+            // before the row that should have triggered it was even examined.
+            Expr::Raise(..) => false,
+            // A register's contents change as the enclosing loop advances.
+            Expr::Register(_) => false,
             Expr::Subquery(_) => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),
             Expr::Variable(_) => false,

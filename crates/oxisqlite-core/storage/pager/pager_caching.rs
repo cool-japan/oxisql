@@ -350,7 +350,17 @@ impl Pager {
                     Ok(CursorResult::Ok(final_root_page_id))
                 }
                 AutoVacuumMode::Incremental => {
-                    unimplemented!()
+                    // No incremental-vacuum root-page allocation strategy exists.
+                    // `translate::pragma` now refuses to arm this mode, so this is
+                    // a defence-in-depth arm for any future caller of
+                    // `Pager::set_auto_vacuum_mode` (e.g. a header-driven restore
+                    // path): return a typed error instead of aborting the host
+                    // process on a bare `unimplemented!()`.
+                    Err(LimboError::InvalidArgument(
+                        "incremental auto_vacuum mode is not supported yet; \
+                         cannot allocate a b-tree root page"
+                            .to_string(),
+                    ))
                 }
             }
         }
@@ -650,6 +660,14 @@ impl Pager {
         // TODO: check duplicates?
         let mut dirty_pages = RefCell::borrow_mut(&self.dirty_pages);
         dirty_pages.insert(page_id);
+    }
+
+    /// How many pages are currently queued for write-back.
+    ///
+    /// Test/diagnostic accessor: used to assert that an error path did not leave
+    /// a page marked dirty by work that never completed.
+    pub fn dirty_page_count(&self) -> usize {
+        RefCell::borrow(&self.dirty_pages).len()
     }
 
     pub fn wal_frame_count(&self) -> Result<u64> {

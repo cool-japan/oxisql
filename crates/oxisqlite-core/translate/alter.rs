@@ -44,6 +44,9 @@ pub fn translate_alter_table(
         )));
     };
 
+    // ALTER TABLE rewrites the `sqlite_schema` row (and, for DROP COLUMN, the
+    // data b-tree) of whichever database owns the table.
+    let db_index = original_btree.db_index;
     let mut btree = (*original_btree).clone();
 
     Ok(match alter_table {
@@ -119,6 +122,7 @@ pub fn translate_alter_table(
                     );
 
                     program.emit_insn(Insn::OpenWrite {
+                        db: db_index,
                         cursor_id,
                         root_page: RegisterOrLiteral::Literal(root_page),
                         name: table_name.clone(),
@@ -157,9 +161,9 @@ pub fn translate_alter_table(
                         });
                     });
 
-                    program.emit_schema_change();
+                    program.emit_schema_change_for(db_index);
                     program.emit_insn(Insn::ParseSchema {
-                        db: usize::MAX, // TODO: This value is unused, change when we do something with it
+                        db: db_index,
                         where_clause: None,
                     })
                 },
@@ -226,9 +230,9 @@ pub fn translate_alter_table(
                 syms,
                 program,
                 |program| {
-                    program.emit_schema_change();
+                    program.emit_schema_change_for(db_index);
                     program.emit_insn(Insn::ParseSchema {
-                        db: usize::MAX, // TODO: This value is unused, change when we do something with it
+                        db: db_index,
                         where_clause: None,
                     });
                 },
@@ -259,6 +263,7 @@ pub fn translate_alter_table(
             ));
 
             program.emit_insn(Insn::OpenWrite {
+                db: db_index,
                 cursor_id,
                 root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
                 name: sqlite_schema.name.clone(),
@@ -313,9 +318,9 @@ pub fn translate_alter_table(
                 });
             });
 
-            program.emit_schema_change();
+            program.emit_schema_change_for(db_index);
             program.emit_insn(Insn::ParseSchema {
-                db: usize::MAX, // TODO: This value is unused, change when we do something with it
+                db: db_index,
                 where_clause: None,
             });
 
@@ -341,6 +346,7 @@ pub fn translate_alter_table(
             ));
 
             program.emit_insn(Insn::OpenWrite {
+                db: db_index,
                 cursor_id,
                 root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
                 name: sqlite_schema.name.clone(),
@@ -392,9 +398,9 @@ pub fn translate_alter_table(
                 });
             });
 
-            program.emit_schema_change();
+            program.emit_schema_change_for(db_index);
             program.emit_insn(Insn::ParseSchema {
-                db: usize::MAX, // TODO: This value is unused, change when we do something with it
+                db: db_index,
                 where_clause: None,
             });
 

@@ -21,7 +21,7 @@ Rust and has **no feature flags**.
 
 ```toml
 [dependencies]
-oxisql-parse = "0.3.3"
+oxisql-parse = "0.4.1"
 ```
 
 MSRV 1.89 · edition 2021 · Apache-2.0.
@@ -206,10 +206,10 @@ None.
 
 ## Part of the OxiSQL workspace
 
-`oxisql-parse` is one of 17 crates in the OxiSQL workspace (10 facade/driver
+`oxisql-parse` is one of 18 crates in the OxiSQL workspace (11 facade/driver
 crates plus a 7-crate C-free `oxisqlite-*` engine). See the
-[workspace README](../../README.md) for the full architecture and the 2,157
-workspace tests (2,651 with `--all-features`).
+[workspace README](../../README.md) for the full architecture and the 2,261
+workspace tests (2,755 with `--all-features`).
 
 ## License
 

@@ -1696,6 +1696,7 @@ mod tests {
     /// Creates a BTreeTable with the given name and columns
     fn _create_btree_table(name: &str, columns: Vec<Column>) -> Rc<BTreeTable> {
         Rc::new(BTreeTable {
+            db_index: 0,
             root_page: 1, // Page number doesn't matter for tests
             name: name.to_string(),
             primary_key_columns: vec![],

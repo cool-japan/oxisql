@@ -23,22 +23,22 @@ URI-based dispatch, connection pooling, TLS, options, introspection, a
 ```toml
 [dependencies]
 # In-memory only
-oxisql = { version = "0.3.3", features = ["embedded"] }
+oxisql = { version = "0.4.1", features = ["embedded"] }
 
 # PostgreSQL
-oxisql = { version = "0.3.3", features = ["postgres"] }
+oxisql = { version = "0.4.1", features = ["postgres"] }
 
 # PostgreSQL with logical replication (CDC via pgoutput)
-oxisql = { version = "0.3.3", features = ["postgres-replication"] }
+oxisql = { version = "0.4.1", features = ["postgres-replication"] }
 
 # MySQL
-oxisql = { version = "0.3.3", features = ["mysql"] }
+oxisql = { version = "0.4.1", features = ["mysql"] }
 
 # Pure-Rust SQLite-compat (oxisqlite, C-free fork of limbo)
-oxisql = { version = "0.3.3", features = ["sqlite"] }
+oxisql = { version = "0.4.1", features = ["sqlite"] }
 
 # Everything + pooling + migrations
-oxisql = { version = "0.3.3", features = [
+oxisql = { version = "0.4.1", features = [
     "embedded", "postgres", "mysql", "sqlite", "datafusion",
     "pool-embedded", "pool-postgres", "pool-mysql",
     "migrate",
@@ -262,7 +262,7 @@ At the crate root and via `prelude`: `Connection`, `Transaction`,
 `RetryConnection`, `RetryPolicy`, `RetryPredicate`).
 
 Feature-gated module re-exports: `oxisql::postgres`, `oxisql::mysql`,
-`oxisql::datafusion`, `oxisql::pool`, `oxisql::migrate`.
+`oxisql::datafusion`, `oxisql::pool`, `oxisql::migrate`, `oxisql::cache`.
 
 Feature-gated direct connection types: `EmbeddedConnection` (`embedded`),
 `RedbEmbeddedConnection` (`redb`), `FjallEmbeddedConnection` (`fjall`),
@@ -286,6 +286,7 @@ Feature-gated direct connection types: `EmbeddedConnection` (`embedded`),
 | `pool-mysql` | `mysql://` | deadpool + mysql_async |
 | `pool-sqlite-compat` | `sqlite://` | Pool over the oxisqlite backend |
 | `migrate` | — | SQL migration runner via `oxisql-migrate` |
+| `cache` | — | SQL query-result / prepared-plan cache via `oxisql-cache` (LRU + TTL) |
 | `repl` | — | `oxisql-repl` binary (implies `embedded`) |
 
 ### REPL binary
@@ -313,10 +314,10 @@ Postgres / MySQL. Zero failures, zero clippy/rustdoc warnings either way.
 
 ## Part of the OxiSQL workspace
 
-`oxisql` is one of 17 crates in the OxiSQL workspace (10 facade/driver crates
+`oxisql` is one of 18 crates in the OxiSQL workspace (11 facade/driver crates
 plus a 7-crate C-free `oxisqlite-*` engine). See the
 [workspace README](../../README.md) for the full architecture, backend matrix,
-and the 2,157 workspace tests (2,651 with `--all-features`).
+and the 2,261 workspace tests (2,755 with `--all-features`).
 
 ## License
 

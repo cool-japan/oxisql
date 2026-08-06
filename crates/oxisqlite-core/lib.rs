@@ -94,6 +94,7 @@ mod info;
 mod io;
 #[cfg(feature = "json")]
 mod json;
+mod multidb;
 pub mod mvcc;
 mod parameters;
 mod pragma;
@@ -365,6 +366,7 @@ impl Database {
             _shared_cache: false,
             cache_size: Cell::new(self.header.lock().default_page_cache_size),
             closed: Cell::new(false),
+            aux_dbs: RefCell::new(Vec::new()),
         });
         if let Err(e) = conn.register_builtins() {
             return Err(LimboError::ExtensionError(e));
@@ -537,6 +539,13 @@ pub struct Connection {
     /// Set once the connection has been checkpoint-closed (via `close()` or
     /// `Drop`) so the work is not repeated.
     closed: Cell<bool>,
+    /// Per-connection registry of auxiliary databases, mirroring upstream
+    /// SQLite's `sqlite3.aDb[]`: index 0 (`main`) is intentionally never stored
+    /// here (it is this connection's own `pager`/`schema`/`transaction_state`),
+    /// index 1 is the lazily-created `temp` database, and indices 2.. are
+    /// `ATTACH`ed databases. Empty (and therefore free) until a statement first
+    /// needs `TEMP` or `ATTACH`. See [`crate::multidb`].
+    aux_dbs: RefCell<Vec<Option<multidb::AuxDb>>>,
 }
 
 impl Connection {
@@ -561,10 +570,7 @@ impl Connection {
         match cmd {
             Cmd::Stmt(stmt) => {
                 let program = Rc::new(translate::translate(
-                    self.schema
-                        .try_read()
-                        .ok_or(LimboError::SchemaLocked)?
-                        .deref(),
+                    self.compile_schema()?.as_ref(),
                     stmt,
                     self.header.clone(),
                     self.pager.clone(),
@@ -591,10 +597,7 @@ impl Connection {
             // without ever stepping it).
             Cmd::Explain(stmt) => {
                 let program = Rc::new(translate::translate(
-                    self.schema
-                        .try_read()
-                        .ok_or(LimboError::SchemaLocked)?
-                        .deref(),
+                    self.compile_schema()?.as_ref(),
                     stmt,
                     self.header.clone(),
                     self.pager.clone(),
@@ -646,10 +649,7 @@ impl Connection {
         match cmd {
             Cmd::Stmt(ref stmt) | Cmd::Explain(ref stmt) => {
                 let program = translate::translate(
-                    self.schema
-                        .try_read()
-                        .ok_or(LimboError::SchemaLocked)?
-                        .deref(),
+                    self.compile_schema()?.as_ref(),
                     stmt.clone(),
                     self.header.clone(),
                     self.pager.clone(),
@@ -764,10 +764,7 @@ impl Connection {
                     // below for why that distinction matters.
                     let syms = self.syms.borrow();
                     let program = translate::translate(
-                        self.schema
-                            .try_read()
-                            .ok_or(LimboError::SchemaLocked)?
-                            .deref(),
+                        self.compile_schema()?.as_ref(),
                         stmt,
                         self.header.clone(),
                         self.pager.clone(),
@@ -794,10 +791,7 @@ impl Connection {
                     let program = {
                         let syms = self.syms.borrow();
                         translate::translate(
-                            self.schema
-                                .try_read()
-                                .ok_or(LimboError::SchemaLocked)?
-                                .deref(),
+                            self.compile_schema()?.as_ref(),
                             stmt,
                             self.header.clone(),
                             self.pager.clone(),
@@ -869,6 +863,11 @@ impl Connection {
         if self.closed.replace(true) {
             return Ok(());
         }
+        // Auxiliary databases are per-connection. Dropping the registry drops
+        // each nested connection (which checkpoints an attached file on the way
+        // out) and discards the `temp` database and everything in it -- exactly
+        // upstream SQLite's `sqlite_temp_schema` lifetime.
+        self.aux_dbs.borrow_mut().clear();
         self.pager.checkpoint_shutdown()
     }
 
@@ -1083,6 +1082,9 @@ impl Drop for Connection {
         if self.closed.replace(true) {
             return;
         }
+        // Same per-connection lifetime as `close()`: `temp` and every attached
+        // database go away with the connection.
+        self.aux_dbs.borrow_mut().clear();
         if let Err(e) = self.pager.checkpoint_shutdown() {
             tracing::warn!("Connection::drop best-effort checkpoint failed: {e}");
         }

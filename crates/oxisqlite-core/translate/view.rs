@@ -34,9 +34,13 @@ pub fn translate_create_view(
     schema: &Schema,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
-    if temporary {
-        bail_parse_error!("TEMPORARY view not supported yet");
-    }
+    // `CREATE TEMP VIEW` registers the view in the `temp` catalog (and writes
+    // its row to `temp`'s own `sqlite_schema`), exactly like a temp table.
+    let db_index = program.resolve_ddl_db_index(
+        view_name.db_name.as_ref().map(|name| name.0.as_str()),
+        temporary,
+    )?;
+    let db_qualifier = program.db_qualifier(db_index);
     let opts = ProgramBuilderOpts {
         query_mode,
         num_cursors: 1,
@@ -48,7 +52,10 @@ pub fn translate_create_view(
     let name = view_name.name.0.clone();
     // A view shares the table namespace, so an existing table/view/vtab of the
     // same name is a conflict (SQLite: "table X already exists").
-    if schema.get_table(&name).is_some() {
+    if schema
+        .get_table_qualified(Some(&db_qualifier), &name)
+        .is_some()
+    {
         if if_not_exists {
             program.epilogue(TransactionMode::Write);
             return Ok(program);
@@ -76,6 +83,7 @@ pub fn translate_create_view(
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(schema_table.clone()));
     program.emit_insn(Insn::OpenWrite {
+        db: db_index,
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1usize.into(),
         name: name.clone(),
@@ -91,10 +99,10 @@ pub fn translate_create_view(
         Some(sql),
     );
 
-    program.emit_schema_change();
+    program.emit_schema_change_for(db_index);
     let parse_schema_where_clause = format!("tbl_name = '{}' AND type != 'trigger'", name);
     program.emit_insn(Insn::ParseSchema {
-        db: sqlite_schema_cursor_id,
+        db: db_index,
         where_clause: Some(parse_schema_where_clause),
     });
 
@@ -125,7 +133,10 @@ pub fn translate_drop_view(
     program.extend(&opts);
 
     let name = view_name.name.0.clone();
-    let table = schema.get_table(&name);
+    let qualifier = view_name.db_name.as_ref().map(|db| db.0.clone());
+    let _ = program.resolve_db_index(qualifier.as_deref())?;
+    let db_index = schema.db_index_for_object(qualifier.as_deref(), &name);
+    let table = schema.get_table_qualified(qualifier.as_deref(), &name);
     match table.as_ref().map(|t| t.as_ref()) {
         None => {
             if if_exists {
@@ -147,6 +158,7 @@ pub fn translate_drop_view(
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(schema_table.clone()));
     program.emit_insn(Insn::OpenWrite {
+        db: db_index,
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1usize.into(),
         name: SQLITE_TABLEID.to_string(),
@@ -204,10 +216,10 @@ pub fn translate_drop_view(
     });
     program.preassign_label_to_next_insn(end_label);
 
-    program.emit_schema_change();
+    program.emit_schema_change_for(db_index);
     // Remove the in-memory catalog entry (type-agnostic HashMap removal).
     program.emit_insn(Insn::DropTable {
-        db: 0,
+        db: db_index,
         _p2: 0,
         _p3: 0,
         table_name: name,

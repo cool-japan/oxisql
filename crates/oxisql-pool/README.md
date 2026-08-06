@@ -27,10 +27,10 @@ SQLite path.
 ```toml
 [dependencies]
 # Choose the backends you need (all features are opt-in):
-oxisql-pool = { version = "0.3.3", features = ["embedded"] }
-oxisql-pool = { version = "0.3.3", features = ["postgres"] }
-oxisql-pool = { version = "0.3.3", features = ["mysql"] }
-oxisql-pool = { version = "0.3.3", features = ["sqlite"] }  # Pure-Rust oxisqlite engine
+oxisql-pool = { version = "0.4.1", features = ["embedded"] }
+oxisql-pool = { version = "0.4.1", features = ["postgres"] }
+oxisql-pool = { version = "0.4.1", features = ["mysql"] }
+oxisql-pool = { version = "0.4.1", features = ["sqlite"] }  # Pure-Rust oxisqlite engine
 ```
 
 - MSRV: **1.89** · edition **2021** · `#![forbid(unsafe_code)]`

@@ -44,7 +44,7 @@ path = "tests/integration_tests.rs"
 # io_uring backends are opt-in via the forwarding features below.
 [dependencies.limbo_core]
 package = "oxisqlite-core"
-version = "0.4.0"
+version = "0.4.1"
 path = "../oxisqlite-core"
 
 [dependencies.thiserror]
@@ -54,7 +54,7 @@ workspace = true
 workspace = true
 
 [dev-dependencies.tokio]
-version = "1.52.3"
+workspace = true
 features = ["full"]
 
 [features]

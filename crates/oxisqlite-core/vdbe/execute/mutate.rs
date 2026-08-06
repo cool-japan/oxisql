@@ -220,9 +220,13 @@ pub fn op_create_btree(
     let Insn::CreateBtree { db, root, flags } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    if *db > 0 {
-        todo!("temp databases not implemented yet");
+    // `db > 0` is the `temp` database or an `ATTACH`ed one: allocate the new
+    // b-tree out of *that* database's pager, after making sure it has a write
+    // transaction open (`main`'s was opened by the prologue's `Transaction`).
+    if super::begin_db_txn(program, *db, true)? {
+        return Ok(InsnFunctionStepResult::Busy);
     }
+    let pager = &super::pager_for_db(program, pager, *db)?;
     let root_page = return_if_io!(pager.btree_create(flags));
     state.registers[*root] = Register::Value(Value::Integer(root_page as i64));
     state.pc += 1;
@@ -243,9 +247,13 @@ pub fn op_destroy(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    if *is_temp == 1 {
-        todo!("temp databases not implemented yet.");
+    // Upstream's `OP_Destroy` P3 is "the table lives in a database other than
+    // `main`"; this engine carries the registry index directly, so `is_temp` is
+    // the database the root page belongs to (0 = `main`).
+    if super::begin_db_txn(program, *is_temp, true)? {
+        return Ok(InsnFunctionStepResult::Busy);
     }
+    let pager = super::pager_for_db(program, pager, *is_temp)?;
     let mut cursor = BTreeCursor::new(None, pager.clone(), *root, Vec::new());
     let former_root_page_result = cursor.btree_destroy()?;
     if let CursorResult::Ok(former_root_page) = former_root_page_result {
@@ -265,14 +273,90 @@ pub fn op_drop_table(
     let Insn::DropTable { db, table_name, .. } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    if *db > 0 {
-        todo!("temp databases not implemented yet");
-    }
     let conn = program.connection.clone();
+    // Drop the object from the catalog of the database that owns it, which for
+    // `db > 0` is the `temp` / attached namespace rather than `main`'s.
+    let schema_lock = conn.schema_for_db(*db)?;
     {
-        let mut schema = conn.schema.write();
+        let mut schema = schema_lock.write();
         schema.remove_indices_for_table(table_name);
         schema.remove_table(table_name);
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// `DropTrigger`: remove one trigger from the live catalog.
+pub fn op_drop_trigger(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::DropTrigger { trigger_name } = insn else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+    // Trigger names share one namespace across every database of a connection,
+    // so the removal sweeps `main` and every auxiliary catalog. The matching
+    // `sqlite_schema` row was already deleted from the owning database.
+    for schema in program.connection.all_catalogs() {
+        schema.write().remove_trigger(trigger_name);
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// `DropTriggersForTable`: remove every trigger attached to a table.
+pub fn op_drop_triggers_for_table(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::DropTriggersForTable { table_name } = insn else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+    // `DROP TABLE t` drops every trigger on `t`, including `TEMP` triggers held
+    // in another catalog -- matching upstream, where a temp trigger on a main
+    // table dies with the table.
+    for schema in program.connection.all_catalogs() {
+        schema.write().remove_triggers_for_table(table_name);
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// `ChangeCounterSnapshot`: save/restore the statement change counter.
+///
+/// See the opcode's doc comment: this is what keeps rows written by an inlined
+/// trigger body out of the outer statement's `changes()`.
+pub fn op_change_counter_snapshot(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::ChangeCounterSnapshot { reg, save } = insn else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+    if *save {
+        state.registers[*reg] = Register::Value(Value::Integer(program.n_change.get()));
+    } else {
+        let saved = match state.registers[*reg].get_owned_value() {
+            Value::Integer(i) => *i,
+            // The register is written by this same opcode's `save` half, which
+            // always stores an Integer; anything else means the program was
+            // built wrong rather than that user data went astray.
+            other => {
+                return Err(LimboError::InternalError(format!(
+                    "ChangeCounterSnapshot: register {reg} holds {other:?}, expected an integer"
+                )))
+            }
+        };
+        program.n_change.set(saved);
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

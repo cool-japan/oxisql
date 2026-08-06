@@ -30,6 +30,11 @@ pub struct UniqueSet {
 #[derive(Clone, Debug)]
 pub struct BTreeTable {
     pub root_page: usize,
+    /// Which database of the owning connection this table lives in: 0 = `main`,
+    /// 1 = `temp`, 2.. = `ATTACH`ed (see [`crate::multidb`]). `root_page` is
+    /// only meaningful relative to that database's pager, so every cursor-open
+    /// opcode carries this index alongside the root page.
+    pub db_index: usize,
     pub name: String,
     pub primary_key_columns: Vec<(String, SortOrder)>,
     pub columns: Vec<Column>,
@@ -283,13 +288,43 @@ pub enum Table {
     View(Rc<View>),
 }
 impl Table {
-    pub fn get_root_page(&self) -> usize {
+    /// The database registry index this object lives in.
+    ///
+    /// Only B-tree tables have a pager-relative root page; every other kind
+    /// (pseudo/virtual/subquery/view) has no b-tree of its own and reports
+    /// `main`.
+    pub fn db_index(&self) -> usize {
         match self {
-            Table::BTree(table) => table.root_page,
-            Table::Pseudo(_) => unimplemented!(),
-            Table::Virtual(_) => unimplemented!(),
-            Table::FromClauseSubquery(_) => unimplemented!(),
-            Table::View(_) => unimplemented!(),
+            Table::BTree(btree) => btree.db_index,
+            _ => crate::multidb::DB_MAIN,
+        }
+    }
+
+    /// Returns the B-tree root page for this table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::LimboError::InternalError`] for table kinds that have
+    /// no B-tree root page ([`Table::Pseudo`], [`Table::Virtual`],
+    /// [`Table::FromClauseSubquery`], [`Table::View`]). These are expected to
+    /// be internal planner invariants (never reachable once the caller has
+    /// already dispatched on table kind), but a typed error lets a planner
+    /// regression surface as a query error instead of aborting the process.
+    pub fn get_root_page(&self) -> Result<usize> {
+        match self {
+            Table::BTree(table) => Ok(table.root_page),
+            Table::Pseudo(_) => Err(crate::LimboError::InternalError(
+                "Pseudo table has no B-tree root page".to_string(),
+            )),
+            Table::Virtual(_) => Err(crate::LimboError::InternalError(
+                "Virtual table has no B-tree root page".to_string(),
+            )),
+            Table::FromClauseSubquery(_) => Err(crate::LimboError::InternalError(
+                "FromClauseSubquery has no B-tree root page".to_string(),
+            )),
+            Table::View(_) => Err(crate::LimboError::InternalError(
+                "View has no B-tree root page".to_string(),
+            )),
         }
     }
     pub fn get_name(&self) -> &str {
@@ -659,6 +694,10 @@ pub(super) fn create_table(
         .collect();
     Ok(BTreeTable {
         root_page,
+        // Schema rows are always parsed as if they belonged to `main`; a
+        // non-`main` catalog is re-tagged wholesale after parsing (see
+        // `multidb::retag_schema_db_index`).
+        db_index: 0,
         name: table_name,
         has_rowid,
         primary_key_columns,

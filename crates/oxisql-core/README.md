@@ -19,7 +19,7 @@ all opt-in feature flags.
 
 ```toml
 [dependencies]
-oxisql-core = "0.3.3"
+oxisql-core = "0.4.1"
 ```
 
 MSRV 1.89 · edition 2021 · Apache-2.0.
@@ -253,10 +253,10 @@ dependency-light and Pure Rust.
 
 ## Part of the OxiSQL workspace
 
-`oxisql-core` is the foundation crate of the OxiSQL workspace (17 crates: 10
+`oxisql-core` is the foundation crate of the OxiSQL workspace (18 crates: 11
 facade/driver crates plus a 7-crate C-free `oxisqlite-*` engine). See the
-[workspace README](../../README.md) for the full architecture and the 2,157
-workspace tests (2,651 with `--all-features`).
+[workspace README](../../README.md) for the full architecture and the 2,261
+workspace tests (2,755 with `--all-features`).
 
 ## License
 

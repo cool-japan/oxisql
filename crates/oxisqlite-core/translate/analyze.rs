@@ -82,6 +82,7 @@ pub fn translate_analyze(
         })?;
         let schema_cursor = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
         program.emit_insn(Insn::OpenWrite {
+            db: 0,
             cursor_id: schema_cursor,
             root_page: 1usize.into(),
             name: SQLITE_TABLEID.to_string(),
@@ -116,6 +117,7 @@ pub fn translate_analyze(
         }
     };
     program.emit_insn(Insn::OpenWrite {
+        db: 0,
         cursor_id: stat1_cursor,
         root_page: stat1_root,
         name: STAT1_TABLE.to_string(),
@@ -307,6 +309,7 @@ fn emit_target_row(program: &mut ProgramBuilder, stat1_cursor: usize, target: &A
 
     let read_cursor = program.alloc_cursor_id(cursor_type);
     program.emit_insn(Insn::OpenRead {
+        db: 0,
         cursor_id: read_cursor,
         root_page,
     });

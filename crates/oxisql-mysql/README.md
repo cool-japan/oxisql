@@ -37,7 +37,7 @@ selected when you open a `mysql://` URL through the `oxisql` facade.
 
 ```toml
 [dependencies]
-oxisql-mysql = "0.3.3"
+oxisql-mysql = "0.4.1"
 ```
 
 MSRV 1.89 · edition 2021 · Apache-2.0.
@@ -213,8 +213,8 @@ cargo test -p oxisql-mysql --features integration-mysql -- --include-ignored  # 
 
 ## Part of the OxiSQL workspace
 
-This crate is one of 17 crates in the Pure-Rust [OxiSQL workspace](../../README.md)
-(2,157 workspace tests pass, 2,651 with `--all-features`). It is the MySQL backend behind the unified `oxisql`
+This crate is one of 18 crates in the Pure-Rust [OxiSQL workspace](../../README.md)
+(2,261 workspace tests pass, 2,755 with `--all-features`). It is the MySQL backend behind the unified `oxisql`
 facade; see the workspace README for the embedded engine, PostgreSQL backend,
 connection pool, migrations, and DataFusion integration.
 

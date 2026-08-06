@@ -209,6 +209,11 @@ impl ToTokens for Expr {
                 }
                 s.append(TK_RP, None)
             }
+            // A register reference has no SQL surface syntax. It only ever
+            // appears in a code-generator-rewritten expression tree, which is
+            // never rendered back to SQL (the text persisted to
+            // `sqlite_schema` is always the pre-rewrite statement).
+            Self::Register(_) => Ok(()),
             Self::RowId { .. } => Ok(()),
             Self::Subquery(query) => {
                 s.append(TK_LP, None)?;

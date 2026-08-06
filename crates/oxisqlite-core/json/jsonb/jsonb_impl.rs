@@ -10,7 +10,7 @@ use crate::{bail_parse_error, LimboError, Result};
 use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
-    str::from_utf8_unchecked,
+    str::from_utf8,
 };
 
 use super::functions::{compare, skip_whitespace, unescape_string, PathOperation};
@@ -20,6 +20,23 @@ use super::types::{
 };
 
 use super::jsonb_type::Jsonb;
+
+/// Bounds-checked view of one JSONB element (`header || payload`) inside `data`.
+///
+/// `header_size` and `payload_size` are decoded straight out of an element
+/// header, and `JsonbHeader::from_slice` deliberately does not validate the
+/// declared payload size against the buffer length — a 4-byte size field lets a
+/// crafted blob claim up to 4 GiB inside a 3-byte document. Returns `None`
+/// instead of panicking whenever the element does not fit.
+fn slice_element(
+    data: &[u8],
+    cursor: usize,
+    header_size: usize,
+    payload_size: usize,
+) -> Option<&[u8]> {
+    let end = cursor.checked_add(header_size)?.checked_add(payload_size)?;
+    data.get(cursor..end)
+}
 
 impl Jsonb {
     pub(super) fn from_str(input: &str) -> PResult<Self> {
@@ -94,7 +111,9 @@ impl Jsonb {
                 && !matches!(current, PathElement::ArrayLocator(_));
 
             let result = if next_is_array {
-                let array_locator = path_iter.next().unwrap();
+                let Some(array_locator) = path_iter.next() else {
+                    bail_parse_error!("malformed JSON path")
+                };
 
                 self.navigate_to_segment(
                     SegmentVariant::KeyWithArrayIndex(current, array_locator),
@@ -142,7 +161,9 @@ impl Jsonb {
 
             if el_type == ElementType::ARRAY && !is_prev_arr {
                 is_prev_arr = true;
-                let arr_element_idx = parent.get_array_index().unwrap();
+                let Some(arr_element_idx) = parent.get_array_index() else {
+                    bail_parse_error!("malformed JSON")
+                };
                 let (JsonbHeader(arr_el_type, arr_el_size), arr_el_header_len) =
                     self.read_header(arr_element_idx)?;
 
@@ -198,11 +219,21 @@ impl Jsonb {
                     let end_pos = pos + root_header_size + root_size;
 
                     match idx {
-                        Some(idx) if *idx >= 0 => {
+                        // `Some(i)` with `i >= 0` is an explicit index; `None`
+                        // is SQLite's `$[#]` append locator, which resolves to
+                        // one past the last element. `None` used to fall into
+                        // the `_ => unreachable!()` arm below and abort the
+                        // process even on a well-formed array
+                        // (`SELECT json_insert('[1,2]', '$[#]', 3)`).
+                        None | Some(0..) => {
+                            let target_count = match idx {
+                                Some(idx) => *idx as usize,
+                                None => usize::MAX,
+                            };
                             let mut count = 0;
                             let mut arr_pos = pos + root_header_size;
 
-                            while arr_pos < end_pos && count != *idx as usize {
+                            while arr_pos < end_pos && count != target_count {
                                 arr_pos = self.skip_element(arr_pos)?;
                                 count += 1;
                             }
@@ -234,7 +265,8 @@ impl Jsonb {
 
                             bail_parse_error!("Not found!");
                         }
-                        Some(idx) if *idx < 0 => {
+                        // Negative index: counted back from the end.
+                        Some(negative_idx) => {
                             let mut idx_map: HashMap<i32, usize> = HashMap::with_capacity(100);
                             let mut element_idx = 0;
                             let mut arr_pos = pos + root_header_size;
@@ -245,7 +277,7 @@ impl Jsonb {
                                 element_idx += 1;
                             }
 
-                            let real_idx = element_idx + idx;
+                            let real_idx = element_idx + negative_idx;
 
                             if let Some(index) = idx_map.get(&real_idx) {
                                 return Ok(JsonTraversalResult::with_array_index(
@@ -258,7 +290,6 @@ impl Jsonb {
                                 bail_parse_error!("Element with negative index not found")
                             }
                         }
-                        _ => unreachable!(),
                     }
                 } else {
                     if root_type == ElementType::OBJECT
@@ -303,8 +334,12 @@ impl Jsonb {
                         }
 
                         let key_start = pos + key_header_len;
-                        let json_key = unsafe {
-                            from_utf8_unchecked(&self.data[key_start..key_start + key_len])
+                        // `from_utf8_unchecked` here was undefined behaviour: the
+                        // key bytes come verbatim from an attacker-supplied JSONB
+                        // blob and are under no obligation to be valid UTF-8.
+                        let Ok(json_key) = from_utf8(self.element_slice(key_start, key_len)?)
+                        else {
+                            bail_parse_error!("malformed JSON")
                         };
 
                         if compare((json_key, key_type), (path_key, *is_raw)) {
@@ -376,16 +411,28 @@ impl Jsonb {
                     let end_pos = pos + root_header_size + root_size;
 
                     match idx {
-                        Some(idx) if *idx >= 0 => {
+                        // `Some(i)` with `i >= 0` is an explicit index; `None`
+                        // is SQLite's `$[#]` append locator, which resolves to
+                        // one past the last element. `None` used to fall into
+                        // the `_ => unreachable!()` arm below and abort the
+                        // process even on a well-formed array
+                        // (`SELECT json_insert('[1,2]', '$[#]', 3)`).
+                        None | Some(0..) => {
+                            let target_count = match idx {
+                                Some(idx) => *idx as usize,
+                                None => usize::MAX,
+                            };
                             let mut count = 0;
                             let mut arr_pos = pos + root_header_size;
 
-                            while arr_pos < end_pos && count != *idx as usize {
+                            while arr_pos < end_pos && count != target_count {
                                 arr_pos = self.skip_element(arr_pos)?;
                                 count += 1;
                             }
 
-                            if mode.allows_insert() && arr_pos == end_pos && count == *idx as usize
+                            if mode.allows_insert()
+                                && arr_pos == end_pos
+                                && (idx.is_none() || count == target_count)
                             {
                                 let placeholder =
                                     JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
@@ -413,7 +460,8 @@ impl Jsonb {
 
                             bail_parse_error!("Not found!");
                         }
-                        Some(idx) if *idx < 0 => {
+                        // Negative index: counted back from the end.
+                        Some(negative_idx) => {
                             let mut idx_map: HashMap<i32, usize> = HashMap::with_capacity(100);
                             let mut element_idx = 0;
                             let mut arr_pos = pos + root_header_size;
@@ -424,7 +472,7 @@ impl Jsonb {
                                 element_idx += 1;
                             }
 
-                            let real_idx = element_idx + idx;
+                            let real_idx = element_idx + negative_idx;
 
                             if let Some(index) = idx_map.get(&real_idx) {
                                 return Ok(JsonTraversalResult::with_array_index(
@@ -437,7 +485,6 @@ impl Jsonb {
                                 bail_parse_error!("Element with negative index not found")
                             }
                         }
-                        _ => unreachable!(),
                     }
                 } else {
                     bail_parse_error!("Root is not an array");
@@ -463,11 +510,12 @@ impl Jsonb {
                         bail_parse_error!("Key should be string")
                     }
 
-                    let obj_key = unsafe {
-                        from_utf8_unchecked(
-                            &self.data[current_pos + key_header_size
-                                ..current_pos + key_header_size + key_size],
-                        )
+                    // See the `json_key` site above: unchecked UTF-8 over
+                    // attacker-controlled blob bytes is UB.
+                    let Ok(obj_key) =
+                        from_utf8(self.element_slice(current_pos + key_header_size, key_size)?)
+                    else {
+                        bail_parse_error!("malformed JSON")
                     };
 
                     if compare((obj_key, key_type), (path_key, *is_raw)) {
@@ -479,7 +527,7 @@ impl Jsonb {
                 }
 
                 if current_pos == end_pos && mode.allows_insert() {
-                    if idx.is_some() && idx.unwrap() != 0 {
+                    if idx.is_some_and(|idx| idx != 0) {
                         bail_parse_error!("cant create new arr with idx");
                     }
 
@@ -633,10 +681,15 @@ impl Jsonb {
         Err(LimboError::ParseError("Not found".to_string()))
     }
 
-    fn skip_element(&self, mut pos: usize) -> Result<usize> {
+    /// Advance past the element starting at `pos`.
+    ///
+    /// The new position is validated against the buffer length. Without that,
+    /// a header-declared payload size from a crafted blob walked the cursor
+    /// past the end of `data`, and every later `splice`/`drain`/`insert` that
+    /// used the cursor panicked with "range end index N out of range".
+    fn skip_element(&self, pos: usize) -> Result<usize> {
         let (header, skip_header) = self.read_header(pos)?;
-        pos += skip_header + header.1;
-        Ok(pos)
+        self.element_end(pos, skip_header + header.1)
     }
 
     // Primitive implementation could be optimized.
@@ -678,8 +731,8 @@ impl Jsonb {
                 }
 
                 let key_start = patch_key_cursor + key_header_size;
-                let key_text = unsafe {
-                    from_utf8_unchecked(&patch.data[key_start..key_start + key_header.1])
+                let Ok(key_text) = from_utf8(patch.element_slice(key_start, key_header.1)?) else {
+                    bail_parse_error!("malformed JSON")
                 };
 
                 // Read the value
@@ -718,15 +771,25 @@ impl Jsonb {
                         let _ = result.operate_on_path(&key_path, &mut op);
                     }
                     ElementType::OBJECT => {
-                        let value_data = &patch.data
-                            [value_cursor..value_cursor + value_header_size + value_size];
+                        // `value_header_size`/`value_size` come from the patch
+                        // document's own element headers, which are attacker
+                        // controlled when the patch is supplied as a raw JSONB
+                        // blob: bound the slice instead of indexing blindly.
+                        let Some(value_data) =
+                            slice_element(&patch.data, value_cursor, value_header_size, value_size)
+                        else {
+                            bail_parse_error!("malformed JSON")
+                        };
 
                         let target_path_result =
                             result.navigate_path(&key_path, PathOperationMode::ReplaceExisting);
 
-                        if target_path_result.is_ok() {
-                            let target_stack = target_path_result.unwrap();
-                            let target_value_idx = target_stack.last().unwrap().field_value_index;
+                        if let Ok(target_stack) = target_path_result {
+                            let Some(target_value_idx) =
+                                target_stack.last().map(|last| last.field_value_index)
+                            else {
+                                bail_parse_error!("malformed JSON")
+                            };
                             let (target_header, _) = result.read_header(target_value_idx)?;
 
                             if target_header.0 == ElementType::OBJECT {
@@ -751,8 +814,11 @@ impl Jsonb {
                         }
                     }
                     _ => {
-                        let value_data = &patch.data
-                            [value_cursor..value_cursor + value_header_size + value_size];
+                        let Some(value_data) =
+                            slice_element(&patch.data, value_cursor, value_header_size, value_size)
+                        else {
+                            bail_parse_error!("malformed JSON")
+                        };
                         let patch_value = Jsonb::new(value_data.len(), Some(value_data));
 
                         let mut op = SetOperation::new(patch_value);

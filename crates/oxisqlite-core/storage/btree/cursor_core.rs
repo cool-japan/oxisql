@@ -85,7 +85,7 @@ impl BTreeCursor {
         }
         let page = self.pager.read_page(self.root_page)?;
         return_if_locked!(page);
-        let cell_count = page.get().contents.as_ref().unwrap().cell_count();
+        let cell_count = page.try_get_contents()?.cell_count();
         Ok(CursorResult::Ok(cell_count == 0))
     }
     /// Move the cursor to the previous record and return it.
@@ -96,7 +96,7 @@ impl BTreeCursor {
             let page = self.stack.top();
             return_if_locked_maybe_load!(self.pager, page);
             let page = page.get();
-            let contents = page.get().contents.as_ref().unwrap();
+            let contents = page.try_get_contents()?;
             // Validate the (untrusted) page-type byte before interpreting the
             // page; it may have been reached via a corrupt child pointer.
             contents.validate_btree_page_type()?;
@@ -304,7 +304,7 @@ impl BTreeCursor {
         let page_btree = self.stack.top();
         return_if_locked_maybe_load!(self.pager, page_btree);
         let page = page_btree.get();
-        let contents = page.get().contents.as_ref().unwrap();
+        let contents = page.try_get_contents()?;
         let cell_idx = self.stack.current_cell_index() as usize - 1;
         if cell_idx >= contents.cell_count() {
             return Err(LimboError::Corrupt("Invalid cell index".into()));
@@ -703,7 +703,7 @@ impl BTreeCursor {
             let page = self.read_page(page_idx)?;
             return_if_locked_maybe_load!(self.pager, page);
             let page = page.get();
-            let contents = page.get().contents.as_ref().unwrap();
+            let contents = page.try_get_contents()?;
             if contents.is_leaf() {
                 if contents.cell_count() > 0 {
                     self.stack.set_cell_index(contents.cell_count() as i32 - 1);
@@ -735,7 +735,7 @@ impl BTreeCursor {
             let page = self.stack.top();
             return_if_locked_maybe_load!(self.pager, page);
             let page = page.get();
-            let contents = page.get().contents.as_ref().unwrap();
+            let contents = page.try_get_contents()?;
             // This page was reached by following an (untrusted) child/rightmost
             // pointer; validate its page-type byte so a corrupt pointer to a
             // non-b-tree page yields a Corrupt error rather than panicking in the
@@ -839,7 +839,7 @@ impl BTreeCursor {
             let page = self.stack.top();
             return_if_locked_maybe_load!(self.pager, page);
             let page = page.get();
-            let contents = page.get().contents.as_ref().unwrap();
+            let contents = page.try_get_contents()?;
             // Validate the (untrusted) page-type byte before interpreting the
             // page: a corrupt child pointer may reference a non-b-tree page.
             contents.validate_btree_page_type()?;
@@ -1017,7 +1017,7 @@ impl BTreeCursor {
             let page = self.stack.top();
             return_if_locked_maybe_load!(self.pager, page);
             let page = page.get();
-            let contents = page.get().contents.as_ref().unwrap();
+            let contents = page.try_get_contents()?;
             // The page was reached by following (untrusted) child pointers; a
             // corrupt interior pointer could land us on a non-leaf or invalid
             // page. Validate the page type instead of asserting.
@@ -1054,7 +1054,7 @@ impl BTreeCursor {
         let page = self.stack.top();
         return_if_locked_maybe_load!(self.pager, page);
         let page = page.get();
-        let contents = page.get().contents.as_ref().unwrap();
+        let contents = page.try_get_contents()?;
         loop {
             let min = min_cell_idx.get();
             let max = max_cell_idx.get();
@@ -1131,7 +1131,7 @@ impl BTreeCursor {
             let page = self.stack.top();
             return_if_locked_maybe_load!(self.pager, page);
             let page = page.get();
-            let contents = page.get().contents.as_ref().unwrap();
+            let contents = page.try_get_contents()?;
             let cell_count = contents.cell_count();
             if cell_count == 0 {
                 self.stack.set_cell_index(0);
@@ -1170,7 +1170,7 @@ impl BTreeCursor {
             let page = self.stack.top();
             return_if_locked_maybe_load!(self.pager, page);
             let page = page.get();
-            let contents = page.get().contents.as_ref().unwrap();
+            let contents = page.try_get_contents()?;
             let cur_cell_idx = self.stack.current_cell_index() as usize;
             let cell = contents
                 .cell_get(
@@ -1207,7 +1207,7 @@ impl BTreeCursor {
         let page = self.stack.top();
         return_if_locked_maybe_load!(self.pager, page);
         let page = page.get();
-        let contents = page.get().contents.as_ref().unwrap();
+        let contents = page.try_get_contents()?;
         let cell_count = contents.cell_count();
         let iter_dir = seek_op.iteration_direction();
         loop {

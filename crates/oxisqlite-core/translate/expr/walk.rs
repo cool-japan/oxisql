@@ -171,6 +171,7 @@ where
             walk_expr(expr, func)?;
         }
         ast::Expr::Id(_)
+        | ast::Expr::Register(_)
         | ast::Expr::Column { .. }
         | ast::Expr::RowId { .. }
         | ast::Expr::Literal(_)
@@ -364,6 +365,7 @@ where
             walk_expr_mut(expr, func)?;
         }
         ast::Expr::Id(_)
+        | ast::Expr::Register(_)
         | ast::Expr::Column { .. }
         | ast::Expr::RowId { .. }
         | ast::Expr::Literal(_)

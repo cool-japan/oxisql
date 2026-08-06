@@ -31,8 +31,9 @@
 //!
 //! [`Connection::tables`] queries `sqlite_master`.
 //! [`Connection::columns`] uses `PRAGMA table_info`.
-//! [`Connection::indexes`] parses `sqlite_master` DDL (PRAGMA index_list/index_info are not
-//! yet implemented in Limbo 0.0.22).
+//! [`Connection::indexes`] uses `PRAGMA index_list` / `PRAGMA index_info` — the
+//! engine surfaces index metadata (including the parsed column list) from its
+//! in-memory schema, avoiding brittle CREATE INDEX text parsing.
 //! [`Connection::foreign_keys`] uses `PRAGMA foreign_key_list` — the engine now
 //! surfaces FK metadata from its in-memory schema.
 //!
@@ -553,52 +554,44 @@ impl Connection for SqliteConnection {
     }
 
     async fn indexes(&self, table: &str) -> Result<Vec<IndexInfo>, OxiSqlError> {
-        // PRAGMA index_list and PRAGMA index_info are not yet implemented in limbo 0.0.22.
-        // Fall back to sqlite_master for index names and uniqueness, then parse
-        // the index SQL to extract column names.  This is best-effort: multi-column
-        // indexes and expression indexes may not parse perfectly.
-        let sql = "SELECT name, sql FROM sqlite_master \
-                   WHERE type='index' AND tbl_name=$1 AND name NOT LIKE 'sqlite_%'";
-        let rows = self.query(sql, &[&table]).await?;
+        // Use PRAGMA index_list / index_info — the engine now surfaces index
+        // metadata directly from its in-memory schema, so the column list is
+        // taken from the parsed index definition rather than by string-splitting
+        // the CREATE INDEX DDL (which mishandled `DESC`, `COLLATE`, quoted
+        // identifiers and multi-column keys).
+        let escaped_table = table.replace('"', "\"\"");
+        let list_sql = format!("PRAGMA index_list(\"{}\")", escaped_table);
+        let list_rows = query_rewritten(&self.conn, &list_sql, vec![])
+            .await
+            .map_err(OxiSqlError::from)?;
 
-        let mut infos: Vec<IndexInfo> = Vec::new();
-        for row in rows {
-            let name = row
-                .get_by_index(0)
-                .and_then(|v| {
-                    if let Value::Text(s) = v {
-                        Some(s.clone())
-                    } else {
-                        None
-                    }
+        // PRAGMA index_list columns (by index): 0:seq 1:name 2:unique 3:origin 4:partial
+        let mut infos: Vec<IndexInfo> = Vec::with_capacity(list_rows.len());
+        for row in &list_rows {
+            let name = match row.get_by_index(1) {
+                Some(Value::Text(s)) => s.clone(),
+                _ => continue,
+            };
+            // Preserve the historical contract of this trait method: internal
+            // auto-indexes (`sqlite_autoindex_*`) are not surfaced.
+            if name.starts_with("sqlite_") {
+                continue;
+            }
+            let unique = matches!(row.get_by_index(2), Some(Value::I64(n)) if *n != 0);
+
+            // PRAGMA index_info(index) columns: 0:seqno 1:cid 2:name
+            let escaped_index = name.replace('"', "\"\"");
+            let info_sql = format!("PRAGMA index_info(\"{}\")", escaped_index);
+            let info_rows = query_rewritten(&self.conn, &info_sql, vec![])
+                .await
+                .map_err(OxiSqlError::from)?;
+            let columns: Vec<String> = info_rows
+                .iter()
+                .filter_map(|r| match r.get_by_index(2) {
+                    Some(Value::Text(s)) => Some(s.clone()),
+                    _ => None,
                 })
-                .unwrap_or_default();
-            let idx_sql = row
-                .get_by_index(1)
-                .and_then(|v| {
-                    if let Value::Text(s) = v {
-                        Some(s.clone())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default();
-
-            // Detect UNIQUE from the CREATE INDEX / CREATE UNIQUE INDEX statement.
-            let upper = idx_sql.to_ascii_uppercase();
-            let unique = upper.contains("UNIQUE");
-
-            // Extract column list between the last `(` and `)`.
-            let columns: Vec<String> =
-                if let (Some(open), Some(close)) = (idx_sql.rfind('('), idx_sql.rfind(')')) {
-                    idx_sql[open + 1..close]
-                        .split(',')
-                        .map(|c| c.trim().to_string())
-                        .filter(|c| !c.is_empty())
-                        .collect()
-                } else {
-                    vec![]
-                };
+                .collect();
 
             infos.push(IndexInfo {
                 name,

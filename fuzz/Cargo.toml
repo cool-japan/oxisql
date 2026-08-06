@@ -1,0 +1,52 @@
+[package]
+name = "oxisql-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fallible-iterator = "0.3"
+
+# The C-free SQLite-compatible engine: `open_from_bytes` parses arbitrary
+# bytes as a full on-disk SQLite database image (header, pager, B-tree,
+# overflow pages, records) — the documented attack surface for the 8
+# panic-DoS bugs fixed in the vendored parser. `blocking` avoids needing a
+# Tokio runtime inside the fuzz harness.
+[dependencies.oxisql-sqlite-compat]
+path = "../crates/oxisql-sqlite-compat"
+features = ["blocking"]
+
+# The hand-written SQL lexer/parser (pre-generated from the `lemon` grammar,
+# no C generator at build time): feeds arbitrary bytes straight into the
+# tokenizer/parser, independent of any on-disk file format. Dependency key
+# matches the crate's own `[lib] name` (`limbo_sqlite3_parser`), package
+# resolves to the actual on-disk crate — same rename pattern used by
+# `oxisqlite-core`'s own Cargo.toml.
+[dependencies.limbo_sqlite3_parser]
+package = "oxisqlite-sqlite3-parser"
+path = "../crates/oxisqlite-sqlite3-parser"
+
+# Use an independent workspace for the fuzz crate: `libfuzzer-sys` requires
+# nightly, and detaching this `[workspace]` (rather than joining the root
+# workspace) keeps a plain `cargo build`/`cargo test` on the main workspace
+# stable-toolchain-only and unaffected by anything under `fuzz/`.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "open_from_bytes"
+path = "fuzz_targets/open_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sql_parse"
+path = "fuzz_targets/sql_parse.rs"
+test = false
+doc = false
+bench = false

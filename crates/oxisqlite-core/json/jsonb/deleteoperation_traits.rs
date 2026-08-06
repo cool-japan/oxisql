@@ -27,11 +27,18 @@ impl PathOperation for DeleteOperation {
             bail_parse_error!("Nothing to operate on!")
         }
 
-        let target = stack.pop().unwrap();
+        // Guarded by the `stack.is_empty()` bail above, but an `unwrap()` on a
+        // traversal stack built from an attacker-supplied JSONB blob is not an
+        // invariant worth betting the host process on.
+        let Some(target) = stack.pop() else {
+            bail_parse_error!("Nothing to operate on!")
+        };
 
         // handle array
         if target.has_specific_index() {
-            let array_value_idx = target.get_array_index().unwrap();
+            let Some(array_value_idx) = target.get_array_index() else {
+                bail_parse_error!("malformed JSON")
+            };
 
             let obj_value_idx = target.field_value_index;
             let (JsonbHeader(_, obj_value_size), obj_value_header_size) =
@@ -40,7 +47,8 @@ impl PathOperation for DeleteOperation {
                 json.read_header(array_value_idx)?;
             let delta = 0 - (array_value_size + array_value_header_size) as isize;
 
-            let end_pos = array_value_idx + array_value_size + array_value_header_size;
+            let end_pos =
+                json.element_end(array_value_idx, array_value_size + array_value_header_size)?;
             json.data.drain(array_value_idx..end_pos);
 
             let h_delta = if matches!(
@@ -64,7 +72,10 @@ impl PathOperation for DeleteOperation {
             let (JsonbHeader(_, key_size), key_header_size) = json.read_header(key_idx)?;
             let delta = 0 - (value_header_size + value_size + key_size + key_header_size) as isize;
 
-            let end_pos = key_idx + value_header_size + value_size + key_size + key_header_size;
+            let end_pos = json.element_end(
+                key_idx,
+                value_header_size + value_size + key_size + key_header_size,
+            )?;
             json.data.drain(key_idx..end_pos);
 
             json.update_parent_references(stack, delta + target.delta)?;

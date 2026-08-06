@@ -1,0 +1,16 @@
+[package]
+name = "oxisql-cache"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "SQL query-result and prepared-statement plan caching for oxisql (LRU + TTL, backed by oxistore-cache)"
+readme = "README.md"
+categories = ["database", "caching"]
+keywords = ["database", "sql", "cache", "lru", "cooljapan"]
+
+[dependencies]
+oxisql-core    = { workspace = true }
+oxistore-cache = { workspace = true }

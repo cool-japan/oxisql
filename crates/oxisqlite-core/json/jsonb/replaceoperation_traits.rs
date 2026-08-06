@@ -27,11 +27,18 @@ impl PathOperation for ReplaceOperation {
             bail_parse_error!("Nothing to operate on!")
         }
         let value = &self.value.data;
-        let target = stack.pop().unwrap();
+        // Guarded by the `stack.is_empty()` bail above, but an `unwrap()` on a
+        // traversal stack built from an attacker-supplied JSONB blob is not an
+        // invariant worth betting the host process on.
+        let Some(target) = stack.pop() else {
+            bail_parse_error!("Nothing to operate on!")
+        };
 
         // handle array
         if target.has_specific_index() {
-            let array_value_idx = target.get_array_index().unwrap();
+            let Some(array_value_idx) = target.get_array_index() else {
+                bail_parse_error!("malformed JSON")
+            };
             let obj_value_idx = target.field_value_index;
             let (JsonbHeader(_, obj_value_size), obj_value_header_size) =
                 json.read_header(obj_value_idx)?;
@@ -41,7 +48,8 @@ impl PathOperation for ReplaceOperation {
             let delta =
                 value.len() as isize - (array_value_size + array_value_header_size) as isize;
 
-            let end_pos = array_value_idx + array_value_size + array_value_header_size;
+            let end_pos =
+                json.element_end(array_value_idx, array_value_size + array_value_header_size)?;
             json.data
                 .splice(array_value_idx..end_pos, value.iter().copied());
 
@@ -68,7 +76,8 @@ impl PathOperation for ReplaceOperation {
                 json.read_header(old_value_idx)?;
             let delta = value.len() as isize - (old_value_header_size + old_value_size) as isize;
 
-            let end_pos = old_value_idx + old_value_header_size + old_value_size;
+            let end_pos =
+                json.element_end(old_value_idx, old_value_header_size + old_value_size)?;
 
             json.data
                 .splice(old_value_idx..end_pos, value.iter().copied());

@@ -51,11 +51,12 @@ pub fn op_drop_index(
     pager: &Rc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    let Insn::DropIndex { index, db: _ } = insn else {
+    let Insn::DropIndex { index, db } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    let mut schema = program.connection.schema.write();
-    schema.remove_index(&index);
+    let schema_lock = program.connection.schema_for_db(*db)?;
+    let mut schema = schema_lock.write();
+    schema.remove_index(index);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

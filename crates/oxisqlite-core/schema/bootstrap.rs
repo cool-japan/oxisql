@@ -11,6 +11,9 @@ pub(super) const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
 pub fn sqlite_schema_table() -> BTreeTable {
     BTreeTable {
         root_page: 1,
+        // Re-tagged by `multidb::retag_schema_db_index` for `temp`/attached
+        // catalogs; `main`'s copy keeps index 0.
+        db_index: 0,
         name: "sqlite_schema".to_string(),
         has_rowid: true,
         is_strict: false,

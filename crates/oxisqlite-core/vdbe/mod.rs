@@ -247,6 +247,11 @@ pub struct ProgramState {
     interrupted: bool,
     parameters: HashMap<NonZero<usize>, Value>,
     commit_state: CommitState,
+    /// Resume point for the multi-database commit walk in [`Program::commit_txn`]:
+    /// the auxiliary-database registry index whose transaction is being ended.
+    /// Starts at (and resets to) [`crate::multidb::DB_TEMP`] because index 0 is
+    /// `main`, which is committed after every auxiliary database.
+    commit_aux_idx: usize,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
     op_idx_delete_state: Option<OpIdxDeleteState>,
@@ -272,6 +277,7 @@ impl ProgramState {
             interrupted: false,
             parameters: HashMap::new(),
             commit_state: CommitState::Ready,
+            commit_aux_idx: crate::multidb::DB_TEMP,
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
             op_idx_delete_state: None,
@@ -417,28 +423,54 @@ impl Program {
             let connection = self.connection.clone();
             let auto_commit = connection.auto_commit.get();
             tracing::trace!("Halt auto_commit {}", auto_commit);
-            if program_state.commit_state == CommitState::Committing {
-                self.step_end_write_txn(&pager, &mut program_state.commit_state, &connection)
-            } else if auto_commit {
-                let current_state = connection.transaction_state.get();
-                match current_state {
-                    TransactionState::Write => self.step_end_write_txn(
-                        &pager,
-                        &mut program_state.commit_state,
-                        &connection,
-                    ),
-                    TransactionState::Read => {
-                        connection.transaction_state.replace(TransactionState::None);
-                        pager.end_read_tx()?;
-                        Ok(StepResult::Done)
-                    }
-                    TransactionState::None => Ok(StepResult::Done),
-                }
-            } else {
+            let resuming = program_state.commit_state == CommitState::Committing;
+            if !auto_commit && !resuming {
                 if self.change_cnt_on {
                     self.connection.set_changes(self.n_change.get());
                 }
-                Ok(StepResult::Done)
+                return Ok(StepResult::Done);
+            }
+            // Phase 1: end the transaction on every auxiliary database (`temp`
+            // and anything `ATTACH`ed) this statement locked. Each pager flushes
+            // independently and may need several I/O rounds, so the walk is
+            // resumable through `commit_aux_idx`.
+            //
+            // NOTE (documented in TODO.md): committing N databases is a
+            // sequential per-pager commit, not the master-journal two-phase
+            // commit upstream SQLite uses, so a crash between two pagers can
+            // leave one committed and another not. Within a single process this
+            // is invisible; across a crash it is a known limitation.
+            while let Some(idx) = connection.next_aux_db_with_txn(program_state.commit_aux_idx) {
+                program_state.commit_aux_idx = idx;
+                match connection.step_end_aux_txn(idx)? {
+                    crate::multidb::AuxTxnEnd::Io => {
+                        program_state.commit_state = CommitState::Committing;
+                        return Ok(StepResult::IO);
+                    }
+                    crate::multidb::AuxTxnEnd::Done => {
+                        program_state.commit_aux_idx = idx + 1;
+                    }
+                }
+            }
+            program_state.commit_aux_idx = crate::multidb::DB_TEMP;
+            // Phase 2: `main`. Dispatching on the live transaction state (rather
+            // than on `commit_state`) keeps the resumed and the fresh case on the
+            // same path: `step_end_write_txn` only clears the state once the
+            // cache flush is actually done.
+            match connection.transaction_state.get() {
+                TransactionState::Write => {
+                    self.step_end_write_txn(&pager, &mut program_state.commit_state, &connection)
+                }
+                TransactionState::Read => {
+                    connection.transaction_state.replace(TransactionState::None);
+                    pager.end_read_tx()?;
+                    program_state.commit_state = CommitState::Ready;
+                    Ok(StepResult::Done)
+                }
+                TransactionState::None => {
+                    program_state.commit_state = CommitState::Ready;
+                    Ok(StepResult::Done)
+                }
             }
         }
     }

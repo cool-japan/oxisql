@@ -36,12 +36,21 @@ pub fn op_open_read(
     let Insn::OpenRead {
         cursor_id,
         root_page,
+        db,
     } = insn
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
+    if super::begin_db_txn(program, *db, false)? {
+        return Ok(InsnFunctionStepResult::Busy);
+    }
+    let pager = &super::pager_for_db(program, pager, *db)?;
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
-    let mv_cursor = match state.mv_tx_id {
+    // MVCC keys its rows by root page alone, which is only unique *within* one
+    // database -- `temp`'s first table and `main`'s first table share root page
+    // 2. Every auxiliary database is opened with MVCC off (its pager is a plain
+    // b-tree), so a cursor on one never goes through the MVCC store.
+    let mv_cursor = match state.mv_tx_id.filter(|_| *db == crate::multidb::DB_MAIN) {
         Some(tx_id) => {
             let table_id = *root_page as u64;
             let mv_store = mv_store.unwrap().clone();
@@ -63,7 +72,8 @@ pub fn op_open_read(
         }
         CursorType::BTreeIndex(index) => {
             let conn = program.connection.clone();
-            let schema = conn.schema.try_read().ok_or(LimboError::SchemaLocked)?;
+            let schema_lock = conn.schema_for_db(*db)?;
+            let schema = schema_lock.try_read().ok_or(LimboError::SchemaLocked)?;
             let table = schema
                 .get_table(&index.table_name)
                 .map_or(None, |table| table.btree());
@@ -1141,11 +1151,16 @@ pub fn op_open_write(
     let Insn::OpenWrite {
         cursor_id,
         root_page,
+        db,
         ..
     } = insn
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
+    if super::begin_db_txn(program, *db, true)? {
+        return Ok(InsnFunctionStepResult::Busy);
+    }
+    let pager = &super::pager_for_db(program, pager, *db)?;
     let root_page = match root_page {
         RegisterOrLiteral::Literal(lit) => *lit as u64,
         RegisterOrLiteral::Register(reg) => match &state.registers[*reg].get_owned_value() {
@@ -1163,7 +1178,8 @@ pub fn op_open_write(
         CursorType::BTreeIndex(index) => Some(index),
         _ => None,
     };
-    let mv_cursor = match state.mv_tx_id {
+    // Same database-aliasing guard as `op_open_read`: MVCC covers `main` only.
+    let mv_cursor = match state.mv_tx_id.filter(|_| *db == crate::multidb::DB_MAIN) {
         Some(tx_id) => {
             let table_id = root_page;
             let mv_store = mv_store.unwrap().clone();
@@ -1176,7 +1192,8 @@ pub fn op_open_write(
     };
     if let Some(index) = maybe_index {
         let conn = program.connection.clone();
-        let schema = conn.schema.try_read().ok_or(LimboError::SchemaLocked)?;
+        let schema_lock = conn.schema_for_db(*db)?;
+        let schema = schema_lock.try_read().ok_or(LimboError::SchemaLocked)?;
         let table = schema
             .get_table(&index.table_name)
             .map_or(None, |table| table.btree());

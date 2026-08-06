@@ -110,10 +110,7 @@ pub fn parse_schema_rows(
                         .row()
                         .expect("invariant: row available after StepResult::Row"); // UPSTREAM (Limbo): unwrap — needs proper error propagation
                     let ty = row.get::<&str>(0)?;
-                    // "trigger" rows are deliberately skipped here: trigger
-                    // execution is unsupported, but their presence in
-                    // sqlite_schema must never break schema loading.
-                    if !["table", "index", "view"].contains(&ty) {
+                    if !["table", "index", "view", "trigger"].contains(&ty) {
                         continue;
                     }
                     match ty {
@@ -195,6 +192,24 @@ pub fn parse_schema_rows(
                                 Err(e) => {
                                     tracing::warn!(
                                         "skipping malformed view {} in sqlite_schema: {}",
+                                        name,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        "trigger" => {
+                            let name: &str = row.get::<&str>(1)?;
+                            let sql: &str = row.get::<&str>(4)?;
+                            // Same failure policy as views: a trigger row whose
+                            // SQL no longer re-parses is skipped with a warning
+                            // instead of aborting the whole schema load, so one
+                            // bad row can never make a database unopenable.
+                            match schema::Trigger::from_sql(sql) {
+                                Ok(trigger) => schema.add_trigger_owned(trigger),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "skipping malformed trigger {} in sqlite_schema: {}",
                                         name,
                                         e
                                     );

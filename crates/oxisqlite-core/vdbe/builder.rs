@@ -142,6 +142,33 @@ pub struct ProgramBuilder {
     nested_level: usize,
     init_label: BranchOffset,
     start_offset: BranchOffset,
+    /// Trigger programs currently being inlined, outermost first.
+    ///
+    /// Used for two things: the `recursive_triggers = off` guard (a trigger
+    /// already on this stack is not re-fired) and resolving `RAISE(IGNORE)`,
+    /// which jumps to the innermost frame's `ignore_jump`.
+    trigger_frames: Vec<TriggerFrame>,
+    /// The connection this program is being compiled for, when one exists.
+    ///
+    /// DDL translation needs it to map a schema qualifier (`temp.t`,
+    /// `alias.t`) onto a database registry index and to materialize the `temp`
+    /// database on first use. `None` in unit tests that build a program without
+    /// a connection, where only `main` can ever be addressed.
+    pub connection: Option<Arc<crate::Connection>>,
+}
+
+/// One inlined trigger program, while its body is being generated.
+#[derive(Debug, Clone)]
+pub struct TriggerFrame {
+    /// Normalized trigger name, for the recursion guard.
+    pub name: String,
+    /// Where `RAISE(IGNORE)` jumps: "abandon the rest of this trigger and the
+    /// row that fired it, then carry on with the statement".
+    pub ignore_jump: BranchOffset,
+    /// Register holding the statement change counter as it was when this
+    /// trigger started. `RAISE(IGNORE)` jumps clear over the restore emitted at
+    /// the end of the trigger's region, so it has to restore from here itself.
+    pub changes_reg: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -206,7 +233,128 @@ impl ProgramBuilder {
             // These labels will be filled when `prologue()` is called
             init_label: BranchOffset::Placeholder,
             start_offset: BranchOffset::Placeholder,
+            trigger_frames: Vec::new(),
+            connection: None,
         }
+    }
+
+    /// Map an optional schema qualifier onto a database registry index.
+    ///
+    /// `None` means "unqualified", which for *object lookup* follows upstream's
+    /// `temp` -> `main` -> attached search order (already baked into the merged
+    /// catalog by [`crate::Connection::resolved_schema`]) and therefore resolves
+    /// to `main` here -- callers that have already found the object use its
+    /// `db_index` instead.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::LimboError::ParseError`] when the qualifier names no attached
+    /// database, matching SQLite's `unknown database <name>`.
+    pub fn resolve_db_index(&self, db_name: Option<&str>) -> crate::Result<usize> {
+        let Some(db_name) = db_name else {
+            return Ok(crate::multidb::DB_MAIN);
+        };
+        let Some(connection) = self.connection.as_ref() else {
+            // No connection: only `main` exists (unit-test program builders).
+            if crate::util::normalize_ident(db_name).eq_ignore_ascii_case("main") {
+                return Ok(crate::multidb::DB_MAIN);
+            }
+            crate::bail_parse_error!("unknown database {}", db_name);
+        };
+        match connection.db_index_by_name(db_name) {
+            Some(index) => Ok(index),
+            None => crate::bail_parse_error!("unknown database {}", db_name),
+        }
+    }
+
+    /// Resolve the database a DDL statement creates its object in, materializing
+    /// the `temp` database when needed.
+    ///
+    /// `temporary` is the `TEMP`/`TEMPORARY` keyword. SQLite rejects combining
+    /// it with a schema qualifier other than `temp`.
+    pub fn resolve_ddl_db_index(
+        &self,
+        db_name: Option<&str>,
+        temporary: bool,
+    ) -> crate::Result<usize> {
+        let qualified = match db_name {
+            Some(name) => Some(self.resolve_db_index(Some(name))?),
+            None => None,
+        };
+        let target = match (temporary, qualified) {
+            (true, None) | (true, Some(crate::multidb::DB_TEMP)) => crate::multidb::DB_TEMP,
+            (true, Some(_)) => {
+                crate::bail_parse_error!("temporary table name must be unqualified")
+            }
+            (false, Some(index)) => index,
+            (false, None) => crate::multidb::DB_MAIN,
+        };
+        if target == crate::multidb::DB_TEMP {
+            let Some(connection) = self.connection.as_ref() else {
+                crate::bail_parse_error!("temporary objects require a database connection");
+            };
+            connection.ensure_temp_db()?;
+        }
+        Ok(target)
+    }
+
+    /// The schema name of a database registry index, for error messages and for
+    /// building the qualified catalog keys used by `resolved_schema`.
+    pub fn db_qualifier(&self, db: usize) -> String {
+        self.connection
+            .as_ref()
+            .and_then(|connection| connection.db_name_for_index(db))
+            .unwrap_or_else(|| crate::multidb::MAIN_DB_NAME.to_string())
+    }
+
+    /// Whether the builder is generating EXPLAIN output rather than a runnable
+    /// program. Derived from the comment buffer, which only exists in
+    /// `QueryMode::Explain` (see [`ProgramBuilder::new`]).
+    pub fn query_mode(&self) -> QueryMode {
+        if self.comments.is_some() {
+            QueryMode::Explain
+        } else {
+            QueryMode::Normal
+        }
+    }
+
+    /// Push a trigger frame while its body is inlined.
+    pub fn push_trigger_frame(
+        &mut self,
+        name: String,
+        ignore_jump: BranchOffset,
+        changes_reg: usize,
+    ) {
+        self.trigger_frames.push(TriggerFrame {
+            name,
+            ignore_jump,
+            changes_reg,
+        });
+    }
+
+    /// Pop the innermost trigger frame.
+    pub fn pop_trigger_frame(&mut self) {
+        self.trigger_frames.pop();
+    }
+
+    /// Whether `name` is already being inlined further out.
+    ///
+    /// With `recursive_triggers` off (SQLite's default, and the only mode this
+    /// engine implements) a trigger that would re-enter itself — directly or
+    /// through other triggers — is silently skipped, exactly as upstream's
+    /// `OP_Program` frame-walk does.
+    pub fn is_trigger_active(&self, name: &str) -> bool {
+        self.trigger_frames.iter().any(|f| f.name == name)
+    }
+
+    /// How many trigger programs are currently being inlined.
+    pub fn trigger_depth(&self) -> usize {
+        self.trigger_frames.len()
+    }
+
+    /// The innermost trigger frame, if a trigger body is being inlined.
+    pub fn current_trigger_frame(&self) -> Option<&TriggerFrame> {
+        self.trigger_frames.last()
     }
 
     pub fn extend(&mut self, opts: &ProgramBuilderOpts) {
@@ -339,8 +487,22 @@ impl ProgramBuilder {
     /// ALTER TABLE) so that other connections detect the schema change and reload
     /// their in-memory schema caches.
     pub fn emit_schema_change(&mut self) {
+        self.emit_schema_change_for(crate::multidb::DB_MAIN);
+    }
+
+    /// Bump the schema cookie after DDL on database `db`.
+    ///
+    /// Only `main` has a compile-time cookie (`self.schema_cookie`, read from
+    /// its header and re-checked by the prologue's `Transaction` opcode), so
+    /// only `main` gets a `SetCookie`. `temp` and attached catalogs are
+    /// re-parsed wholesale by the `ParseSchema` that follows every DDL on them,
+    /// which is what their cookie would have triggered anyway.
+    pub fn emit_schema_change_for(&mut self, db: usize) {
+        if db != crate::multidb::DB_MAIN {
+            return;
+        }
         self.emit_insn(Insn::SetCookie {
-            db: 0,
+            db: crate::multidb::DB_MAIN,
             cookie: Cookie::SchemaVersion,
             value: self.schema_cookie.wrapping_add(1) as i32,
             p5: 0,
@@ -766,6 +928,19 @@ impl ProgramBuilder {
     }
 
     #[inline]
+    /// Whether this builder is currently splicing a statement into an enclosing
+    /// program (a materialized `SELECT`, or an inlined trigger body).
+    ///
+    /// Nested statements must not emit anything that ends the enclosing
+    /// program or its transaction: `prologue`/`epilogue` already no-op on this,
+    /// and the statement-level `"_stmt"` savepoint has to as well — releasing a
+    /// transaction-owning savepoint commits and halts the whole program (see
+    /// `op_savepoint`'s `SavepointOp::Release` arm), which would silently drop
+    /// every instruction emitted after it.
+    pub fn is_nested(&self) -> bool {
+        self.nested_level > 0
+    }
+
     pub fn incr_nesting(&mut self) {
         self.nested_level += 1;
     }

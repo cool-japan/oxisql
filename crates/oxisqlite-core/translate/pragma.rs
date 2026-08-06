@@ -9,7 +9,9 @@ use std::sync::Arc;
 use crate::fast_lock::SpinLock;
 use crate::schema::Schema;
 use crate::storage::pager::{AutoVacuumMode, SynchronousMode};
-use crate::storage::sqlite3_ondisk::{DatabaseHeader, MIN_PAGE_CACHE_SIZE};
+use crate::storage::sqlite3_ondisk::{
+    DatabaseHeader, MAX_PAGE_SIZE, MIN_PAGE_CACHE_SIZE, MIN_PAGE_SIZE,
+};
 use crate::storage::wal::CheckpointMode;
 use crate::util::{normalize_ident, parse_signed_number};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
@@ -58,6 +60,31 @@ pub fn translate_pragma(
         Err(_) => bail_parse_error!("Not a valid pragma name"),
     };
 
+    // `PRAGMA <schema>.<name>` addresses one specific database. The header-cookie
+    // family (`user_version`, `application_id`, `schema_version`, `page_count`)
+    // is routed to it through the `db` operand of `ReadCookie`/`SetCookie`/
+    // `PageCount`. Every other pragma either reads `main`'s header at
+    // compile time or changes connection-global state, so a non-`main`
+    // qualifier is refused rather than silently answered from `main` -- an
+    // answer about the wrong database is worse than an error.
+    let db_index = program.resolve_db_index(name.db_name.as_ref().map(|db| db.0.as_str()))?;
+    if db_index == crate::multidb::DB_TEMP {
+        // `temp` is addressable before it is materialized; a read-only
+        // `PRAGMA temp.user_version` must create it rather than fail, exactly as
+        // a `CREATE TEMP TABLE` would.
+        connection.ensure_temp_db()?;
+    }
+    if db_index != crate::multidb::DB_MAIN && !pragma_is_per_database(&pragma) {
+        bail_parse_error!(
+            "PRAGMA {}.{} is not supported: this pragma applies to the main database only",
+            name.db_name
+                .as_ref()
+                .map(|db| db.0.as_str())
+                .unwrap_or("main"),
+            name.name.0
+        );
+    }
+
     match body {
         None => {
             query_pragma(
@@ -67,11 +94,15 @@ pub fn translate_pragma(
                 database_header.clone(),
                 pager,
                 connection,
+                db_index,
                 &mut program,
             )?;
         }
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
-            PragmaName::TableInfo | PragmaName::ForeignKeyList => {
+            PragmaName::TableInfo
+            | PragmaName::ForeignKeyList
+            | PragmaName::IndexList
+            | PragmaName::IndexInfo => {
                 query_pragma(
                     pragma,
                     schema,
@@ -79,6 +110,7 @@ pub fn translate_pragma(
                     database_header.clone(),
                     pager,
                     connection,
+                    db_index,
                     &mut program,
                 )?;
             }
@@ -91,6 +123,7 @@ pub fn translate_pragma(
                     database_header.clone(),
                     pager,
                     connection,
+                    db_index,
                     &mut program,
                 )?;
             }
@@ -104,6 +137,21 @@ pub fn translate_pragma(
     Ok(program)
 }
 
+#[allow(clippy::too_many_arguments)]
+/// Whether a pragma is meaningfully per-database, i.e. reads or writes a value
+/// that lives in one database's header and is routed through an opcode carrying
+/// a `db` operand.
+fn pragma_is_per_database(pragma: &PragmaName) -> bool {
+    matches!(
+        pragma,
+        PragmaName::UserVersion
+            | PragmaName::ApplicationId
+            | PragmaName::SchemaVersion
+            | PragmaName::PageCount
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn update_pragma(
     pragma: PragmaName,
     schema: &Schema,
@@ -111,6 +159,7 @@ fn update_pragma(
     header: Arc<SpinLock<DatabaseHeader>>,
     pager: Rc<Pager>,
     connection: Arc<crate::Connection>,
+    db_index: usize,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
     match pragma {
@@ -131,6 +180,7 @@ fn update_pragma(
                 header,
                 pager,
                 connection,
+                db_index,
                 program,
             )?;
             Ok(())
@@ -144,6 +194,7 @@ fn update_pragma(
                 header,
                 pager,
                 connection,
+                db_index,
                 program,
             )?;
             Ok(())
@@ -156,6 +207,7 @@ fn update_pragma(
                 header,
                 pager,
                 connection,
+                db_index,
                 program,
             )?;
             Ok(())
@@ -169,7 +221,7 @@ fn update_pragma(
             };
 
             program.emit_insn(Insn::SetCookie {
-                db: 0,
+                db: db_index,
                 cookie: Cookie::UserVersion,
                 value: version_value,
                 p5: 1,
@@ -192,7 +244,7 @@ fn update_pragma(
             };
 
             program.emit_insn(Insn::SetCookie {
-                db: 0,
+                db: db_index,
                 cookie: Cookie::ApplicationId,
                 value: application_id_value,
                 p5: 1,
@@ -208,21 +260,65 @@ fn update_pragma(
             };
 
             program.emit_insn(Insn::SetCookie {
-                db: 0,
+                db: db_index,
                 cookie: Cookie::SchemaVersion,
                 value: schema_version_value,
                 p5: 1,
             });
             Ok(())
         }
-        PragmaName::TableInfo | PragmaName::ForeignKeyList => {
+        PragmaName::TableInfo
+        | PragmaName::ForeignKeyList
+        | PragmaName::IndexList
+        | PragmaName::IndexInfo => {
             // because we need control over the write parameter for the transaction,
             // this should be unreachable. We have to force-call query_pragma before
             // getting here
             unreachable!();
         }
         PragmaName::PageSize => {
-            todo!("updating page_size is not yet implemented")
+            // SQLite semantics (`setPageSize` in pragma.c / btree.c): the requested
+            // size must be a power of two in [MIN_PAGE_SIZE, MAX_PAGE_SIZE]; any
+            // other value -- including a non-numeric argument -- is *silently
+            // ignored*. Even a legal value only takes effect while the database
+            // file is still completely empty; otherwise it is merely recorded and
+            // applied by the next `VACUUM`. Crucially, `PRAGMA page_size = N`
+            // never raises an error: drivers and ORMs emit it unconditionally
+            // during connection setup, so turning it into an `Err` would break the
+            // handshake just as badly as the `todo!()` that used to abort the
+            // process here.
+            //
+            // Changing the live page size would require rebuilding the buffer
+            // pool, the page cache and the WAL around the new size (and, for a
+            // non-empty file, a full VACUUM-style rewrite), which is not
+            // implemented. So we validate, log, and defer -- observationally
+            // identical to SQLite's behaviour on a database that already holds
+            // data, which is the overwhelmingly common case.
+            let requested = match parse_signed_number(&value) {
+                Ok(Value::Integer(size)) => Some(size),
+                Ok(Value::Float(size)) => Some(size as i64),
+                // Non-numeric argument: ignored, exactly like SQLite.
+                _ => None,
+            };
+            if let Some(size) = requested {
+                let is_legal = u32::try_from(size).is_ok_and(|size| {
+                    (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&size) && size.is_power_of_two()
+                });
+                let current = header.lock().get_page_size();
+                if !is_legal {
+                    tracing::debug!(
+                        "PRAGMA page_size = {size}: not a power of two in \
+                         [{MIN_PAGE_SIZE}, {MAX_PAGE_SIZE}], ignored"
+                    );
+                } else if size as u32 != current {
+                    tracing::warn!(
+                        "PRAGMA page_size = {size}: deferred (current page size {current} \
+                         retained); changing the page size of an existing database \
+                         requires VACUUM, which is not implemented yet"
+                    );
+                }
+            }
+            Ok(())
         }
         PragmaName::AutoVacuum => {
             let auto_vacuum_mode = match value {
@@ -248,7 +344,25 @@ fn update_pragma(
             match auto_vacuum_mode {
                 0 => update_auto_vacuum_mode(AutoVacuumMode::None, 0, header, pager)?,
                 1 => update_auto_vacuum_mode(AutoVacuumMode::Full, 1, header, pager)?,
-                2 => update_auto_vacuum_mode(AutoVacuumMode::Incremental, 1, header, pager)?,
+                2 => {
+                    // Incremental auto-vacuum has no implementation: the freelist
+                    // trunk walk that `PRAGMA incremental_vacuum` would need does
+                    // not exist, and `Pager::btree_create` has no
+                    // `AutoVacuumMode::Incremental` root-page allocation strategy.
+                    //
+                    // Accepting mode 2 here used to arm that mode on the pager AND
+                    // persist it into the database header, so the very next
+                    // `CREATE TABLE`/`CREATE INDEX` aborted the host process on an
+                    // `unimplemented!()` -- and, because the header had already
+                    // been written, kept aborting on every reopen of the file.
+                    // Reject *before* mutating any state so nothing is armed and
+                    // nothing is persisted.
+                    return Err(LimboError::InvalidArgument(
+                        "incremental auto_vacuum mode (auto_vacuum = 2) is not supported yet; \
+                         use 'none' or 'full'"
+                            .to_string(),
+                    ));
+                }
                 _ => {
                     return Err(LimboError::InvalidArgument(
                         "invalid auto vacuum mode".to_string(),
@@ -327,6 +441,7 @@ fn update_pragma(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn query_pragma(
     pragma: PragmaName,
     schema: &Schema,
@@ -334,6 +449,7 @@ fn query_pragma(
     database_header: Arc<SpinLock<DatabaseHeader>>,
     pager: Rc<Pager>,
     connection: Arc<crate::Connection>,
+    db_index: usize,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
     let register = program.alloc_register();
@@ -378,7 +494,7 @@ fn query_pragma(
         }
         PragmaName::PageCount => {
             program.emit_insn(Insn::PageCount {
-                db: 0,
+                db: db_index,
                 dest: register,
             });
             program.emit_result_row(register, 1);
@@ -511,9 +627,133 @@ fn query_pragma(
                 program.add_pragma_result_column(name.into());
             }
         }
+        PragmaName::IndexList => {
+            // PRAGMA index_list(table) — 5-column SQLite shape:
+            //   seq, name, unique, origin, partial
+            // Emitted straight from the in-memory schema, which is more reliable
+            // than re-parsing the CREATE INDEX text from sqlite_schema. The parsed
+            // index list is only retained when the `index_experimental` feature is
+            // on; without it the schema keeps a per-table "has indexes" bit only.
+            let tbl = match value {
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(&name.0)),
+                _ => None,
+            };
+
+            // Without the feature we cannot enumerate index rows. Returning zero
+            // rows for a table that actually has indexes would be a silent lie, so
+            // raise a typed error in that case (a table with no indexes, or an
+            // unknown table, still legitimately produces an empty result set).
+            #[cfg(not(feature = "index_experimental"))]
+            if let Some(t) = &tbl {
+                if schema.table_has_indexes(t) {
+                    bail_parse_error!(
+                        "PRAGMA index_list requires the `index_experimental` \
+                         feature to enumerate index metadata"
+                    );
+                }
+            }
+
+            #[cfg(feature = "index_experimental")]
+            {
+                let indices: Vec<Arc<crate::schema::Index>> = match &tbl {
+                    Some(t) => schema.get_indices(t).to_vec(),
+                    None => Vec::new(),
+                };
+
+                // 5 columns total; base_reg is already allocated above.
+                let base_reg = register;
+                program.alloc_registers(4);
+
+                for (seq, index) in indices.iter().enumerate() {
+                    // seq — position of the index within the table
+                    program.emit_int(seq as i64, base_reg);
+                    // name
+                    program.emit_string8(index.name.clone(), base_reg + 1);
+                    // unique
+                    program.emit_bool(index.unique, base_reg + 2);
+                    // origin — "c" for an explicit CREATE INDEX, "u" for an index
+                    // that backs a UNIQUE / PRIMARY KEY constraint (auto-index). We
+                    // cannot tell PRIMARY KEY from UNIQUE apart here, so we do not
+                    // fabricate SQLite's "pk"; "u" is the honest classification.
+                    let origin = if index.name.starts_with("sqlite_autoindex") {
+                        "u"
+                    } else {
+                        "c"
+                    };
+                    program.emit_string8(origin.into(), base_reg + 3);
+                    // partial — the schema does not retain a partial index's WHERE
+                    // predicate (`Index::from_sql` drops `where_clause`), so this is
+                    // always 0. Correct for non-partial indexes, conservative otherwise.
+                    program.emit_int(0, base_reg + 4);
+
+                    program.emit_result_row(base_reg, 5);
+                }
+            }
+
+            let col_names = ["seq", "name", "unique", "origin", "partial"];
+            for name in col_names {
+                program.add_pragma_result_column(name.into());
+            }
+        }
+        PragmaName::IndexInfo => {
+            // PRAGMA index_info(index) — 3-column SQLite shape:
+            //   seqno, cid, name
+            // Without the `index_experimental` feature the schema retains no parsed
+            // index definitions, so no index can be resolved; emitting an empty
+            // result would be indistinguishable from "no such index", which is
+            // false for every real index. Raise a typed error instead.
+            #[cfg(not(feature = "index_experimental"))]
+            {
+                let _ = (&value, register);
+                bail_parse_error!(
+                    "PRAGMA index_info requires the `index_experimental` feature \
+                     to enumerate index columns"
+                );
+            }
+
+            #[cfg(feature = "index_experimental")]
+            {
+                // Index names are globally unique, so a scan across every table's
+                // index list resolves the argument unambiguously.
+                let index: Option<Arc<crate::schema::Index>> = match value {
+                    Some(ast::Expr::Name(name)) => {
+                        let idx_name = normalize_ident(&name.0);
+                        schema
+                            .indexes
+                            .values()
+                            .flatten()
+                            .find(|idx| idx.name == idx_name)
+                            .cloned()
+                    }
+                    _ => None,
+                };
+
+                // 3 columns total; base_reg is already allocated above.
+                let base_reg = register;
+                program.alloc_registers(2);
+
+                if let Some(index) = index {
+                    for (seqno, column) in index.columns.iter().enumerate() {
+                        // seqno — rank of the column within the index
+                        program.emit_int(seqno as i64, base_reg);
+                        // cid — rank of the column within the source table
+                        program.emit_int(column.pos_in_table as i64, base_reg + 1);
+                        // name — the indexed column name
+                        program.emit_string8(column.name.clone(), base_reg + 2);
+
+                        program.emit_result_row(base_reg, 3);
+                    }
+                }
+
+                let col_names = ["seqno", "cid", "name"];
+                for name in col_names {
+                    program.add_pragma_result_column(name.into());
+                }
+            }
+        }
         PragmaName::UserVersion => {
             program.emit_insn(Insn::ReadCookie {
-                db: 0,
+                db: db_index,
                 dest: register,
                 cookie: Cookie::UserVersion,
             });
@@ -522,7 +762,7 @@ fn query_pragma(
         }
         PragmaName::ApplicationId => {
             program.emit_insn(Insn::ReadCookie {
-                db: 0,
+                db: db_index,
                 dest: register,
                 cookie: Cookie::ApplicationId,
             });
@@ -531,7 +771,7 @@ fn query_pragma(
         }
         PragmaName::SchemaVersion => {
             program.emit_insn(Insn::ReadCookie {
-                db: 0,
+                db: db_index,
                 dest: register,
                 cookie: Cookie::SchemaVersion,
             });

@@ -20,11 +20,11 @@ It offers two `TableProvider` flavours: a **snapshot** provider that materialise
 
 ```toml
 [dependencies]
-oxisql-datafusion = "0.3.3"
+oxisql-datafusion = "0.4.1"
 
 # Optional features:
-# oxisql-datafusion = { version = "0.3.3", features = ["parse"] }     # SQL → DataFusion plan bridge
-# oxisql-datafusion = { version = "0.3.3", features = ["columnar"] }  # Parquet table provider
+# oxisql-datafusion = { version = "0.4.1", features = ["parse"] }     # SQL → DataFusion plan bridge
+# oxisql-datafusion = { version = "0.4.1", features = ["columnar"] }  # Parquet table provider
 ```
 
 ## Quick start
@@ -147,11 +147,11 @@ Filters on the snapshot provider are reported as `Inexact`, so DataFusion still 
 
 ## Test coverage
 
-**67 tests pass** with default features and **87 tests pass** with `--all-features` (4 ignored: 2 live-server tests for the optional `postgres` backend, 2 for the optional `mysql` backend). The extra all-features tests are the `parse` plan-bridge suite, the `columnar` Parquet-provider suite, and one `sqlite` streaming test — all individually feature-gated. This crate is part of a workspace where **2,157 tests pass** in total (**2,651** with `--all-features`).
+**67 tests pass** with default features and **87 tests pass** with `--all-features` (4 ignored: 2 live-server tests for the optional `postgres` backend, 2 for the optional `mysql` backend). The extra all-features tests are the `parse` plan-bridge suite, the `columnar` Parquet-provider suite, and one `sqlite` streaming test — all individually feature-gated. This crate is part of a workspace where **2,261 tests pass** in total (**2,755** with `--all-features`).
 
 ## Part of the OxiSQL workspace
 
-`oxisql-datafusion` is one of 17 Pure-Rust crates in the OxiSQL project. See the [workspace README](../../README.md) for the facade, the embedded engine that backs most providers here, connection pooling, and the wire-protocol backends.
+`oxisql-datafusion` is one of 18 Pure-Rust crates in the OxiSQL project. See the [workspace README](../../README.md) for the facade, the embedded engine that backs most providers here, connection pooling, and the wire-protocol backends.
 
 ## License
 

@@ -29,7 +29,7 @@ pub const MIN_PAGE_CACHE_SIZE: usize = 10;
 /// The minimum page size in bytes.
 pub const MIN_PAGE_SIZE: u32 = 512;
 /// The maximum page size in bytes.
-const MAX_PAGE_SIZE: u32 = 65536;
+pub const MAX_PAGE_SIZE: u32 = 65536;
 /// The default page size in bytes.
 const DEFAULT_PAGE_SIZE: u16 = 4096;
 pub const DATABASE_HEADER_PAGE_ID: usize = 1;

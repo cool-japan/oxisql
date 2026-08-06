@@ -335,6 +335,9 @@ pub enum Insn {
     OpenRead {
         cursor_id: CursorID,
         root_page: PageIdx,
+        /// Database registry index the root page belongs to: 0 = `main`,
+        /// 1 = `temp`, 2.. = `ATTACH`ed. Mirrors P3 of upstream's `OP_OpenRead`.
+        db: usize,
     },
 
     /// Open a cursor for a virtual table.
@@ -788,6 +791,9 @@ pub enum Insn {
         cursor_id: CursorID,
         root_page: RegisterOrLiteral<PageIdx>,
         name: String,
+        /// Database registry index the root page belongs to: 0 = `main`,
+        /// 1 = `temp`, 2.. = `ATTACH`ed. Mirrors P3 of upstream's `OP_OpenWrite`.
+        db: usize,
     },
 
     Copy {
@@ -827,6 +833,41 @@ pub enum Insn {
         //  The name of the table being dropped
         table_name: String,
     },
+
+    /// Remove a trigger from the in-memory catalog.
+    ///
+    /// The `sqlite_schema` row itself is removed by ordinary cursor
+    /// instructions (see `translate::trigger::translate_drop_trigger`); this
+    /// only keeps the live `Schema` in step, exactly as `DropTable` does for
+    /// tables. `if_exists` is implicit: dropping an unregistered name is a
+    /// no-op, because the translate layer has already decided whether a missing
+    /// trigger is an error.
+    DropTrigger {
+        /// The name of the trigger being dropped (normalized).
+        trigger_name: String,
+    },
+
+    /// Remove every trigger attached to a table from the in-memory catalog.
+    ///
+    /// Emitted by `DROP TABLE`, which drops the table's triggers with it.
+    DropTriggersForTable {
+        /// The name of the table whose triggers are being dropped (normalized).
+        table_name: String,
+    },
+
+    /// Save (`save = true`) or restore (`save = false`) the statement change
+    /// counter to/from register `reg`.
+    ///
+    /// Wrapped around an inlined trigger program so that rows written by a
+    /// trigger body do not leak into the outer statement's `changes()` — SQLite
+    /// keeps the counter per VDBE frame, and this is the frame-less equivalent.
+    ChangeCounterSnapshot {
+        /// Scratch register holding the saved counter value.
+        reg: usize,
+        /// `true` = save into `reg`, `false` = restore from `reg`.
+        save: bool,
+    },
+
     DropIndex {
         ///  The database within which this index needs to be dropped (P1).
         db: usize,
@@ -850,6 +891,19 @@ pub enum Insn {
     ParseSchema {
         db: usize,
         where_clause: Option<String>,
+    },
+
+    /// `ATTACH DATABASE <path-reg> AS <alias-reg>`: open the database named by
+    /// the string in `path_reg` and register it on this connection under the
+    /// alias in `alias_reg`.
+    Attach {
+        path_reg: usize,
+        alias_reg: usize,
+    },
+
+    /// `DETACH DATABASE <alias-reg>`: close and unregister an attached database.
+    Detach {
+        alias_reg: usize,
     },
 
     /// Place the result of lhs >> rhs in dest register.
@@ -1113,9 +1167,14 @@ impl Insn {
             Insn::Destroy { .. } => execute::op_destroy,
 
             Insn::DropTable { .. } => execute::op_drop_table,
+            Insn::DropTrigger { .. } => execute::op_drop_trigger,
+            Insn::DropTriggersForTable { .. } => execute::op_drop_triggers_for_table,
+            Insn::ChangeCounterSnapshot { .. } => execute::op_change_counter_snapshot,
             Insn::Close { .. } => execute::op_close,
             Insn::IsNull { .. } => execute::op_is_null,
             Insn::ParseSchema { .. } => execute::op_parse_schema,
+            Insn::Attach { .. } => execute::op_attach,
+            Insn::Detach { .. } => execute::op_detach,
             Insn::ShiftRight { .. } => execute::op_shift_right,
             Insn::ShiftLeft { .. } => execute::op_shift_left,
             Insn::Variable { .. } => execute::op_variable,

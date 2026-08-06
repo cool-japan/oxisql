@@ -20,12 +20,12 @@ By default it runs entirely in memory (`MemoryStorage`, reset on drop). Three op
 
 ```toml
 [dependencies]
-oxisql-embedded = "0.3.3"
+oxisql-embedded = "0.4.1"
 
 # Optional persistent backends (pick any subset):
-# oxisql-embedded = { version = "0.3.3", features = ["fjall-storage"] }
-# oxisql-embedded = { version = "0.3.3", features = ["redb-storage"] }
-# oxisql-embedded = { version = "0.3.3", features = ["sled-storage"] }
+# oxisql-embedded = { version = "0.4.1", features = ["fjall-storage"] }
+# oxisql-embedded = { version = "0.4.1", features = ["redb-storage"] }
+# oxisql-embedded = { version = "0.4.1", features = ["sled-storage"] }
 ```
 
 ## Quick start
@@ -153,11 +153,11 @@ Named placeholders (`:name`, `$name`, `@name`) are provided by `oxisql_core` def
 
 ## Test coverage
 
-**263 tests pass** with default features and **281 tests pass** with `--all-features` (unit + integration; CSV, schema introspection, persistence round-trips, parameter binding, UDFs, FTS, virtual tables, and more). The extra all-features tests are mostly the `fjall-storage` / `redb-storage` / `sled-storage` persistence-round-trip suites, whose `#[test]` functions are individually feature-gated (the files themselves always compile). The crate is part of a workspace where **2,157 tests pass** in total (**2,651** with `--all-features`).
+**263 tests pass** with default features and **281 tests pass** with `--all-features` (unit + integration; CSV, schema introspection, persistence round-trips, parameter binding, UDFs, FTS, virtual tables, and more). The extra all-features tests are mostly the `fjall-storage` / `redb-storage` / `sled-storage` persistence-round-trip suites, whose `#[test]` functions are individually feature-gated (the files themselves always compile). The crate is part of a workspace where **2,261 tests pass** in total (**2,755** with `--all-features`).
 
 ## Part of the OxiSQL workspace
 
-`oxisql-embedded` is one of 17 Pure-Rust crates in the OxiSQL project. See the [workspace README](../../README.md) for the facade, connection pooling, the DataFusion OLAP bridge, and the wire-protocol backends.
+`oxisql-embedded` is one of 18 Pure-Rust crates in the OxiSQL project. See the [workspace README](../../README.md) for the facade, connection pooling, the DataFusion OLAP bridge, and the wire-protocol backends.
 
 ## License
 

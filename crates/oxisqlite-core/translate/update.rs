@@ -108,9 +108,12 @@ pub fn prepare_update_plan(
             );
         }
     }
-    let table = match schema.get_table(table_name.0.as_str()) {
+    let table = match schema.get_table_qualified(
+        body.tbl_name.db_name.as_ref().map(|db| db.0.as_str()),
+        table_name.0.as_str(),
+    ) {
         Some(table) => table,
-        None => bail_parse_error!("Parse error: no such table: {}", table_name),
+        None => bail_parse_error!("Parse error: no such table: {}", body.tbl_name),
     };
     if matches!(table.as_ref(), crate::schema::Table::View(_)) {
         bail_parse_error!("cannot modify {} because it is a view", table_name.0);
@@ -165,7 +168,7 @@ pub fn prepare_update_plan(
                     ))
                 })?;
 
-            let _ = bind_column_references(&mut set.expr, &mut table_references, None);
+            let _ = bind_column_references(&mut set.expr, &mut table_references, None, schema);
             Ok((col_index, set.expr.clone()))
         })
         .collect::<Result<Vec<(usize, Expr)>, crate::LimboError>>()?;
@@ -175,7 +178,7 @@ pub fn prepare_update_plan(
     if let Some(returning) = &mut body.returning {
         for rc in returning.iter_mut() {
             if let ResultColumn::Expr(expr, alias) = rc {
-                bind_column_references(expr, &mut table_references, None)?;
+                bind_column_references(expr, &mut table_references, None, schema)?;
                 result_columns.push(ResultSetColumn {
                     expr: expr.clone(),
                     alias: alias.as_ref().and_then(|a| {
@@ -204,6 +207,7 @@ pub fn prepare_update_plan(
         &mut table_references,
         Some(&result_columns),
         &mut where_clause,
+        schema,
     )?;
 
     // Parse the LIMIT/OFFSET clause

@@ -1,15 +1,18 @@
 impl BTreeCursor {
     fn insert_into_page(&mut self, bkey: &BTreeKey) -> Result<CursorResult<()>> {
-        let record = bkey.get_record().expect("expected record present on insert");
+        // `insert` is only ever called with a key that carries a record; a
+        // missing one is a caller bug, reported rather than aborting the process.
+        let record = bkey.get_record().ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "BTreeCursor::insert called with a key that carries no record".to_string(),
+            )
+        })?;
         if let CursorState::None = &self.state {
             self.state = CursorState::Write(WriteInfo::new());
         }
         let ret = loop {
             let write_state = {
-                let write_info = self
-                    .state
-                    .mut_write_info()
-                    .expect("can't insert while counting");
+                let write_info = self.state.mut_write_info_or_err()?;
                 write_info.state
             };
             match write_state {
@@ -21,7 +24,11 @@ impl BTreeCursor {
                         let page = page.get();
                         page.set_dirty();
                         self.pager.add_dirty(page.get().id);
-                        let page = page.get().contents.as_mut().unwrap();
+                        let page = page.get().contents.as_mut().ok_or_else(|| {
+                            crate::LimboError::Corrupt(
+                                "insert: page contents are not loaded".to_string(),
+                            )
+                        })?;
                         assert!(
                             matches!(page.page_type(), PageType::TableLeaf |
                             PageType::IndexLeaf)
@@ -53,18 +60,25 @@ impl BTreeCursor {
                                         "found exact match with cell_idx={cell_idx}, overwriting"
                                     );
                                     self.overwrite_cell(page.clone(), cell_idx, record)?;
-                                    self
-                                        .state
-                                        .mut_write_info()
-                                        .expect("expected write info")
-                                        .state = WriteState::Finish;
+                                    self.state.mut_write_info_or_err()?.state =
+                                        WriteState::Finish;
                                     continue;
                                 }
                             }
                             BTreeCell::IndexLeafCell(..) => {
                                 let cmp = compare_immutable(
                                     record.get_values(),
-                                    self.get_immutable_record().as_ref().unwrap().get_values(),
+                                    self
+                                        .get_immutable_record()
+                                        .as_ref()
+                                        .ok_or_else(|| {
+                                            crate::LimboError::Corrupt(
+                                                "insert: cursor has no materialized record to \
+                                                 compare against"
+                                                    .to_string(),
+                                            )
+                                        })?
+                                        .get_values(),
                                     self.key_sort_order(),
                                     &self.collations,
                                 );
@@ -74,11 +88,8 @@ impl BTreeCursor {
                                     );
                                     self.has_record.set(true);
                                     self.overwrite_cell(page.clone(), cell_idx, record)?;
-                                    self
-                                        .state
-                                        .mut_write_info()
-                                        .expect("expected write info")
-                                        .state = WriteState::Finish;
+                                    self.state.mut_write_info_or_err()?.state =
+                                        WriteState::Finish;
                                     continue;
                                 }
                             }
@@ -101,7 +112,11 @@ impl BTreeCursor {
                     )?;
                     let overflow = {
                         let page = page.get();
-                        let contents = page.get().contents.as_mut().unwrap();
+                        let contents = page.get().contents.as_mut().ok_or_else(|| {
+                            crate::LimboError::Corrupt(
+                                "insert: page contents are not loaded".to_string(),
+                            )
+                        })?;
                         tracing::debug!(
                             name : "overflow", cell_count = contents.cell_count()
                         );
@@ -128,16 +143,10 @@ impl BTreeCursor {
                                 }
                             },
                         );
-                        let write_info = self
-                            .state
-                            .mut_write_info()
-                            .expect("can't count while inserting");
+                        let write_info = self.state.mut_write_info_or_err()?;
                         write_info.state = WriteState::BalanceStart;
                     } else {
-                        let write_info = self
-                            .state
-                            .mut_write_info()
-                            .expect("can't count while inserting");
+                        let write_info = self.state.mut_write_info_or_err()?;
                         write_info.state = WriteState::Finish;
                     }
                 }
@@ -151,7 +160,7 @@ impl BTreeCursor {
                 }
             };
         };
-        if matches!(self.state.write_info().unwrap().state, WriteState::Finish) {
+        if matches!(self.state.write_info_or_err()?.state, WriteState::Finish) {
             return_if_io!(self.restore_context());
         }
         self.state = CursorState::None;
@@ -171,24 +180,28 @@ impl BTreeCursor {
             "Cursor must be in balancing state"
         );
         loop {
-            let state = self.state.write_info().expect("must be balancing").state;
+            let state = self.state.write_info_or_err()?.state;
             match state {
                 WriteState::BalanceStart => {
                     assert!(
-                        self.state.write_info().unwrap().balance_info.borrow().is_none(),
+                        self.state.write_info_or_err()?.balance_info.borrow().is_none(),
                         "BalanceInfo should be empty on start"
                     );
                     let current_page = self.stack.top();
                     {
                         let current_page = current_page.get();
-                        let page = current_page.get().contents.as_mut().unwrap();
+                        let page = current_page.get().contents.as_mut().ok_or_else(|| {
+                            crate::LimboError::Corrupt(
+                                "balance: page contents are not loaded".to_string(),
+                            )
+                        })?;
                         let usable_space = self.usable_space();
                         let free_space = compute_free_space(page, usable_space as u16)?;
                         if page.overflow_cells.is_empty()
                             && (!self.stack.has_parent()
                                 || free_space as usize * 3 <= usable_space * 2)
                         {
-                            let write_info = self.state.mut_write_info().unwrap();
+                            let write_info = self.state.mut_write_info_or_err()?;
                             write_info.state = WriteState::Finish;
                             return Ok(CursorResult::Ok(()));
                         }
@@ -196,7 +209,7 @@ impl BTreeCursor {
                     if !self.stack.has_parent() {
                         self.balance_root()?;
                     }
-                    let write_info = self.state.mut_write_info().unwrap();
+                    let write_info = self.state.mut_write_info_or_err()?;
                     write_info.state = WriteState::BalanceNonRoot;
                     self.stack.pop();
                     return_if_io!(self.balance_non_root());
@@ -215,7 +228,7 @@ impl BTreeCursor {
             matches!(self.state, CursorState::Write(_)),
             "Cursor must be in balancing state"
         );
-        let state = self.state.write_info().expect("must be balancing").state;
+        let state = self.state.write_info_or_err()?.state;
         tracing::debug!("balance_non_root(state={:?})", state);
         let (next_write_state, result) = match state {
             // `balance_non_root()` has exactly two call sites (both in `balance()`
@@ -238,30 +251,75 @@ impl BTreeCursor {
                 } else if self.stack.current_cell_index() == -1 {
                     self.stack.advance();
                 }
-                parent_page.set_dirty();
-                self.pager.add_dirty(parent_page.get().id);
-                let parent_contents = parent_page.get().contents.as_ref().unwrap();
+                let parent_id_for_diagnostics = parent_page.get().id;
                 let page_to_balance_idx = self.stack.current_cell_index() as usize;
                 tracing::debug!(
-                    "balance_non_root(parent_id={} page_to_balance_idx={})", parent_page
-                    .get().id, page_to_balance_idx
+                    "balance_non_root(parent_id={} page_to_balance_idx={})",
+                    parent_id_for_diagnostics,
+                    page_to_balance_idx
                 );
-                assert!(
-                    matches!(parent_contents.page_type(), PageType::IndexInterior |
-                    PageType::TableInterior)
-                );
+                // These three checks were `assert!`s, which -- unlike
+                // `debug_assert!` -- are compiled into release builds and abort the
+                // host process. All three are decided by state that ultimately
+                // comes off disk (the parent's page-type byte, its cell count) or
+                // by a balance-path invariant the 0.3.3 CHANGELOG shows has been
+                // broken before, so a library must surface them as errors instead
+                // of killing its embedder. `Corrupt` is the right channel here: it
+                // is what every other on-disk-state violation in this module
+                // returns, and an internal invariant break is indistinguishable
+                // from a corrupt page at this point.
+                //
+                // They run BEFORE the parent is marked dirty on purpose: an early
+                // `Err` then leaves the pager's dirty bookkeeping exactly as it
+                // found it, so a caller that catches the error and keeps using the
+                // connection is not left with a page queued for write-back by a
+                // balance that never happened.
+                let number_of_cells_in_parent = {
+                    let parent_contents =
+                        parent_page.get().contents.as_ref().ok_or_else(|| {
+                            LimboError::Corrupt(format!(
+                                "balance_non_root: parent page {parent_id_for_diagnostics} has no \
+                                 contents loaded"
+                            ))
+                        })?;
+                    if !matches!(
+                        parent_contents.page_type(),
+                        PageType::IndexInterior | PageType::TableInterior
+                    ) {
+                        return Err(LimboError::Corrupt(format!(
+                            "balance_non_root: parent page {} has non-interior page type {:?}",
+                            parent_id_for_diagnostics,
+                            parent_contents.page_type()
+                        )));
+                    }
+                    let number_of_cells_in_parent =
+                        parent_contents.cell_count() + parent_contents.overflow_cells.len();
+                    if !parent_contents.overflow_cells.is_empty() {
+                        return Err(LimboError::Corrupt(format!(
+                            "balance_non_root: parent page {} still holds {} pending overflow \
+                             cell(s); balancing a child of an overflowed parent is not \
+                             implemented",
+                            parent_id_for_diagnostics,
+                            parent_contents.overflow_cells.len()
+                        )));
+                    }
+                    if page_to_balance_idx > parent_contents.cell_count() {
+                        return Err(LimboError::Corrupt(format!(
+                            "balance_non_root: page_to_balance_idx={page_to_balance_idx} is out of \
+                             bounds for parent cell count {number_of_cells_in_parent}"
+                        )));
+                    }
+                    number_of_cells_in_parent
+                };
+                parent_page.set_dirty();
+                self.pager.add_dirty(parent_id_for_diagnostics);
+                let parent_contents = parent_page.get().contents.as_ref().ok_or_else(|| {
+                    LimboError::Corrupt(format!(
+                        "balance_non_root: parent page {parent_id_for_diagnostics} has no contents \
+                         loaded"
+                    ))
+                })?;
                 let mut pages_to_balance: [Option<BTreePage>; 3] = [const { None }; 3];
-                let number_of_cells_in_parent = parent_contents.cell_count()
-                    + parent_contents.overflow_cells.len();
-                assert!(
-                    parent_contents.overflow_cells.is_empty(),
-                    "balancing child page with overflowed parent not yet implemented"
-                );
-                assert!(
-                    page_to_balance_idx <= parent_contents.cell_count(),
-                    "page_to_balance_idx={} is out of bounds for parent cell count {}",
-                    page_to_balance_idx, number_of_cells_in_parent
-                );
                 let (sibling_pointer, first_cell_divider) = match number_of_cells_in_parent {
                     n if n < 2 => (number_of_cells_in_parent, 0),
                     2 => (2, 0),
@@ -323,10 +381,20 @@ impl BTreeCursor {
                         );
                     }
                     pages_to_balance[i].replace(page);
-                    assert_eq!(
-                        parent_contents.overflow_cells.len(), 0,
-                        "overflow in parent is not yet implented while balancing it"
-                    );
+                    // Third release-active overflow assert (the audit only
+                    // listed two). Same reasoning as the guards at the top of
+                    // this arm: a library must not abort its embedder, and a
+                    // half-balanced parent is indistinguishable from corruption
+                    // at this point.
+                    if !parent_contents.overflow_cells.is_empty() {
+                        return Err(LimboError::Corrupt(format!(
+                            "balance_non_root: parent page {} acquired {} pending overflow \
+                             cell(s) while collecting siblings; balancing an overflowed parent \
+                             is not implemented",
+                            parent_id_for_diagnostics,
+                            parent_contents.overflow_cells.len()
+                        )));
+                    }
                     if i == 0 {
                         break;
                     }
@@ -373,8 +441,7 @@ impl BTreeCursor {
                     }
                 }
                 self.state
-                    .write_info()
-                    .unwrap()
+                    .write_info_or_err()?
                     .balance_info
                     .replace(
                         Some(BalanceInfo {
@@ -388,7 +455,7 @@ impl BTreeCursor {
                 (WriteState::BalanceNonRootWaitLoadPages, Ok(CursorResult::IO))
             }
             WriteState::BalanceNonRootWaitLoadPages => {
-                let write_info = self.state.write_info().unwrap();
+                let write_info = self.state.write_info_or_err()?;
                 let mut balance_info = write_info.balance_info.borrow_mut();
                 let balance_info = balance_info.as_mut().unwrap();
                 for page in balance_info
@@ -414,10 +481,18 @@ impl BTreeCursor {
                 let parent_id = parent_page.get_ref().id;
                 let parent_contents = parent_page.get_contents_mut();
                 let parent_is_root = !self.stack.has_parent();
-                assert!(
-                    parent_contents.overflow_cells.is_empty(),
-                    "overflow parent not yet implemented"
-                );
+                // Release-active `assert!` converted to a typed error: aborting the
+                // embedding process is never an acceptable failure mode for a
+                // library. See the matching guard in the `BalanceNonRoot` arm.
+                if !parent_contents.overflow_cells.is_empty() {
+                    return Err(LimboError::Corrupt(format!(
+                        "balance_non_root: parent page {} still holds {} pending overflow \
+                         cell(s); balancing a child of an overflowed parent is not \
+                         implemented",
+                        parent_id,
+                        parent_contents.overflow_cells.len()
+                    )));
+                }
                 let mut max_cells = 0;
                 let mut pages_to_balance_new: [Option<BTreePage>; 5] = [const {
                     None
@@ -663,10 +738,15 @@ impl BTreeCursor {
                         let needs_new_page = i + 1 >= sibling_count_new;
                         if needs_new_page {
                             sibling_count_new = i + 2;
-                            assert!(
-                                sibling_count_new <= 5,
-                                "it is corrupt to require more than 5 pages to balance 3 siblings"
-                            );
+                            // Release-active `assert!` whose own message says
+                            // "it is corrupt": report it as such instead of
+                            // aborting the process.
+                            if sibling_count_new > 5 {
+                                return Err(LimboError::Corrupt(format!(
+                                    "balance_non_root: {sibling_count_new} pages would be needed \
+                                     to balance 3 siblings (maximum 5)"
+                                )));
+                            }
                             new_page_sizes[sibling_count_new - 1] = 0;
                             cell_array.number_of_cells_per_page[sibling_count_new - 1] = cell_array
                                 .cells
@@ -1068,9 +1148,9 @@ impl BTreeCursor {
             }
         };
         if matches!(next_write_state, WriteState::BalanceStart) {
-            let _ = self.state.mut_write_info().unwrap().balance_info.take();
+            let _ = self.state.mut_write_info_or_err()?.balance_info.take();
         }
-        let write_info = self.state.mut_write_info().unwrap();
+        let write_info = self.state.mut_write_info_or_err()?;
         write_info.state = next_write_state;
         result
     }

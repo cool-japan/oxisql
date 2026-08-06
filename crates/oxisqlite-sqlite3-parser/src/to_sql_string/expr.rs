@@ -266,6 +266,10 @@ impl ToSqlString for Expr {
                 }
                 ret.push(')');
             }
+            // Code-generator-only node (see `Expr::Register`): it has no SQL
+            // surface syntax, and no rewritten tree is ever rendered back to
+            // SQL text, so the rendering is empty rather than a made-up token.
+            Expr::Register(_) => {}
             Expr::Subquery(select) => {
                 ret.push('(');
                 ret.push_str(&select.to_sql_string(context));

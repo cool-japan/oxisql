@@ -35,9 +35,14 @@ pub fn translate_create_table(
     syms: &SymbolTable,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
-    if temporary {
-        bail_parse_error!("TEMPORARY table not supported yet");
-    }
+    // Which database this table is created in: `TEMP` -> the `temp` database
+    // (materialized here, on first use), an explicit `<db>.<name>` qualifier ->
+    // that database, otherwise `main`.
+    let db_index = program.resolve_ddl_db_index(
+        tbl_name.db_name.as_ref().map(|name| name.0.as_str()),
+        temporary,
+    )?;
+    let db_qualifier = program.db_qualifier(db_index);
     let opts = ProgramBuilderOpts {
         query_mode,
         num_cursors: 1,
@@ -45,7 +50,10 @@ pub fn translate_create_table(
         approx_num_labels: 1,
     };
     program.extend(&opts);
-    if schema.get_table(tbl_name.name.0.as_str()).is_some() {
+    if schema
+        .get_table_qualified(Some(&db_qualifier), tbl_name.name.0.as_str())
+        .is_some()
+    {
         if if_not_exists {
             program.epilogue(crate::translate::emitter::TransactionMode::Write);
 
@@ -62,7 +70,7 @@ pub fn translate_create_table(
     let body = match body {
         ast::CreateTableBody::AsSelect(select) => {
             return translate_create_table_as_select(
-                query_mode, tbl_name, *select, schema, syms, program,
+                query_mode, tbl_name, db_index, *select, schema, syms, program,
             );
         }
         body @ ast::CreateTableBody::ColumnsAndConstraints { .. } => body,
@@ -97,7 +105,7 @@ pub fn translate_create_table(
         CreateBTreeFlags::new_table()
     };
     program.emit_insn(Insn::CreateBtree {
-        db: 0,
+        db: db_index,
         root: table_root_reg,
         flags: btree_flags,
     });
@@ -133,7 +141,7 @@ pub fn translate_create_table(
         }
         for index_reg in index_regs.clone() {
             program.emit_insn(Insn::CreateBtree {
-                db: 0,
+                db: db_index,
                 root: index_reg,
                 flags: CreateBTreeFlags::new_index(),
             });
@@ -145,6 +153,7 @@ pub fn translate_create_table(
         .ok_or_else(|| LimboError::InternalError("sqlite_schema table not found".to_string()))?;
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenWrite {
+        db: db_index,
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1usize.into(),
         name: tbl_name.name.0.clone(),
@@ -183,11 +192,12 @@ pub fn translate_create_table(
     }
 
     program.resolve_label(parse_schema_label, program.offset());
-    program.emit_schema_change();
+    program.emit_schema_change_for(db_index);
     // TODO: remove format, it sucks for performance but is convenient
-    let parse_schema_where_clause = format!("tbl_name = '{}' AND type != 'trigger'", tbl_name);
+    let parse_schema_where_clause =
+        format!("tbl_name = '{}' AND type != 'trigger'", tbl_name.name.0);
     program.emit_insn(Insn::ParseSchema {
-        db: sqlite_schema_cursor_id,
+        db: db_index,
         where_clause: Some(parse_schema_where_clause),
     });
 
@@ -219,6 +229,7 @@ pub fn translate_create_table(
 fn translate_create_table_as_select(
     query_mode: QueryMode,
     tbl_name: ast::QualifiedName,
+    db_index: usize,
     select: ast::Select,
     schema: &Schema,
     syms: &SymbolTable,
@@ -258,7 +269,7 @@ fn translate_create_table_as_select(
 
     let table_root_reg = program.alloc_register();
     program.emit_insn(Insn::CreateBtree {
-        db: 0,
+        db: db_index,
         root: table_root_reg,
         flags: CreateBTreeFlags::new_table(),
     });
@@ -269,6 +280,7 @@ fn translate_create_table_as_select(
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema_table.clone()));
     program.emit_insn(Insn::OpenWrite {
+        db: db_index,
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1usize.into(),
         name: table_name.clone(),
@@ -292,6 +304,7 @@ fn translate_create_table_as_select(
     // `INSERT INTO ... SELECT` looks up its (already-persisted) target.
     let new_table = Rc::new(BTreeTable {
         root_page: 0, // unused: the cursor below is opened via the CreateBtree register, not this field
+        db_index,
         name: table_name.clone(),
         primary_key_columns: vec![],
         columns: new_columns,
@@ -312,10 +325,10 @@ fn translate_create_table_as_select(
         table_root_reg,
     )?;
 
-    program.emit_schema_change();
+    program.emit_schema_change_for(db_index);
     let parse_schema_where_clause = format!("tbl_name = '{}' AND type != 'trigger'", table_name);
     program.emit_insn(Insn::ParseSchema {
-        db: sqlite_schema_cursor_id,
+        db: db_index,
         where_clause: Some(parse_schema_where_clause),
     });
 
@@ -469,6 +482,7 @@ fn emit_ctas_row_pump(
 
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(new_table.clone()));
     program.emit_insn(Insn::OpenWrite {
+        db: new_table.db_index,
         cursor_id,
         root_page: RegisterOrLiteral::Register(table_root_reg),
         name: new_table.name.clone(),
@@ -540,6 +554,31 @@ pub fn emit_schema_entry(
     root_page_reg: usize,
     sql: Option<String>,
 ) {
+    emit_schema_entry_raw(
+        program,
+        sqlite_schema_cursor_id,
+        entry_type.as_str(),
+        name,
+        tbl_name,
+        root_page_reg,
+        sql,
+    )
+}
+
+/// `emit_schema_entry` with a free-form `sqlite_schema.type` string.
+///
+/// Exists so object kinds that live outside [`SchemaEntryType`] — currently
+/// `'trigger'`, see `translate::trigger` — can write their catalog row through
+/// exactly the same code path instead of duplicating it.
+pub fn emit_schema_entry_raw(
+    program: &mut ProgramBuilder,
+    sqlite_schema_cursor_id: usize,
+    entry_type: &str,
+    name: &str,
+    tbl_name: &str,
+    root_page_reg: usize,
+    sql: Option<String>,
+) {
     let rowid_reg = program.alloc_register();
     program.emit_insn(Insn::NewRowid {
         cursor: sqlite_schema_cursor_id,
@@ -547,7 +586,7 @@ pub fn emit_schema_entry(
         prev_largest_reg: 0,
     });
 
-    let type_reg = program.emit_string8_new_reg(entry_type.as_str().to_string());
+    let type_reg = program.emit_string8_new_reg(entry_type.to_string());
     program.emit_string8_new_reg(name.to_string());
     program.emit_string8_new_reg(tbl_name.to_string());
 
@@ -1037,6 +1076,7 @@ pub fn translate_create_virtual_table(
         .ok_or_else(|| LimboError::InternalError("sqlite_schema table not found".to_string()))?;
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenWrite {
+        db: 0,
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1usize.into(),
         name: table_name.clone(),
@@ -1055,8 +1095,11 @@ pub fn translate_create_virtual_table(
 
     program.emit_schema_change();
     let parse_schema_where_clause = format!("tbl_name = '{}' AND type != 'trigger'", table_name);
+    // Virtual tables are only ever created in `main` in this engine (the module
+    // registry is connection-global, not per-database), so the re-parse targets
+    // `main`'s catalog.
     program.emit_insn(Insn::ParseSchema {
-        db: sqlite_schema_cursor_id,
+        db: crate::multidb::DB_MAIN,
         where_clause: Some(parse_schema_where_clause),
     });
 
@@ -1087,7 +1130,11 @@ pub fn translate_drop_table(
         approx_num_labels: 4,
     };
     program.extend(&opts);
-    let table = schema.get_table(tbl_name.name.0.as_str());
+    let qualifier = tbl_name.db_name.as_ref().map(|name| name.0.clone());
+    // Validate the qualifier before looking anything up, so `DROP TABLE
+    // nosuchdb.t` reports the database rather than the table.
+    let _ = program.resolve_db_index(qualifier.as_deref())?;
+    let table = schema.get_table_qualified(qualifier.as_deref(), tbl_name.name.0.as_str());
     if table.is_none() {
         if if_exists {
             program.epilogue(crate::translate::emitter::TransactionMode::Write);
@@ -1103,6 +1150,10 @@ pub fn translate_drop_table(
     if matches!(table.as_ref(), Table::View(_)) {
         bail_parse_error!("use DROP VIEW to delete view {}", tbl_name.name.0);
     }
+
+    // Everything below writes to the catalog of the database that actually owns
+    // the table: its `sqlite_schema`, its b-trees, its in-memory catalog.
+    let db_index = table.db_index();
 
     let null_reg = program.alloc_register(); //  r1
     program.emit_null(null_reg, None);
@@ -1121,6 +1172,7 @@ pub fn translate_drop_table(
         CursorType::BTreeTable(schema_table.clone()),
     );
     program.emit_insn(Insn::OpenWrite {
+        db: db_index,
         cursor_id: sqlite_schema_cursor_id_0,
         root_page: 1usize.into(),
         name: SQLITE_TABLEID.to_string(),
@@ -1178,13 +1230,23 @@ pub fn translate_drop_table(
     program.preassign_label_to_next_insn(end_metadata_label);
     //  end of loop on schema table
 
+    //  1b. Drop the table's triggers with it, matching SQLite ("DROP TABLE also
+    //  deletes triggers associated with the table"). The loop above deliberately
+    //  skips type='trigger' rows, so they are removed here in their own pass.
+    crate::translate::trigger::emit_delete_trigger_rows(
+        &mut program,
+        sqlite_schema_cursor_id_0,
+        tbl_name.name.0.as_str(),
+        crate::translate::trigger::MatchColumn::TblName,
+    );
+
     //  2. Destroy the indices within a loop
     let indices = schema.get_indices(&tbl_name.name.0);
     for index in indices {
         program.emit_insn(Insn::Destroy {
             root: index.root_page,
             former_root_reg: 0, //  no autovacuum (https://www.sqlite.org/opcode.html#Destroy)
-            is_temp: 0,
+            is_temp: db_index,
         });
 
         //  3. TODO: Open an ephemeral table, and read over triggers from schema table into ephemeral table
@@ -1200,7 +1262,7 @@ pub fn translate_drop_table(
             program.emit_insn(Insn::Destroy {
                 root: table.root_page,
                 former_root_reg: table_name_and_root_page_register,
-                is_temp: 0,
+                is_temp: db_index,
             });
         }
         Table::Virtual(vtab) => {
@@ -1218,8 +1280,16 @@ pub fn translate_drop_table(
                 db: 0, // TODO change this for multiple databases
             });
         }
-        Table::Pseudo(..) => unimplemented!(),
-        Table::FromClauseSubquery(..) => panic!("FromClauseSubquery can't be dropped"),
+        Table::Pseudo(..) => {
+            return Err(crate::LimboError::InternalError(
+                "Pseudo table cannot be dropped".to_string(),
+            ));
+        }
+        Table::FromClauseSubquery(..) => {
+            return Err(crate::LimboError::InternalError(
+                "FromClauseSubquery cannot be dropped".to_string(),
+            ));
+        }
         // A view has no B-tree to destroy. Reaching here with a view means the
         // early guard in `translate_drop_table` was bypassed; do nothing rather
         // than emit a bogus `Destroy`.
@@ -1239,6 +1309,7 @@ pub fn translate_drop_table(
             program.alloc_cursor_id(CursorType::BTreeTable(schema_table.clone()));
         let simple_table_rc = Rc::new(BTreeTable {
             root_page: 0, // Not relevant for ephemeral table definition
+            db_index: 0,  // ephemeral b-trees always live in the main pager
             name: "ephemeral_scratch".to_string(),
             has_rowid: true,
             primary_key_columns: vec![],
@@ -1273,6 +1344,7 @@ pub fn translate_drop_table(
             jump_if_null: true, //  jump anyway
         });
         program.emit_insn(Insn::OpenRead {
+            db: db_index,
             cursor_id: sqlite_schema_cursor_id_1,
             root_page: 1usize.into(),
         });
@@ -1329,6 +1401,7 @@ pub fn translate_drop_table(
 
         //  5. Open a write cursor to the schema table and re-insert the records placed in the ephemeral table but insert the correct root page now
         program.emit_insn(Insn::OpenWrite {
+            db: db_index,
             cursor_id: sqlite_schema_cursor_id_1,
             root_page: 1usize.into(),
             name: SQLITE_TABLEID.to_string(),
@@ -1357,10 +1430,9 @@ pub fn translate_drop_table(
         program.emit_column(sqlite_schema_cursor_id_1, 0, schema_column_0_register);
         program.emit_column(sqlite_schema_cursor_id_1, 1, schema_column_1_register);
         program.emit_column(sqlite_schema_cursor_id_1, 2, schema_column_2_register);
-        let root_page = table
-            .get_root_page()
-            .try_into()
-            .expect("Failed to cast the root page to an i64");
+        let root_page: i64 = table.get_root_page()?.try_into().map_err(|_| {
+            crate::LimboError::InternalError("root page does not fit in i64".to_string())
+        })?;
         program.emit_insn(Insn::Integer {
             value: root_page,
             dest: moved_to_root_page_register,
@@ -1392,10 +1464,13 @@ pub fn translate_drop_table(
         //  End loop to copy over row id's from the ephemeral table and then re-insert into the schema table with the correct root page
     }
 
-    program.emit_schema_change();
+    program.emit_schema_change_for(db_index);
     //  Drop the in-memory structures for the table
+    program.emit_insn(Insn::DropTriggersForTable {
+        table_name: crate::util::normalize_ident(tbl_name.name.0.as_str()),
+    });
     program.emit_insn(Insn::DropTable {
-        db: 0,
+        db: db_index,
         _p2: 0,
         _p3: 0,
         table_name: tbl_name.name.0,

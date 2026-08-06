@@ -57,7 +57,10 @@ pub fn prepare_delete_plan(
     limit: Option<Box<Limit>>,
     table_ref_counter: &mut TableRefIdCounter,
 ) -> Result<Plan> {
-    let table = match schema.get_table(tbl_name.name.0.as_str()) {
+    let table = match schema.get_table_qualified(
+        tbl_name.db_name.as_ref().map(|db| db.0.as_str()),
+        tbl_name.name.0.as_str(),
+    ) {
         Some(table) => table,
         None => crate::bail_parse_error!("no such table: {}", tbl_name),
     };
@@ -98,6 +101,7 @@ pub fn prepare_delete_plan(
         &mut table_references,
         None,
         &mut where_predicates,
+        schema,
     )?;
 
     // Parse the LIMIT/OFFSET clause

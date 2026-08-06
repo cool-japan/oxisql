@@ -52,6 +52,8 @@ pub fn translate_create_index(
     let Some(tbl) = tbl.btree() else {
         crate::bail_parse_error!("Error: table '{tbl_name}' is not a b-tree table.");
     };
+    // An index is always created in the database that owns its table.
+    let db_index = tbl.db_index;
     let columns = resolve_sorted_columns(&tbl, columns)?;
 
     let mut index_columns = Vec::with_capacity(columns.len());
@@ -103,13 +105,14 @@ pub fn translate_create_index(
     // Create a new B-Tree and store the root page index in a register
     let root_page_reg = program.alloc_register();
     program.emit_insn(Insn::CreateBtree {
-        db: 0,
+        db: db_index,
         root: root_page_reg,
         flags: CreateBTreeFlags::new_index(),
     });
 
     // open the sqlite schema table for writing and create a new entry for the index
     program.emit_insn(Insn::OpenWrite {
+        db: db_index,
         cursor_id: sqlite_schema_cursor_id,
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
         name: sqlite_table.name.clone(),
@@ -143,6 +146,7 @@ pub fn translate_create_index(
 
     // open the table we are creating the index on for reading
     program.emit_insn(Insn::OpenRead {
+        db: db_index,
         cursor_id: table_cursor_id,
         root_page: tbl.root_page,
     });
@@ -190,6 +194,7 @@ pub fn translate_create_index(
     // Open the index btree we created for writing to insert the
     // newly sorted index records.
     program.emit_insn(Insn::OpenWrite {
+        db: db_index,
         cursor_id: btree_cursor_id,
         root_page: RegisterOrLiteral::Register(root_page_reg),
         name: idx_name.clone(),
@@ -234,11 +239,11 @@ pub fn translate_create_index(
     // Keep schema table open to emit ParseSchema, close the other cursors.
     program.close_cursors(&[sorter_cursor_id, table_cursor_id, btree_cursor_id]);
 
-    program.emit_schema_change();
+    program.emit_schema_change_for(db_index);
     // Parse the schema table to get the index root page and add new index to Schema
     let parse_schema_where_clause = format!("name = '{}' AND type = 'index'", idx_name);
     program.emit_insn(Insn::ParseSchema {
-        db: sqlite_schema_cursor_id,
+        db: db_index,
         where_clause: Some(parse_schema_where_clause),
     });
     // Close the final sqlite_schema cursor
@@ -328,6 +333,10 @@ pub fn translate_drop_index(
     };
     program.extend(&opts);
 
+    // The index (and therefore its `sqlite_schema` row and b-tree) lives in
+    // whichever database the merged catalog places it in.
+    let db_index = schema.db_index_for_object(None, &idx_name);
+
     // Find the index in Schema
     let mut maybe_index = None;
     for val in schema.indexes.values() {
@@ -378,6 +387,7 @@ pub fn translate_drop_index(
 
     // Open root=1 iDb=0; sqlite_schema for writing
     program.emit_insn(Insn::OpenWrite {
+        db: db_index,
         cursor_id: sqlite_schema_cursor_id,
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
         name: sqlite_table.name.clone(),
@@ -441,18 +451,18 @@ pub fn translate_drop_index(
 
     program.resolve_label(loop_end_label, program.offset());
 
-    program.emit_schema_change();
+    program.emit_schema_change_for(db_index);
 
     // Destroy index btree and remove from the Schema any mention of the index
     if let Some(idx) = maybe_index {
         program.emit_insn(Insn::Destroy {
             root: idx.root_page,
             former_root_reg: 0,
-            is_temp: 0,
+            is_temp: db_index,
         });
         program.emit_insn(Insn::DropIndex {
             index: idx.clone(),
-            db: 0,
+            db: db_index,
         });
     }
 

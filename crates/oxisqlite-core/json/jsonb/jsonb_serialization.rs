@@ -31,23 +31,23 @@ impl Jsonb {
     }
 
     pub fn make_empty_array(size: usize) -> Self {
-        let mut jsonb = Self {
-            data: Vec::with_capacity(size),
-        };
-        jsonb
-            .write_element_header(0, ElementType::ARRAY, 0, false)
-            .unwrap();
-        jsonb
+        Self::with_empty_container_header(size, ElementType::ARRAY)
     }
 
     pub fn make_empty_obj(size: usize) -> Self {
-        let mut jsonb = Self {
-            data: Vec::with_capacity(size),
-        };
-        jsonb
-            .write_element_header(0, ElementType::OBJECT, 0, false)
-            .unwrap();
-        jsonb
+        Self::with_empty_container_header(size, ElementType::OBJECT)
+    }
+
+    /// Build a `Jsonb` holding just the (always single-byte) header of an empty
+    /// ARRAY/OBJECT container. Encoding a zero payload size is infallible, so
+    /// this replaces the previous `write_element_header(..).unwrap()`, which
+    /// would have aborted the process on any future change to the encoder.
+    fn with_empty_container_header(size: usize, element_type: ElementType) -> Self {
+        let header = JsonbHeader::new(element_type, 0).into_bytes();
+        let header_bytes = header.as_bytes();
+        let mut data = Vec::with_capacity(size.max(header_bytes.len()));
+        data.extend_from_slice(header_bytes);
+        Self { data }
     }
 
     pub fn append_to_array_unsafe(&mut self, data: &[u8]) {
@@ -61,6 +61,38 @@ impl Jsonb {
     pub fn finalize_unsafe(&mut self, element_type: ElementType) -> Result<()> {
         self.write_element_header(0, element_type, self.len() - 1, false)?;
         Ok(())
+    }
+
+    /// Bounds-checked view of `len` payload bytes starting at `cursor`.
+    ///
+    /// Every `len` handed to this helper is a payload size decoded from a JSONB
+    /// element header. `JsonbHeader::from_slice` deliberately does not check
+    /// that size against the buffer length — a 4-byte size field lets a crafted
+    /// blob claim ~4 GiB inside a 3-byte document — so slicing with it directly
+    /// panics ("range end index N out of range"). Blobs reach this code
+    /// straight from SQL (`SELECT json_extract(X'1bc7ff', '$[0]')`), so the
+    /// only acceptable outcome is a typed error.
+    pub(super) fn element_slice(&self, cursor: usize, len: usize) -> Result<&[u8]> {
+        match cursor
+            .checked_add(len)
+            .and_then(|end| self.data.get(cursor..end))
+        {
+            Some(slice) => Ok(slice),
+            None => bail_parse_error!("malformed JSON"),
+        }
+    }
+
+    /// Bounds-checked end offset of a `len`-byte region starting at `cursor`.
+    ///
+    /// Companion to [`Self::element_slice`] for the mutating paths, which need
+    /// the range (for `Vec::splice`/`Vec::drain`) rather than a borrow. Both
+    /// operations panic on an out-of-range end, and `len` here is always a
+    /// header-declared, attacker-controllable size.
+    pub(super) fn element_end(&self, cursor: usize, len: usize) -> Result<usize> {
+        match cursor.checked_add(len) {
+            Some(end) if end <= self.data.len() => Ok(end),
+            _ => bail_parse_error!("malformed JSON"),
+        }
     }
 
     pub(super) fn read_header(&self, cursor: usize) -> Result<(JsonbHeader, usize)> {
@@ -254,7 +286,7 @@ impl Jsonb {
         kind: &ElementType,
         quote: bool,
     ) -> Result<usize> {
-        let word_slice = &self.data[cursor..cursor + len];
+        let word_slice = self.element_slice(cursor, len)?;
         if quote {
             string.push('"');
         }
@@ -427,7 +459,7 @@ impl Jsonb {
         kind: &ElementType,
     ) -> Result<usize> {
         let current_cursor = cursor + len;
-        let num_slice = from_utf8(&self.data[cursor..current_cursor])
+        let num_slice = from_utf8(self.element_slice(cursor, len)?)
             .map_err(|_| LimboError::ParseError("Failed to parse integer".to_string()))?;
 
         match kind {
@@ -1269,6 +1301,22 @@ impl Jsonb {
         payload_size: usize,
         size_might_change: bool,
     ) -> Result<usize> {
+        // `payload_size` is routinely computed as `(old_size as isize + delta)
+        // as usize` by the mutating operations. On a crafted JSONB blob that
+        // arithmetic can go negative and wrap to a colossal `usize`, which then
+        // reached `JsonbHeader::into_bytes`'s
+        // `_ => panic!("Payload size too large for encoding")` and aborted the
+        // process. The JSONB header format tops out at a 32-bit size, so
+        // anything larger is malformed by definition -- reject it here, which
+        // also keeps that `panic!` unreachable.
+        if payload_size > u32::MAX as usize {
+            bail_parse_error!("malformed JSON")
+        }
+        // A cursor past the end is likewise only reachable from a corrupt
+        // document; indexing would panic.
+        if cursor > self.len() {
+            bail_parse_error!("malformed JSON")
+        }
         if payload_size <= 11 && !size_might_change {
             let header_byte = (element_type as u8) | ((payload_size as u8) << 4);
             if cursor == self.len() {
@@ -1297,17 +1345,25 @@ impl Jsonb {
 
         let new_len = header_bytes.len();
 
+        // `cursor + old_len` / `cursor + new_len` must stay inside the buffer:
+        // `old_len` is decoded from the (attacker-controlled) header at
+        // `cursor`, so an under-long document would make `splice`/`drain` panic.
+        let old_end = self.element_end(cursor, old_len)?;
         if new_len > old_len {
             self.data.splice(
-                cursor + old_len..cursor + old_len,
-                std::iter::repeat(0).take(new_len - old_len),
+                old_end..old_end,
+                std::iter::repeat_n(0u8, new_len - old_len),
             );
         } else if new_len < old_len {
-            self.data.drain(cursor + new_len..cursor + old_len);
+            let new_end = self.element_end(cursor, new_len)?;
+            self.data.drain(new_end..old_end);
         }
 
         for (i, &byte) in header_bytes.iter().enumerate() {
-            self.data[cursor + i] = byte;
+            match self.data.get_mut(cursor + i) {
+                Some(slot) => *slot = byte,
+                None => bail_parse_error!("malformed JSON"),
+            }
         }
 
         Ok(new_len)

@@ -1680,7 +1680,11 @@ pub fn translate_expr(
             )?;
             Ok(target_register)
         }
-        ast::Expr::InTable { .. } => todo!(),
+        // `x IN tablename` / `x IN tablefunc(...)`: parseable, but there is no
+        // emitter for it. Bail like CREATE TRIGGER/ATTACH instead of `todo!()`.
+        ast::Expr::InTable { .. } => {
+            crate::bail_parse_error!("IN <table> is not supported yet; use IN (SELECT ...)")
+        }
         ast::Expr::IsNull(expr) => {
             let reg = program.alloc_register();
             translate_expr(program, referenced_tables, expr, reg, resolver)?;
@@ -1839,7 +1843,25 @@ pub fn translate_expr(
         ast::Expr::Qualified(_, _) => {
             unreachable!("Qualified should be resolved to a Column before translation")
         }
-        ast::Expr::Raise(_, _) => todo!(),
+        // RAISE() is only meaningful inside a trigger body. Inside one, the
+        // enclosing trigger frame supplies the RAISE(IGNORE) jump target;
+        // outside one, `emit_raise` bails with SQLite's own wording.
+        ast::Expr::Raise(resolve_type, message) => crate::translate::trigger::raise::emit_raise(
+            program,
+            *resolve_type,
+            message.as_deref(),
+            target_register,
+        ),
+        // A value that a previous instruction already left in a register — see
+        // `ast::Expr::Register` and `translate::trigger::rewrite`.
+        ast::Expr::Register(src_reg) => {
+            program.emit_insn(Insn::Copy {
+                src_reg: *src_reg,
+                dst_reg: target_register,
+                amount: 0,
+            });
+            Ok(target_register)
+        }
         ast::Expr::Subquery(select) => {
             let outer = referenced_tables.ok_or_else(|| {
                 crate::error::LimboError::ParseError(

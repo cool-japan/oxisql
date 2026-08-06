@@ -1,7 +1,9 @@
 #![allow(unused_variables)]
 use super::super::{insn::Cookie, CommitState};
 use super::super::{Program, ProgramState, Register};
-use crate::error::{LimboError, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY};
+use crate::error::{
+    LimboError, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
+};
 use crate::result::LimboResult;
 use crate::schema::Schema;
 use crate::storage::btree::{integrity_check, IntegrityCheckError, IntegrityCheckState};
@@ -131,6 +133,11 @@ pub fn op_halt(
                 description
             )));
         }
+        // `RAISE(ABORT|FAIL|ROLLBACK, 'msg')` inside a trigger body. SQLite
+        // surfaces the trigger's message verbatim, so no prefix is added.
+        SQLITE_CONSTRAINT_TRIGGER => {
+            return Err(LimboError::Constraint(description.clone()));
+        }
         _ => {
             return Err(LimboError::Constraint(format!(
                 "undocumented halt error code {}",
@@ -250,6 +257,10 @@ pub fn op_auto_commit(
     if *auto_commit != conn.auto_commit.get() {
         if *rollback {
             pager.rollback();
+            // Auxiliary databases roll back with `main`: a statement that wrote
+            // to `temp` or an attached database inside the aborted transaction
+            // must not keep those writes.
+            conn.rollback_aux_txns();
             conn.transaction_state.replace(TransactionState::None);
             conn.auto_commit.replace(true);
             return Ok(InsnFunctionStepResult::Done);
@@ -368,9 +379,7 @@ pub fn op_page_count(
     let Insn::PageCount { db, dest } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    if *db > 0 {
-        todo!("temp databases not implemented yet");
-    }
+    let pager = &super::pager_for_db(program, pager, *db)?;
     let count = pager.db_header.lock().database_size.into();
     state.registers[*dest] = Register::Value(Value::Integer(count));
     state.pc += 1;
@@ -383,14 +392,19 @@ pub fn op_parse_schema(
     pager: &Rc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    let Insn::ParseSchema {
-        db: _,
-        where_clause,
-    } = insn
-    else {
+    let Insn::ParseSchema { db, where_clause } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
     let conn = program.connection.clone();
+    if *db != crate::multidb::DB_MAIN {
+        // `temp` / attached catalogs are re-read wholesale from their own
+        // `sqlite_schema` (and re-tagged with their registry index) rather than
+        // incrementally: they are small, per-connection, and the incremental
+        // `where_clause` path below can only address `main`'s catalog.
+        conn.reparse_aux_schema(*db, state.mv_tx_id)?;
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     if let Some(where_clause) = where_clause {
         let stmt = conn.prepare(format!(
             "SELECT * FROM sqlite_schema WHERE {}",
@@ -438,6 +452,62 @@ pub fn op_parse_schema(
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
+/// `ATTACH DATABASE <path> AS <alias>`.
+///
+/// Opens the database named by `path_reg` and registers it on the connection
+/// under the alias in `alias_reg`. Both operands are evaluated at run time so
+/// `ATTACH ? AS ?` and expression paths behave like upstream's `OP_Function`
+/// based implementation.
+pub fn op_attach(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::Attach {
+        path_reg,
+        alias_reg,
+    } = insn
+    else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+    let path = value_as_db_text(&state.registers[*path_reg], "ATTACH", "filename")?;
+    let alias = value_as_db_text(&state.registers[*alias_reg], "ATTACH", "schema name")?;
+    program.connection.attach_db(&path, &alias)?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// `DETACH DATABASE <alias>`.
+pub fn op_detach(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::Detach { alias_reg } = insn else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+    let alias = value_as_db_text(&state.registers[*alias_reg], "DETACH", "schema name")?;
+    program.connection.detach_db(&alias)?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Read an `ATTACH`/`DETACH` operand as text, with a typed error for every
+/// other value kind (upstream rejects non-text names the same way).
+fn value_as_db_text(register: &Register, stmt: &str, what: &str) -> Result<String> {
+    match register.get_owned_value() {
+        Value::Text(text) => Ok(text.as_str().to_string()),
+        other => Err(LimboError::InvalidArgument(format!(
+            "{stmt}: {what} must be a text value, got {}",
+            other.value_type()
+        ))),
+    }
+}
+
 pub fn op_read_cookie(
     program: &Program,
     state: &mut ProgramState,
@@ -448,9 +518,7 @@ pub fn op_read_cookie(
     let Insn::ReadCookie { db, dest, cookie } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    if *db > 0 {
-        todo!("temp databases not implemented yet");
-    }
+    let pager = &super::pager_for_db(program, pager, *db)?;
     let cookie_value = match cookie {
         Cookie::UserVersion => pager.db_header.lock().user_version.into(),
         Cookie::SchemaVersion => pager.db_header.lock().schema_cookie.into(),
@@ -483,9 +551,10 @@ pub fn op_set_cookie(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
-    if *db > 0 {
-        todo!("temp databases not implemented yet");
+    if super::begin_db_txn(program, *db, true)? {
+        return Ok(InsnFunctionStepResult::Busy);
     }
+    let pager = &super::pager_for_db(program, pager, *db)?;
     match cookie {
         Cookie::UserVersion => {
             let mut header_guard = pager.db_header.lock();

@@ -77,6 +77,14 @@ fn pragma_for(pragma: PragmaName) -> Pragma {
             PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
             &["cid", "name", "type", "notnull", "dflt_value", "pk"],
         ),
+        IndexList => Pragma::new(
+            PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
+            &["seq", "name", "unique", "origin", "partial"],
+        ),
+        IndexInfo => Pragma::new(
+            PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
+            &["seqno", "cid", "name"],
+        ),
         UserVersion => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["user_version"],
