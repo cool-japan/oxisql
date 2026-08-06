@@ -13,7 +13,7 @@ categories = ["database"]
 
 [dependencies]
 oxisql-core = { workspace = true }
-limbo       = { package = "oxisqlite", path = "../oxisqlite", version = "0.4.1", features = ["index_experimental"] }
+limbo       = { package = "oxisqlite", path = "../oxisqlite", version = "0.4.2", features = ["index_experimental"] }
 async-trait = { workspace = true }
 thiserror   = { workspace = true }
 tokio       = { workspace = true }

@@ -28,7 +28,7 @@ CC=/usr/bin/false cargo build --workspace   # → exit 0
 cargo build --workspace                      # → 0 warnings
 ```
 
-**Version 0.4.1 — 2026-08-07.**
+**Version 0.4.2 — Unreleased.**
 18 workspace crates (plus 2 non-published, internal patch-shim crates) · 2,261 tests passing (2,755 with `--all-features`) · 0 failing · 0 clippy warnings.
 ~183,534 lines of Rust across 481 source files (verified via `cargo nextest run --workspace [--all-features]`, `cargo clippy --all-targets --all-features`, and `tokei`).
 
@@ -433,14 +433,14 @@ Add to your workspace's root `Cargo.toml`:
 ```toml
 # Workspace root Cargo.toml
 [workspace.dependencies]
-oxisql = { version = "0.4.1", features = ["embedded"] }
+oxisql = { version = "0.4.2", features = ["embedded"] }
 ```
 
 Or add to a single crate:
 
 ```toml
 [dependencies]
-oxisql = { version = "0.4.1", features = ["embedded", "postgres", "pool-embedded", "migrate"] }
+oxisql = { version = "0.4.2", features = ["embedded", "postgres", "pool-embedded", "migrate"] }
 ```
 
 ### Downstream `[patch.crates-io]` requirement (whoami / zstd)
@@ -721,26 +721,26 @@ cross-backend OLAP queries (filter / projection / limit pushdown).
 
 ```toml
 # In-memory only
-oxisql = { version = "0.4.1", features = ["embedded"] }
+oxisql = { version = "0.4.2", features = ["embedded"] }
 
 # PostgreSQL + pooling
-oxisql = { version = "0.4.1", features = ["postgres", "pool-postgres"] }
+oxisql = { version = "0.4.2", features = ["postgres", "pool-postgres"] }
 
 # MySQL + migrations
-oxisql = { version = "0.4.1", features = ["mysql", "pool-mysql", "migrate"] }
+oxisql = { version = "0.4.2", features = ["mysql", "pool-mysql", "migrate"] }
 
 # C-free SQLite + pooling
-oxisql = { version = "0.4.1", features = ["sqlite", "pool-sqlite-compat"] }
+oxisql = { version = "0.4.2", features = ["sqlite", "pool-sqlite-compat"] }
 
 # All OLTP backends + pooling + migrations
-oxisql = { version = "0.4.1", features = [
+oxisql = { version = "0.4.2", features = [
     "embedded", "postgres", "mysql", "sqlite",
     "pool-embedded", "pool-postgres", "pool-mysql", "pool-sqlite-compat",
     "migrate",
 ] }
 
 # Full stack including DataFusion OLAP, logical replication, and the REPL
-oxisql = { version = "0.4.1", features = [
+oxisql = { version = "0.4.2", features = [
     "embedded", "postgres", "postgres-replication", "mysql", "sqlite", "datafusion",
     "pool-embedded", "pool-postgres", "pool-mysql",
     "migrate", "repl",
